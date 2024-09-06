@@ -5,6 +5,10 @@ import shutil
 import os
 from datetime import datetime
 import tempfile
+from openpyxl.drawing.image import Image
+from openpyxl.drawing.spreadsheet_drawing import OneCellAnchor, AnchorMarker
+from openpyxl.utils.units import pixels_to_EMU
+from openpyxl.drawing.xdr import XDRPositiveSize2D
 
 app = Flask(__name__)
 
@@ -72,6 +76,21 @@ def generate_excel(form_data):
     wb = load_workbook(temp_file.name)
     wb._external_links = []
     ws = wb.active
+
+    # Add the logo
+    img = Image('images/logo.jpg')
+    
+    # Set the size of the image (convert cm to EMUs)
+    width_emu = int(4.09 * 360000)  # 4.09 cm
+    height_emu = int(1.62 * 360000)  # 1.62 cm
+
+    # Create an OneCellAnchor for the image
+    marker = AnchorMarker(col=0, colOff=133350, row=1, rowOff=38100)  # 14 pixels ≈ 133350 EMU, 4 pixels ≈ 38100 EMU
+    size = XDRPositiveSize2D(cx=width_emu, cy=height_emu)
+    img.anchor = OneCellAnchor(_from=marker, ext=size)
+
+    # Add the image to the worksheet
+    ws.add_image(img)
 
     # Fill in the special fields
     for field, (row, start_col, end_col, _) in special_fields.items():

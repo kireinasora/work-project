@@ -5,7 +5,7 @@ import shutil
 import os
 from datetime import datetime
 import tempfile
-import requests
+import gdown
 
 app = Flask(__name__)
 
@@ -52,13 +52,8 @@ attachment_type_checkboxes = [
 def index():
     if request.method == 'POST':
         # Process form data and generate Excel file
-        excel_file = generate_excel(request.form)
-        return send_file(
-            excel_file,
-            as_attachment=True,
-            download_name="材料報批表_filled.xlsx",
-            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-        )
+        temp_file = generate_excel(request.form)
+        return send_file(temp_file, as_attachment=True, download_name="材料報批表_filled.xlsx")
     return render_template('form.html', 
                            special_fields=special_fields,
                            regular_fields=regular_fields,
@@ -67,22 +62,16 @@ def index():
                            attachment_type_checkboxes=attachment_type_checkboxes)
 
 def generate_excel(form_data):
-    # Construct correct Google Drive download URL
+    # Create a temporary file
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx')
+    temp_file.close()
+
+    # Download template file from Google Drive
     url = f'https://drive.google.com/uc?id={template_file_id}'
-    
-    # Use requests to download the file
-    response = requests.get(url)
-    if response.status_code == 200:
-        with open(temp_file.name, 'wb') as f:
-            f.write(response.content)
-    else:
-        raise Exception(f"Failed to download the template file. Status code: {response.status_code}")
+    gdown.download(url, temp_file.name, quiet=False)
 
-    # Load the downloaded file into memory
-    file_content = BytesIO(response.content)
-
-    # Load the workbook
-    wb = load_workbook(file_content)
+    # Load the copied file
+    wb = load_workbook(temp_file.name)
     wb._external_links = []
     ws = wb.active
 
@@ -105,12 +94,10 @@ def generate_excel(form_data):
     # Fill in the date
     ws.cell(row=21, column=7, value=form_data.get('日期', datetime.now().strftime("%Y/%m/%d")))
 
-    # Save to BytesIO object
-    output = BytesIO()
-    wb.save(output)
-    output.seek(0)
+    # Save the workbook
+    wb.save(temp_file.name)
 
-    return output
+    return temp_file.name
 
 if __name__ == "__main__":
     port = int(os.environ.get('PORT', 5000))

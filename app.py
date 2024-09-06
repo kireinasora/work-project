@@ -5,10 +5,12 @@ import shutil
 import os
 from datetime import datetime
 import tempfile
+import gdown
 
 app = Flask(__name__)
 
-template_file = "材料報批表.xlsx"
+template_file_id = "1v0kQrMN2N83NJVjGgBBsS7OZ2nZuyQRq"
+
 special_fields = {
     "工程編號": (6, 2, 4, "37/2024/DVPS"),
     "工程名稱": (7, 2, 4, "黑沙馬路行人道優化工程(第二期)"),
@@ -64,8 +66,9 @@ def generate_excel(form_data):
     temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx')
     temp_file.close()
 
-    # Copy the template file to the temporary location
-    shutil.copy2(template_file, temp_file.name)
+    # Download template file from Google Drive
+    url = f'https://drive.google.com/uc?id={template_file_id}'
+    gdown.download(url, temp_file.name, quiet=False)
 
     # Load the copied file
     wb = load_workbook(temp_file.name)

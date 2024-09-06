@@ -61,7 +61,10 @@ def index():
     if request.method == 'POST':
         # Process form data and generate Excel file
         temp_file = generate_excel(request.form)
-        return send_file(temp_file, as_attachment=True, download_name="材料報批表_filled.xlsx")
+        file_name = request.form.get('檔案名稱', '材料報批表_filled.xlsx')
+        if not file_name.endswith('.xlsx'):
+            file_name += '.xlsx'
+        return send_file(temp_file, as_attachment=True, download_name=file_name)
     return render_template('form.html', 
                            special_fields=special_fields,
                            regular_fields=regular_fields,

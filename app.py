@@ -66,11 +66,17 @@ def generate_excel(form_data):
     temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx')
     temp_file.close()
 
-    # Download template file from Google Drive
+    # Construct correct Google Drive download URL
     url = f'https://drive.google.com/uc?id={template_file_id}'
+    
+    # Use gdown to download the file
     gdown.download(url, temp_file.name, quiet=False)
 
-    # Load the copied file
+    # Check if the file was successfully downloaded
+    if not os.path.exists(temp_file.name) or os.path.getsize(temp_file.name) == 0:
+        raise Exception("Failed to download the template file")
+
+    # Load the downloaded file
     wb = load_workbook(temp_file.name)
     wb._external_links = []
     ws = wb.active

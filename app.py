@@ -26,8 +26,13 @@ regular_fields = [
     ("型號", 12, 6),
     ("貨期", 13, 6),
     ("數量", 14, 6),
-    ("附件", 15, 6)
+    # Remove "附件" from here
 ]
+
+attachment_fields = [
+    ("附件", 15, 6)  # Add "附件" here
+]
+
 material_type_checkboxes = [
     ("結構", 7, 6),
     ("供水", 8, 6),
@@ -62,7 +67,8 @@ def index():
                            regular_fields=regular_fields,
                            material_type_checkboxes=material_type_checkboxes,
                            material_status_checkboxes=material_status_checkboxes,
-                           attachment_type_checkboxes=attachment_type_checkboxes)
+                           attachment_type_checkboxes=attachment_type_checkboxes,
+                           attachment_fields=attachment_fields)  # Add this line
 
 def generate_excel(form_data):
     # Create a temporary file
@@ -101,6 +107,10 @@ def generate_excel(form_data):
     
     # Fill in the regular fields
     for field, row, col in regular_fields:
+        ws.cell(row=row, column=col, value=form_data.get(field, ''))
+
+    # Fill in the attachment fields
+    for field, row, col in attachment_fields:
         ws.cell(row=row, column=col, value=form_data.get(field, ''))
 
     # Fill in the checkboxes

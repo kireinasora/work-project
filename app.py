@@ -5,6 +5,7 @@ import os
 from datetime import datetime
 import tempfile
 import requests
+from io import BytesIO
 
 app = Flask(__name__)
 
@@ -51,8 +52,13 @@ attachment_type_checkboxes = [
 def index():
     if request.method == 'POST':
         # Process form data and generate Excel file
-        temp_file = generate_excel(request.form)
-        return send_file(temp_file, as_attachment=True, download_name="材料報批表_filled.xlsx")
+        excel_file = generate_excel(request.form)
+        return send_file(
+            excel_file,
+            as_attachment=True,
+            download_name="材料報批表_filled.xlsx",
+            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        )
     return render_template('form.html', 
                            special_fields=special_fields,
                            regular_fields=regular_fields,
@@ -61,27 +67,19 @@ def index():
                            attachment_type_checkboxes=attachment_type_checkboxes)
 
 def generate_excel(form_data):
-    # Create a temporary file
-    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx')
-    temp_file.close()
-
     # Construct correct Google Drive download URL
     url = f'https://drive.google.com/uc?export=download&id={template_file_id}'
     
     # Use requests to download the file
     response = requests.get(url)
-    if response.status_code == 200:
-        with open(temp_file.name, 'wb') as f:
-            f.write(response.content)
-    else:
+    if response.status_code != 200:
         raise Exception(f"Failed to download the template file. Status code: {response.status_code}")
 
-    # Check if the file was successfully downloaded
-    if not os.path.exists(temp_file.name) or os.path.getsize(temp_file.name) == 0:
-        raise Exception("Failed to download the template file")
+    # Load the downloaded file into memory
+    file_content = BytesIO(response.content)
 
-    # Load the downloaded file
-    wb = load_workbook(temp_file.name)
+    # Load the workbook
+    wb = load_workbook(file_content)
     wb._external_links = []
     ws = wb.active
 
@@ -104,10 +102,12 @@ def generate_excel(form_data):
     # Fill in the date
     ws.cell(row=21, column=7, value=form_data.get('日期', datetime.now().strftime("%Y/%m/%d")))
 
-    # Save the workbook
-    wb.save(temp_file.name)
+    # Save to BytesIO object
+    output = BytesIO()
+    wb.save(output)
+    output.seek(0)
 
-    return temp_file.name
+    return output
 
 if __name__ == "__main__":
     port = int(os.environ.get('PORT', 5000))

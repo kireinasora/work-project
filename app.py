@@ -1,11 +1,11 @@
 from flask import Flask, render_template, request, send_file
 from openpyxl import load_workbook
 from openpyxl.styles import Font
+import shutil
 import os
 from datetime import datetime
 import tempfile
 import requests
-from io import BytesIO
 
 app = Flask(__name__)
 
@@ -68,11 +68,14 @@ def index():
 
 def generate_excel(form_data):
     # Construct correct Google Drive download URL
-    url = f'https://drive.google.com/uc?export=download&id={template_file_id}'
+    url = f'https://drive.google.com/uc?id={template_file_id}'
     
     # Use requests to download the file
     response = requests.get(url)
-    if response.status_code != 200:
+    if response.status_code == 200:
+        with open(temp_file.name, 'wb') as f:
+            f.write(response.content)
+    else:
         raise Exception(f"Failed to download the template file. Status code: {response.status_code}")
 
     # Load the downloaded file into memory

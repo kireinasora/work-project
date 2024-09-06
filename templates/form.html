@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Material Submission Form</title>
+</head>
+<body>
+    <h1>Material Submission Form</h1>
+    <form method="POST">
+        {% for field, (_, _, _, default_value) in special_fields.items() %}
+            <label for="{{ field }}">{{ field }}:</label>
+            <input type="text" id="{{ field }}" name="{{ field }}" value="{{ default_value }}"><br><br>
+        {% endfor %}
+
+        {% for field, _, _ in regular_fields %}
+            <label for="{{ field }}">{{ field }}:</label>
+            <input type="text" id="{{ field }}" name="{{ field }}"><br><br>
+        {% endfor %}
+
+        <h3>Material Type</h3>
+        {% for field, _, _ in material_type_checkboxes %}
+            <input type="checkbox" id="{{ field }}" name="{{ field }}">
+            <label for="{{ field }}">{{ field }}</label><br>
+        {% endfor %}
+
+        <h3>Material Status</h3>
+        {% for field, _, _ in material_status_checkboxes %}
+            <input type="checkbox" id="{{ field }}" name="{{ field }}">
+            <label for="{{ field }}">{{ field }}</label><br>
+        {% endfor %}
+
+        <h3>Attachment Type</h3>
+        {% for field, _, _ in attachment_type_checkboxes %}
+            <input type="checkbox" id="{{ field }}" name="{{ field }}">
+            <label for="{{ field }}">{{ field }}</label><br>
+        {% endfor %}
+
+        <label for="日期">日期:</label>
+        <input type="date" id="日期" name="日期"><br><br>
+
+        <input type="submit" value="Generate Excel">
+    </form>
+</body>
+</html>

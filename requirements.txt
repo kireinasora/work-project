@@ -1,7 +1,10 @@
-alembic==1.14.1
 Flask==3.1.0
-Flask_Migrate==4.1.0
-flask_sqlalchemy==3.1.1
+Flask-PyMongo==3.0.1
+pymongo==4.11.0
+# 其他你可能需要的套件（openpyxl、gunicorn、requests 等）
 openpyxl==3.1.5
-SQLAlchemy==2.0.37
-pillow==11.1.0
+gunicorn==23.0.0
+requests==2.32.3
+# ...依照專案實際需要增加
+
+# Vue前端的建置不在此列舉：Vite/node_modules 由 npm/yarn 管理

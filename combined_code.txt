@@ -2,6 +2,7 @@
 ./
 ├── backend/
 │   ├── __init__.py
+│   ├── db.py # backend/db.py
 │   ├── main.py # backend/main.py
 │   └── server.py
 │   ├── material_management/
@@ -16,14 +17,11 @@
 │   │   │   ├── 0b5bdb10bee4_initial_schema_from_scratch.py
 │   │   │   └── 21bfa265addc_add_job_number_and_contractor_columns.py
 │   ├── project_management/
-│   │   ├── models.py # backend/project_management/models.py
 │   │   └── routes.py # backend/project_management/routes.py
 │   ├── site_diary/
-│   │   ├── models.py # backend/site_diary/models.py
 │   │   ├── routes.py # backend/site_diary/routes.py
 │   │   └── services.py # backend/site_diary/services.py
 │   ├── staff_management/
-│   │   ├── models.py # backend/staff_management/models.py
 │   │   └── routes.py # backend/staff_management/routes.py
 ├── frontend/
 │   └── index.html
@@ -52,50 +50,134 @@ backend/__init__.py
 
 ================================================================================
 
+backend/db.py
+
+================================================================================
+# backend/db.py
+
+import os
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+from flask import Flask
+from flask_pymongo import PyMongo
+from bson.objectid import ObjectId
+from pymongo.errors import DuplicateKeyError, ConfigurationError, ConnectionFailure
+
+mongo = PyMongo()
+
+def _ensure_auth_source_admin_if_railway(mongo_uri: str) -> str:
+    """
+    若偵測到 URI 為 Railway 提供的內部位址 (含 'railway.internal')，
+    且尚未設定 authSource，則自動補上 "?authSource=admin" 或 "&authSource=admin"。
+    其他平台(非 Railway) 或已經有指定 authSource 時，則不動作。
+    """
+    if "railway.internal" not in mongo_uri:
+        return mongo_uri  # 非 Railway，不動作
+
+    # 解析 URI
+    parsed = urlparse(mongo_uri)
+    qs = parse_qs(parsed.query)  # 例如 {'authSource': ['admin'], 'replicaSet': ['xxx']}
+
+    # 若已存在 authSource，就不再補
+    if "authSource" in qs:
+        return mongo_uri
+
+    # 若尚無 authSource，補上 admin
+    qs["authSource"] = ["admin"]
+    new_query = urlencode(qs, doseq=True)  # 重新組裝 query string
+    new_parsed = parsed._replace(query=new_query)
+    return urlunparse(new_parsed)
+
+
+def init_mongo_app(app: Flask):
+    """
+    初始化 MongoDB 連線。
+    
+    - 強制要求 MONGO_URI，若未設定則直接報錯，避免默默嘗試 localhost 而出現 Connection refused。
+    - 若要在本機開發，可自行在 .env 或系統環境裡設定：
+        MONGO_URI="mongodb://127.0.0.1:27017/test"
+    - 若偵測到 Railway 提供的 URI (含 railway.internal)，但缺少 authSource，
+      則自動加上 "?authSource=admin"（以避免 Authentication failed）。
+    """
+    raw_uri = os.environ.get("MONGO_URI", "").strip()
+    if not raw_uri:
+        raise ConfigurationError(
+            "ERROR: 環境變數 MONGO_URI 尚未設定，無法連接 MongoDB。\n"
+            "請於 Railway/Heroku/本機環境設定有效的 MONGO_URI。"
+        )
+
+    # 若是 Railway 的 URI，則自動補 authSource=admin
+    mongo_uri = _ensure_auth_source_admin_if_railway(raw_uri)
+
+    print("[INFO] MONGO_URI=", mongo_uri)  # 幫助檢查實際讀到的 URI（可在 logs 看到）
+
+    app.config["MONGO_URI"] = mongo_uri
+    mongo.init_app(app)
+
+    try:
+        # 檢驗連線是否可行 (會觸發實際連線)
+        _ = mongo.cx.server_info()
+    except ConnectionFailure as e:
+        raise ConnectionFailure(f"無法連接 MongoDB: {e}")
+
+    # 建立好 counters 集合的索引（若不存在）
+    # 用來實作「自動遞增序號」功能
+    counters_coll = mongo.db["counters"]
+    counters_coll.create_index("collection_name", unique=True)
+
+
+def get_next_sequence(collection_name: str) -> int:
+    """
+    取得對應 collection_name 的下一個自增序號。
+    若尚無紀錄，則從 1 開始。
+    """
+    counters_coll = mongo.db["counters"]
+    result = counters_coll.find_one_and_update(
+        {"collection_name": collection_name},
+        {"$inc": {"seq": 1}},
+        upsert=True,
+        return_document=True
+    )
+    return result["seq"]
+
+
+def to_iso_date(date_obj):
+    """
+    安全轉換 datetime => 'YYYY-MM-DD' 字串。
+    若原本是 None 或非 datetime, 則回傳 None。
+    """
+    if not date_obj:
+        return None
+    return date_obj.strftime("%Y-%m-%d")
+
+================================================================================
+
 backend/main.py
 
 ================================================================================
 # backend/main.py
 
-from flask import Flask, send_from_directory
-from flask_sqlalchemy import SQLAlchemy
 import os
-
-# 改用 project_management.models 來初始化 db
-from backend.project_management.models import db
+from flask import Flask, send_from_directory
 from backend.project_management.routes import projects_bp
 from backend.material_management.routes import material_bp
 from backend.site_diary.routes import site_diary_bp
-
-# Flask-Migrate
-from flask_migrate import Migrate
-
-# staff_management 仍保留
 from backend.staff_management.routes import staff_bp
-
-# ★ 新增：引入我們在 server.py 裏定義的下載 Blueprint
 from backend.server import download_bp
 
+# ★ 新增：改用我們的 db.py 來初始化 Mongo
+from backend.db import init_mongo_app
 
 def create_app():
     app = Flask(__name__, static_folder="../frontend/dist", static_url_path="/")
 
-    # 設定資料庫
-    app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///app.db'
-    app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-    
-    db.init_app(app)
-    
-    # 使用 flask-migrate，指定 migrations 資料夾為 backend/migrations
-    migrate = Migrate(app, db, directory="backend/migrations")
+    # 初始化 MongoDB
+    init_mongo_app(app)
 
     # Blueprint 註冊
     app.register_blueprint(projects_bp, url_prefix='/api/projects')
     app.register_blueprint(material_bp, url_prefix='/api')
     app.register_blueprint(site_diary_bp, url_prefix='/api/projects')
     app.register_blueprint(staff_bp, url_prefix='/api/staff')
-
-    # ★ 新增：註冊提供下載的 Blueprint（對應 /download-diary）
     app.register_blueprint(download_bp)
 
     # 提供前端打包後檔案 (SPA)
@@ -108,14 +190,15 @@ def create_app():
             return send_from_directory(dist_dir, path)
         else:
             return send_from_directory(dist_dir, 'index.html')
+
     return app
 
+# === 以下區段已移除 ===
+# if __name__ == "__main__":
+#     app = create_app()
+#     port = int(os.environ.get("PORT", 5000))
+#     app.run(host='0.0.0.0', port=port)
 
-if __name__ == "__main__":
-    import os
-    app = create_app()
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host='0.0.0.0', port=port)
 ================================================================================
 
 backend/material_management/constants.py
@@ -532,45 +615,16 @@ def downgrade():
 
 ================================================================================
 
-backend/project_management/models.py
-
-================================================================================
-# backend/project_management/models.py
-
-from flask_sqlalchemy import SQLAlchemy
-
-db = SQLAlchemy()
-
-class Project(db.Model):
-    """
-    專案 (Project) Model
-    """
-    __tablename__ = 'projects'
-    id = db.Column(db.Integer, primary_key=True)
-    name = db.Column(db.String(200), nullable=False)
-    description = db.Column(db.Text, nullable=True)
-    start_date = db.Column(db.Date, nullable=True)
-    end_date = db.Column(db.Date, nullable=True)
-
-    # 既有欄位
-    owner = db.Column(db.String(100), nullable=True)           # 專案業主
-    objective = db.Column(db.Text, nullable=True)              # 專案整體目標
-    duration_type = db.Column(db.String(20), nullable=True)    # 'business' or 'calendar'
-    duration_days = db.Column(db.Integer, nullable=True)
-
-    # === 新增欄位: 工作編號 & 承建商 ===
-    job_number = db.Column(db.String(50), nullable=True)  # 工作編號
-    contractor = db.Column(db.String(200), nullable=True) # 承建商
-
-================================================================================
-
 backend/project_management/routes.py
 
 ================================================================================
 # backend/project_management/routes.py
-from flask import Blueprint, request, jsonify
+
+from flask import Blueprint, request, jsonify, abort
 from datetime import datetime
-from .models import db, Project
+from bson import ObjectId
+
+from backend.db import mongo, get_next_sequence, to_iso_date
 
 projects_bp = Blueprint('projects_bp', __name__)
 
@@ -579,22 +633,21 @@ def get_projects():
     """
     取得所有專案列表
     """
-    projects = Project.query.all()
+    cursor = mongo.db.projects.find({}, sort=[("id", 1)])
     result = []
-    for p in projects:
+    for doc in cursor:
         result.append({
-            "id": p.id,
-            "name": p.name,
-            "description": p.description,
-            "start_date": p.start_date.isoformat() if p.start_date else None,
-            "end_date": p.end_date.isoformat() if p.end_date else None,
-            "owner": p.owner,
-            "objective": p.objective,
-            "duration_type": p.duration_type,
-            "duration_days": p.duration_days,
-            # 新增回傳
-            "job_number": p.job_number,
-            "contractor": p.contractor
+            "id": doc["id"],
+            "name": doc.get("name"),
+            "description": doc.get("description"),
+            "start_date": to_iso_date(doc.get("start_date")),
+            "end_date": to_iso_date(doc.get("end_date")),
+            "owner": doc.get("owner"),
+            "objective": doc.get("objective"),
+            "duration_type": doc.get("duration_type"),
+            "duration_days": doc.get("duration_days"),
+            "job_number": doc.get("job_number"),
+            "contractor": doc.get("contractor"),
         })
     return jsonify(result), 200
 
@@ -604,40 +657,45 @@ def create_project():
     """
     建立新專案
     """
-    data = request.json
+    data = request.json or {}
     name = data.get('name')
+    if not name:
+        return jsonify({"error": "Project name is required"}), 400
+
     description = data.get('description')
     start_date_str = data.get('start_date')
     end_date_str = data.get('end_date')
     owner = data.get('owner')
     objective = data.get('objective')
     duration_type = data.get('duration_type')
-    duration_days_str = data.get('duration_days')
-
-    # 新增接收欄位
+    duration_days = data.get('duration_days')
     job_number = data.get('job_number')
     contractor = data.get('contractor')
 
-    start_date = datetime.strptime(start_date_str, '%Y-%m-%d').date() if start_date_str else None
-    end_date = datetime.strptime(end_date_str, '%Y-%m-%d').date() if end_date_str else None
-    duration_days = int(duration_days_str) if duration_days_str else None
+    # 轉換為 datetime(yyyy,mm,dd) 而不是 date()，以讓 PyMongo 能正常儲存
+    start_date = datetime.strptime(start_date_str, '%Y-%m-%d') if start_date_str else None
+    end_date = datetime.strptime(end_date_str, '%Y-%m-%d') if end_date_str else None
 
-    project = Project(
-        name=name,
-        description=description,
-        start_date=start_date,
-        end_date=end_date,
-        owner=owner,
-        objective=objective,
-        duration_type=duration_type,
-        duration_days=duration_days,
-        job_number=job_number,
-        contractor=contractor
-    )
-    db.session.add(project)
-    db.session.commit()
+    # 取得此集合下一個可用的整數 ID
+    new_id = get_next_sequence("projects")
 
-    return jsonify({"message": "Project created", "project_id": project.id}), 201
+    doc = {
+        "id": new_id,
+        "name": name,
+        "description": description,
+        "start_date": start_date,
+        "end_date": end_date,
+        "owner": owner,
+        "objective": objective,
+        "duration_type": duration_type,
+        "duration_days": duration_days,
+        "job_number": job_number,
+        "contractor": contractor,
+    }
+
+    mongo.db.projects.insert_one(doc)
+
+    return jsonify({"message": "Project created", "project_id": new_id}), 201
 
 
 @projects_bp.route('/<int:project_id>', methods=['GET'])
@@ -645,20 +703,22 @@ def get_project_detail(project_id):
     """
     取得單一專案詳細資訊
     """
-    project = Project.query.get_or_404(project_id)
+    doc = mongo.db.projects.find_one({"id": project_id})
+    if not doc:
+        abort(404, description="Project not found")
+
     return jsonify({
-        "id": project.id,
-        "name": project.name,
-        "description": project.description,
-        "start_date": project.start_date.isoformat() if project.start_date else None,
-        "end_date": project.end_date.isoformat() if project.end_date else None,
-        "owner": project.owner,
-        "objective": project.objective,
-        "duration_type": project.duration_type,
-        "duration_days": project.duration_days,
-        # 新增回傳
-        "job_number": project.job_number,
-        "contractor": project.contractor
+        "id": doc["id"],
+        "name": doc.get("name"),
+        "description": doc.get("description"),
+        "start_date": to_iso_date(doc.get("start_date")),
+        "end_date": to_iso_date(doc.get("end_date")),
+        "owner": doc.get("owner"),
+        "objective": doc.get("objective"),
+        "duration_type": doc.get("duration_type"),
+        "duration_days": doc.get("duration_days"),
+        "job_number": doc.get("job_number"),
+        "contractor": doc.get("contractor"),
     }), 200
 
 
@@ -667,28 +727,47 @@ def update_project(project_id):
     """
     更新專案
     """
-    project = Project.query.get_or_404(project_id)
-    data = request.json
+    doc = mongo.db.projects.find_one({"id": project_id})
+    if not doc:
+        abort(404, description="Project not found")
 
-    project.name = data.get('name', project.name)
-    project.description = data.get('description', project.description)
-    project.owner = data.get('owner', project.owner)
-    project.objective = data.get('objective', project.objective)
-    project.duration_type = data.get('duration_type', project.duration_type)
-    project.duration_days = data.get('duration_days', project.duration_days)
+    data = request.json or {}
+    update_fields = {}
 
-    # 新增更新
-    project.job_number = data.get('job_number', project.job_number)
-    project.contractor = data.get('contractor', project.contractor)
+    if "name" in data:
+        update_fields["name"] = data["name"]
+    if "description" in data:
+        update_fields["description"] = data["description"]
+    if "owner" in data:
+        update_fields["owner"] = data["owner"]
+    if "objective" in data:
+        update_fields["objective"] = data["objective"]
+    if "duration_type" in data:
+        update_fields["duration_type"] = data["duration_type"]
+    if "duration_days" in data:
+        update_fields["duration_days"] = data["duration_days"]
+    if "job_number" in data:
+        update_fields["job_number"] = data["job_number"]
+    if "contractor" in data:
+        update_fields["contractor"] = data["contractor"]
 
+    # 處理日期，改為存 datetime 而非 date
     start_date_str = data.get('start_date')
     end_date_str = data.get('end_date')
-    if start_date_str:
-        project.start_date = datetime.strptime(start_date_str, '%Y-%m-%d').date()
-    if end_date_str:
-        project.end_date = datetime.strptime(end_date_str, '%Y-%m-%d').date()
+    if start_date_str is not None:
+        if start_date_str == "":
+            update_fields["start_date"] = None
+        else:
+            update_fields["start_date"] = datetime.strptime(start_date_str, '%Y-%m-%d')
+    if end_date_str is not None:
+        if end_date_str == "":
+            update_fields["end_date"] = None
+        else:
+            update_fields["end_date"] = datetime.strptime(end_date_str, '%Y-%m-%d')
 
-    db.session.commit()
+    if update_fields:
+        mongo.db.projects.update_one({"id": project_id}, {"$set": update_fields})
+
     return jsonify({"message": "Project updated"}), 200
 
 
@@ -697,9 +776,10 @@ def delete_project(project_id):
     """
     刪除專案
     """
-    project = Project.query.get_or_404(project_id)
-    db.session.delete(project)
-    db.session.commit()
+    result = mongo.db.projects.delete_one({"id": project_id})
+    if result.deleted_count == 0:
+        abort(404, description="Project not found")
+
     return jsonify({"message": "Project deleted"}), 200
 
 ================================================================================
@@ -878,330 +958,291 @@ def download_diary():
 
 ================================================================================
 
-backend/site_diary/models.py
-
-================================================================================
-# backend/site_diary/models.py
-
-from datetime import datetime
-# 注意：這裡我們只需要引用 db 自 backend.project_management.models
-from backend.project_management.models import db
-# 如果有需要使用 Staff，可引用 (但示範通常在關聯那裡再做)
-from backend.staff_management.models import Staff
-
-class SiteDiary(db.Model):
-    """
-    替代原本的 DailyReport：日報 (SiteDiary) 主表
-    """
-    __tablename__ = 'site_diaries'
-
-    id = db.Column(db.Integer, primary_key=True)
-    # 與 Project 的外鍵關係
-    project_id = db.Column(db.Integer, db.ForeignKey('projects.id'), nullable=False)
-
-    # 報表日期
-    report_date = db.Column(db.Date, default=datetime.utcnow)
-
-    # 天氣
-    weather_morning = db.Column(db.String(50), nullable=True)  # 早上天氣
-    weather_noon = db.Column(db.String(50), nullable=True)     # 中午天氣
-
-    # 開工日數
-    # （若不想手動填，可在 services.py 裏做自動計算）
-    day_count = db.Column(db.Integer, nullable=True)
-
-    # 本日工作概述
-    summary = db.Column(db.Text, nullable=False)
-
-    # 一對多: SiteDiaryWorker
-    workers = db.relationship('SiteDiaryWorker', 
-                              backref='site_diary', 
-                              cascade='all, delete-orphan', 
-                              lazy=True)
-
-    # 一對多: SiteDiaryMachine
-    machines = db.relationship('SiteDiaryMachine', 
-                               backref='site_diary', 
-                               cascade='all, delete-orphan', 
-                               lazy=True)
-
-    # 多對多: Staff (through site_diary_staff)
-    staffs = db.relationship('Staff',
-                             secondary='site_diary_staff',
-                             back_populates='site_diaries',
-                             lazy=True)
-
-
-class SiteDiaryWorker(db.Model):
-    """
-    替代原本的 DailyReportWorker
-    """
-    __tablename__ = 'site_diary_workers'
-
-    id = db.Column(db.Integer, primary_key=True)
-    site_diary_id = db.Column(db.Integer, db.ForeignKey('site_diaries.id'), nullable=False)
-    worker_type = db.Column(db.String(50), nullable=False)
-    quantity = db.Column(db.Integer, nullable=False, default=0)
-
-
-class SiteDiaryMachine(db.Model):
-    """
-    替代原本的 DailyReportMachine
-    """
-    __tablename__ = 'site_diary_machines'
-
-    id = db.Column(db.Integer, primary_key=True)
-    site_diary_id = db.Column(db.Integer, db.ForeignKey('site_diaries.id'), nullable=False)
-    machine_type = db.Column(db.String(50), nullable=False)
-    quantity = db.Column(db.Integer, nullable=False, default=0)
-
-================================================================================
-
 backend/site_diary/routes.py
 
 ================================================================================
 # backend/site_diary/routes.py
 
 import traceback
-from flask import Blueprint, request, jsonify, send_file, Response
+import logging
+from flask import Blueprint, request, jsonify, send_file, Response, abort
 from datetime import datetime
 from urllib.parse import quote
 
-from backend.project_management.models import db, Project
-from backend.staff_management.models import Staff
-from backend.site_diary.models import (
-    SiteDiary,
-    SiteDiaryWorker,
-    SiteDiaryMachine
-)
-from backend.site_diary.services import (
-    auto_compute_day_count_if_needed,
-    generate_diary_xlsx_only,
-    generate_diary_pdf_sheet
-)
+from backend.db import mongo, get_next_sequence, to_iso_date
+
+# 建立 logger
+logger = logging.getLogger(__name__)
 
 site_diary_bp = Blueprint('site_diary_bp', __name__)
 
-
 @site_diary_bp.route('/<int:project_id>/site_diaries', methods=['POST'])
 def create_site_diary(project_id):
-    project = Project.query.get_or_404(project_id)
-    data = request.json
+    logger.debug("create_site_diary() called, project_id=%s", project_id)
+
+    project_doc = mongo.db.projects.find_one({"id": project_id})
+    if not project_doc:
+        logger.warning("Project not found: project_id=%s, returning 404", project_id)
+        abort(404, description="Project not found")
+
+    data = request.json or {}
+    logger.debug("Received data for create_site_diary: %s", data)
 
     report_date_str = data.get('report_date')
     if report_date_str:
-        report_date = datetime.strptime(report_date_str, '%Y-%m-%d').date()
+        report_date = datetime.strptime(report_date_str, '%Y-%m-%d')
     else:
-        report_date = datetime.utcnow().date()
+        report_date = None
 
-    site_diary = SiteDiary(
-        project_id=project.id,
-        report_date=report_date,
-        weather_morning=data.get('weather_morning', ''),
-        weather_noon=data.get('weather_noon', ''),
-        day_count=data.get('day_count', None),
-        summary=data.get('summary', '')
-    )
-    db.session.add(site_diary)
-    db.session.flush()
-
-    auto_compute_day_count_if_needed(site_diary)
-    db.session.flush()
+    doc_id = get_next_sequence("site_diaries")
 
     workers_dict = data.get('workers', {})
-    for worker_type, quantity in workers_dict.items():
-        db.session.add(SiteDiaryWorker(
-            site_diary_id=site_diary.id,
-            worker_type=worker_type,
-            quantity=quantity
-        ))
-
     machines_dict = data.get('machines', {})
-    for machine_type, quantity in machines_dict.items():
-        db.session.add(SiteDiaryMachine(
-            site_diary_id=site_diary.id,
-            machine_type=machine_type,
-            quantity=quantity
-        ))
-
     staff_ids = data.get('staff_ids', [])
-    for sid in staff_ids:
-        staff_obj = Staff.query.get(sid)
-        if staff_obj:
-            site_diary.staffs.append(staff_obj)
 
-    db.session.commit()
+    site_diary_doc = {
+        "id": doc_id,
+        "project_id": project_id,
+        "report_date": report_date,
+        "weather_morning": data.get('weather_morning', ''),
+        "weather_noon": data.get('weather_noon', ''),
+        "day_count": data.get('day_count'),
+        "summary": data.get('summary', ''),
+        "workers": workers_dict,
+        "machines": machines_dict,
+        "staff_ids": staff_ids,
+    }
+
+    # 若未填 day_count，則自動計算
+    if site_diary_doc["day_count"] is None:
+        max_day = mongo.db.site_diaries.find(
+            {"project_id": project_id, "day_count": {"$ne": None}},
+            {"day_count": 1}
+        ).sort("day_count", -1).limit(1)
+        row = next(max_day, None)
+        if row:
+            site_diary_doc["day_count"] = row["day_count"] + 1
+        else:
+            site_diary_doc["day_count"] = 1
+
+    mongo.db.site_diaries.insert_one(site_diary_doc)
+    logger.info("Site diary created: diary_id=%s, day_count=%s", doc_id, site_diary_doc["day_count"])
 
     return jsonify({
         "message": "Site diary created",
-        "site_diary_id": site_diary.id,
-        "day_count": site_diary.day_count
+        "site_diary_id": doc_id,
+        "day_count": site_diary_doc["day_count"]
     }), 201
 
 
 @site_diary_bp.route('/<int:project_id>/site_diaries', methods=['GET'])
 def get_site_diaries(project_id):
-    project = Project.query.get_or_404(project_id)
-    diaries = SiteDiary.query.filter_by(project_id=project.id).all()
+    logger.debug("get_site_diaries() called, project_id=%s", project_id)
 
+    project_doc = mongo.db.projects.find_one({"id": project_id})
+    if not project_doc:
+        logger.warning("Project not found: project_id=%s, returning 404", project_id)
+        abort(404, description="Project not found")
+
+    cursor = mongo.db.site_diaries.find({"project_id": project_id}, sort=[("id", 1)])
     results = []
-    for sd in diaries:
-        worker_list = [{
-            "id": w.id,
-            "type": w.worker_type,
-            "quantity": w.quantity
-        } for w in sd.workers]
 
-        machine_list = [{
-            "id": m.id,
-            "type": m.machine_type,
-            "quantity": m.quantity
-        } for m in sd.machines]
-
-        staff_list = [{
-            "id": st.id,
-            "name": st.name,
-            "role": st.role
-        } for st in sd.staffs]
+    for sd in cursor:
+        worker_list = []
+        for w_type, qty in sd.get("workers", {}).items():
+            worker_list.append({
+                "type": w_type,
+                "quantity": qty
+            })
+        machine_list = []
+        for m_type, qty in sd.get("machines", {}).items():
+            machine_list.append({
+                "type": m_type,
+                "quantity": qty
+            })
+        staff_list = []
+        staff_ids = sd.get("staff_ids", [])
+        if staff_ids:
+            staff_docs = list(mongo.db.staff.find({"id": {"$in": staff_ids}}))
+            staff_map = {s["id"]: s for s in staff_docs}
+            for sid in staff_ids:
+                st_doc = staff_map.get(sid)
+                if st_doc:
+                    staff_list.append({
+                        "id": st_doc["id"],
+                        "name": st_doc.get("name"),
+                        "role": st_doc.get("role")
+                    })
 
         results.append({
-            "id": sd.id,
-            "report_date": sd.report_date.isoformat() if sd.report_date else None,
-            "weather_morning": sd.weather_morning,
-            "weather_noon": sd.weather_noon,
-            "day_count": sd.day_count,
-            "summary": sd.summary,
+            "id": sd["id"],
+            "report_date": to_iso_date(sd.get("report_date")),
+            "weather_morning": sd.get("weather_morning", ""),
+            "weather_noon": sd.get("weather_noon", ""),
+            "day_count": sd.get("day_count"),
+            "summary": sd.get("summary", ""),
             "workers": worker_list,
             "machines": machine_list,
             "staffs": staff_list
         })
 
+    logger.debug("Returning %d diaries for project_id=%s", len(results), project_id)
     return jsonify(results), 200
 
 
 @site_diary_bp.route('/<int:project_id>/site_diaries/<int:diary_id>', methods=['PUT'])
 def update_site_diary(project_id, diary_id):
-    site_diary = SiteDiary.query.filter_by(project_id=project_id, id=diary_id).first_or_404()
-    data = request.json
+    logger.debug("update_site_diary() called, project_id=%s, diary_id=%s", project_id, diary_id)
 
+    site_diary = mongo.db.site_diaries.find_one({"project_id": project_id, "id": diary_id})
+    if not site_diary:
+        logger.warning("SiteDiary not found: project_id=%s, diary_id=%s", project_id, diary_id)
+        abort(404, description="SiteDiary not found")
+
+    data = request.json or {}
+    logger.debug("Received data for update_site_diary: %s", data)
+
+    update_fields = {}
     report_date_str = data.get('report_date')
-    if report_date_str:
-        site_diary.report_date = datetime.strptime(report_date_str, '%Y-%m-%d').date()
+    if report_date_str == "":
+        update_fields["report_date"] = None
+    elif report_date_str:
+        update_fields["report_date"] = datetime.strptime(report_date_str, '%Y-%m-%d')
+
+    if "weather_morning" in data:
+        update_fields["weather_morning"] = data["weather_morning"]
+    if "weather_noon" in data:
+        update_fields["weather_noon"] = data["weather_noon"]
+    if "day_count" in data:
+        update_fields["day_count"] = data["day_count"]
+    if "summary" in data:
+        update_fields["summary"] = data["summary"]
+    if "workers" in data:
+        update_fields["workers"] = data["workers"]
+    if "machines" in data:
+        update_fields["machines"] = data["machines"]
+    if "staff_ids" in data:
+        update_fields["staff_ids"] = data["staff_ids"]
+
+    # 若前端沒傳 day_count 或給 null，就繼續自動計算
+    if "day_count" not in data or data["day_count"] is None:
+        max_day = mongo.db.site_diaries.find(
+            {"project_id": project_id, "day_count": {"$ne": None}},
+            {"day_count": 1}
+        ).sort("day_count", -1).limit(1)
+        row = next(max_day, None)
+        if row:
+            update_fields["day_count"] = row["day_count"] + 1
+        else:
+            update_fields["day_count"] = 1
+
+    if update_fields:
+        mongo.db.site_diaries.update_one(
+            {"project_id": project_id, "id": diary_id},
+            {"$set": update_fields}
+        )
+        logger.info("Site diary updated: project_id=%s, diary_id=%s, fields=%s", project_id, diary_id, list(update_fields.keys()))
     else:
-        site_diary.report_date = None
-
-    site_diary.weather_morning = data.get('weather_morning', '')
-    site_diary.weather_noon = data.get('weather_noon', '')
-    site_diary.day_count = data.get('day_count') or None
-    site_diary.summary = data.get('summary', '')
-
-    SiteDiaryWorker.query.filter_by(site_diary_id=site_diary.id).delete()
-    for worker_type, quantity in data.get('workers', {}).items():
-        db.session.add(SiteDiaryWorker(
-            site_diary_id=site_diary.id,
-            worker_type=worker_type,
-            quantity=quantity
-        ))
-
-    SiteDiaryMachine.query.filter_by(site_diary_id=site_diary.id).delete()
-    for machine_type, quantity in data.get('machines', {}).items():
-        db.session.add(SiteDiaryMachine(
-            site_diary_id=site_diary.id,
-            machine_type=machine_type,
-            quantity=quantity
-        ))
-
-    site_diary.staffs.clear()
-    for sid in data.get('staff_ids', []):
-        staff_obj = Staff.query.get(sid)
-        if staff_obj:
-            site_diary.staffs.append(staff_obj)
-
-    auto_compute_day_count_if_needed(site_diary)
-    db.session.commit()
+        logger.debug("No fields updated, data was empty or invalid.")
 
     return jsonify({
         "message": "Site diary updated",
-        "day_count": site_diary.day_count
+        "day_count": update_fields.get("day_count", site_diary.get("day_count"))
     }), 200
 
 
 @site_diary_bp.route('/<int:project_id>/site_diaries/<int:diary_id>', methods=['DELETE'])
 def delete_site_diary(project_id, diary_id):
-    site_diary = SiteDiary.query.filter_by(project_id=project_id, id=diary_id).first_or_404()
-    db.session.delete(site_diary)
-    db.session.commit()
+    logger.debug("delete_site_diary() called, project_id=%s, diary_id=%s", project_id, diary_id)
+
+    result = mongo.db.site_diaries.delete_one({"project_id": project_id, "id": diary_id})
+    if result.deleted_count == 0:
+        logger.warning("Site diary not found, cannot delete: project_id=%s, diary_id=%s", project_id, diary_id)
+        abort(404, description="Site diary not found")
+
+    logger.info("Site diary deleted: project_id=%s, diary_id=%s", project_id, diary_id)
     return jsonify({"message": "Site diary deleted"}), 200
 
 
 @site_diary_bp.route('/<int:project_id>/site_diaries/<int:diary_id>/download_report', methods=['GET'])
 def download_site_diary_report(project_id, diary_id):
     """
-    依照 ?file= 參數決定下載哪個檔案：
-      - xlsx   => "YYYYMMDD_daily_report.xlsx"
-      - sheet1 => "YYYYMMDD每日施工進度報告表.pdf"
-      - sheet2 => "YYYYMMDD施工人員紀錄表.pdf"
+    依照 ?file= 參數決定下載哪個檔案 (xlsx, sheet1, sheet2)。
+    若帶有冒號 (例如 sheet1:1)，則自動擷取冒號前部分避免錯誤。
     """
-    site_diary = SiteDiary.query.filter_by(project_id=project_id, id=diary_id).first_or_404()
-    file_type = request.args.get('file', 'xlsx')
+    logger.debug("download_site_diary_report() called, project_id=%s, diary_id=%s", project_id, diary_id)
 
-    date_str = site_diary.report_date.strftime("%Y%m%d") if site_diary.report_date else "noDate"
+    site_diary = mongo.db.site_diaries.find_one({"project_id": project_id, "id": diary_id})
+    if not site_diary:
+        logger.warning("SiteDiary not found, returning 404: project_id=%s, diary_id=%s", project_id, diary_id)
+        return jsonify({"error": "SiteDiary not found"}), 404
+
+    # 擷取 file=? 參數，移除冒號後字串
+    file_type_param = request.args.get('file', 'xlsx')
+    main_file_type = file_type_param.split(':')[0].strip()
+    logger.debug("Raw file param=%r => main_file_type=%r", file_type_param, main_file_type)
+
+    if site_diary.get("report_date"):
+        date_str = site_diary["report_date"].strftime("%Y%m%d")
+    else:
+        date_str = "noDate"
 
     try:
-        if file_type == 'xlsx':
+        if main_file_type == 'xlsx':
+            from backend.site_diary.services import generate_diary_xlsx_only
             xlsx_path = generate_diary_xlsx_only(site_diary)
             download_name = f"{date_str}_daily_report.xlsx"
+            logger.info("Returning XLSX report: %s", download_name)
             return _send_file_with_utf8_filename(xlsx_path, download_name)
 
-        elif file_type in ('sheet1', 'sheet2'):
-            pdf_path = generate_diary_pdf_sheet(site_diary, sheet_name=file_type)
-            if file_type == 'sheet1':
-                # 假設想要英文化 fallback
-                download_name = f"{date_str}每日施工進度報告表.pdf"  # 中文
-                ascii_fallback = f"{date_str}_daily_report.pdf"     # 英文
-            else:
-                download_name = f"{date_str}施工人員紀錄表.pdf"      # 中文
-                ascii_fallback = f"{date_str}_worker_log.pdf"       # 英文
+        elif main_file_type in ('sheet1', 'sheet2'):
+            from backend.site_diary.services import generate_diary_pdf_sheet
+            pdf_path = generate_diary_pdf_sheet(site_diary, sheet_name=main_file_type)
 
+            if main_file_type == 'sheet1':
+                download_name = f"{date_str}每日施工進度報告表.pdf"
+                ascii_fallback = f"{date_str}_daily_report.pdf"
+            else:
+                download_name = f"{date_str}施工人員紀錄表.pdf"
+                ascii_fallback = f"{date_str}_worker_log.pdf"
+
+            logger.info("Returning PDF report: %s (sheet=%s)", download_name, main_file_type)
             return _send_file_with_utf8_filename(pdf_path, download_name, ascii_fallback)
+
         else:
-            return jsonify({"error": f"Unknown file type '{file_type}'"}), 400
+            logger.warning("Unknown file type: %r => returning 400", file_type_param)
+            return jsonify({"error": f"Unknown file type '{file_type_param}'"}), 400
 
     except FileNotFoundError as e:
+        logger.error("FileNotFoundError: %s", e, exc_info=True)
         return jsonify({"error": f"FileNotFoundError: {e}"}), 404
     except PermissionError as e:
+        logger.error("PermissionError: %s", e, exc_info=True)
         return jsonify({"error": f"PermissionError: {e}"}), 403
+    except RuntimeError as e:
+        logger.error("RuntimeError: %s", e, exc_info=True)
+        return jsonify({"error": f"RuntimeError: {e}"}), 500
     except Exception as e:
         tb = traceback.format_exc()
+        logger.exception("Unhandled exception during download_site_diary_report:")
         return jsonify({"error": str(e), "traceback": tb}), 500
 
 
-def _send_file_with_utf8_filename(
-    file_path: str,
-    full_chinese_name: str,
-    ascii_fallback: str = None
-) -> Response:
-    """
-    改良後: 若有指定 ascii_fallback，則 filename="ascii_fallback";
-    否則就自動做個 fallback(全部非 ASCII 改成 '_').
-    而 filename*=UTF-8''... 用 full_chinese_name (URL-encoded)。
-    """
+def _send_file_with_utf8_filename(file_path: str, full_chinese_name: str, ascii_fallback: str = None) -> Response:
+    from flask import send_file
+    from urllib.parse import quote
+
     response = send_file(file_path, as_attachment=True)
 
     if not ascii_fallback:
-        # 若沒傳入 fallback => 將所有非 ASCII 改成 _
-        # (含中文皆視為非 ASCII)
-        ascii_fallback = "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "_" 
-                                 for ch in full_chinese_name)
-
-    # quote() 後只包含 ASCII 範圍字元
+        ascii_fallback = "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "_" for ch in full_chinese_name)
     utf8_quoted = quote(full_chinese_name, encoding="utf-8")
 
     disposition_value = (
         f'attachment; filename="{ascii_fallback}"; '
         f'filename*=UTF-8\'\'{utf8_quoted}'
     )
-    # encode+decode 防止任何潛在的超 ASCII 字元
+
     safe_disposition = disposition_value.encode('latin-1', 'replace').decode('latin-1')
     response.headers["Content-Disposition"] = safe_disposition
 
@@ -1210,43 +1251,54 @@ def _send_file_with_utf8_filename(
 
 @site_diary_bp.route('/<int:project_id>/site_diaries/last', methods=['GET'])
 def get_last_site_diary(project_id):
-    project = Project.query.get_or_404(project_id)
-    last_diary = (SiteDiary.query
-                  .filter_by(project_id=project.id)
-                  .order_by(SiteDiary.report_date.desc(), SiteDiary.id.desc())
-                  .first())
-    if not last_diary:
+    """
+    取得該 project 最後一筆日報(依報表日期 desc, id desc)
+    """
+    logger.debug("get_last_site_diary() called, project_id=%s", project_id)
+
+    project_doc = mongo.db.projects.find_one({"id": project_id})
+    if not project_doc:
+        logger.debug("Project not found for last site diary: project_id=%s", project_id)
         return jsonify({}), 200
 
-    worker_list = [{
-        "id": w.id,
-        "type": w.worker_type,
-        "quantity": w.quantity
-    } for w in last_diary.workers]
+    last_sd = mongo.db.site_diaries.find({"project_id": project_id}).sort("id", -1).limit(1)
+    last_diary = next(last_sd, None)
+    if not last_diary:
+        logger.debug("No diaries found for project_id=%s", project_id)
+        return jsonify({}), 200
 
-    machine_list = [{
-        "id": m.id,
-        "type": m.machine_type,
-        "quantity": m.quantity
-    } for m in last_diary.machines]
+    worker_list = [{"id": i, "type": w_type, "quantity": qty}
+                   for i, (w_type, qty) in enumerate(last_diary.get("workers", {}).items(), start=1)]
+    machine_list = [{"id": i, "type": m_type, "quantity": qty}
+                    for i, (m_type, qty) in enumerate(last_diary.get("machines", {}).items(), start=1)]
 
-    staff_list = [{
-        "id": st.id,
-        "name": st.name,
-        "role": st.role
-    } for st in last_diary.staffs]
+    staff_list = []
+    staff_ids = last_diary.get("staff_ids", [])
+    if staff_ids:
+        staff_docs = list(mongo.db.staff.find({"id": {"$in": staff_ids}}))
+        staff_map = {s["id"]: s for s in staff_docs}
+        for sid in staff_ids:
+            st_doc = staff_map.get(sid)
+            if st_doc:
+                staff_list.append({
+                    "id": st_doc["id"],
+                    "name": st_doc.get("name"),
+                    "role": st_doc.get("role")
+                })
 
     result = {
-        "id": last_diary.id,
-        "report_date": last_diary.report_date.isoformat() if last_diary.report_date else None,
-        "weather_morning": last_diary.weather_morning,
-        "weather_noon": last_diary.weather_noon,
-        "day_count": last_diary.day_count,
-        "summary": last_diary.summary,
+        "id": last_diary["id"],
+        "report_date": to_iso_date(last_diary.get("report_date")),
+        "weather_morning": last_diary.get("weather_morning", ""),
+        "weather_noon": last_diary.get("weather_noon", ""),
+        "day_count": last_diary.get("day_count"),
+        "summary": last_diary.get("summary", ""),
         "workers": worker_list,
         "machines": machine_list,
         "staffs": staff_list
     }
+
+    logger.debug("Returning last diary for project_id=%s => diary_id=%s", project_id, last_diary["id"])
     return jsonify(result), 200
 
 ================================================================================
@@ -1261,7 +1313,7 @@ import tempfile
 import shutil
 import subprocess
 from datetime import datetime
-from typing import Dict
+from typing import Dict, Any
 import platform
 from shutil import which
 
@@ -1269,91 +1321,53 @@ from flask import current_app
 from openpyxl import load_workbook
 from openpyxl.styles import Alignment
 
-from backend.project_management.models import Project, db
-from backend.site_diary.models import SiteDiary
+# ★ 新增：使用我們的 Mongo 物件
+from backend.db import mongo
 
 
-def auto_compute_day_count_if_needed(site_diary: SiteDiary):
+def generate_diary_xlsx_only(site_diary_doc: Dict[str, Any]) -> str:
     """
-    若使用者未手動指定 day_count，則自動計算為該專案已存在的最大 day_count + 1。
-    若尚無任何紀錄則從 1 開始。
+    產生/填寫 daily_report.xlsx 後，回傳填好的暫存 XLSX 檔路徑 (含所有工作表)。
+    目前只用 Sheet1/Sheet2，但整份 workbook 都會被保留。
     """
-    if site_diary.day_count is not None:
-        return
+    # 先依 project_id 找出對應的專案資料 (Mongo)
+    project_id = site_diary_doc.get("project_id")
+    project_doc = mongo.db.projects.find_one({"id": project_id})
+    if not project_doc:
+        raise ValueError("Project not found in MongoDB (id={}).".format(project_id))
 
-    max_day_count = db.session.query(db.func.max(SiteDiary.day_count)) \
-                              .filter_by(project_id=site_diary.project_id).scalar()
-    if max_day_count:
-        site_diary.day_count = max_day_count + 1
-    else:
-        site_diary.day_count = 1
+    # 日報日期
+    report_date = site_diary_doc.get("report_date")
+    # Mongodb 中該欄可能是 datetime 或 None
+    date_str = report_date.strftime("%Y-%m-%d") if report_date else ""
 
+    # 專案基本資訊
+    project_name = project_doc.get("name", "")
+    project_job_number = project_doc.get("job_number", "")
+    contractor_name = project_doc.get("contractor", "")
 
-def generate_diary_xlsx_only(site_diary: SiteDiary) -> str:
-    """
-    產生/填寫 daily_report.xlsx 後，回傳填好的暫存 XLSX 檔路徑。
-    同時依需求設定各 Sheet 之列印範圍（整份工作簿都會包含）。
-    """
-    project = Project.query.get(site_diary.project_id)
-    if not project:
-        raise ValueError("Project not found.")
+    # 日數 / 摘要 / 天氣
+    day_count_str = str(site_diary_doc.get("day_count", ""))
+    summary_str = site_diary_doc.get("summary", "")
+    weather_morning = site_diary_doc.get("weather_morning", "")
+    weather_noon = site_diary_doc.get("weather_noon", "")
 
-    # 找到 daily_report.xlsx 模板位置 (不寫死路徑)
-    template_path = os.path.join(
-        current_app.root_path,
-        'site_diary',
-        'templates',
-        'daily_report.xlsx'
-    )
-    if not os.path.isfile(template_path):
-        raise FileNotFoundError(
-            f"daily_report.xlsx not found at: {template_path}"
-        )
+    # 專案開始日期
+    start_date = project_doc.get("start_date")
+    start_date_str = start_date.strftime("%Y-%m-%d") if start_date else ""
 
-    # 在系統臨時資料夾中建立子資料夾
-    temp_dir = tempfile.mkdtemp(prefix="diary_xlsx_")
-
-    # 以報表日期組出檔名
-    date_str_for_filename = "noDate"
-    if site_diary.report_date:
-        date_str_for_filename = site_diary.report_date.strftime("%Y%m%d")
-
-    filled_xlsx_path = os.path.join(
-        temp_dir,
-        f"{date_str_for_filename}_daily_report.xlsx"
-    )
-
-    # 先把模板拷貝到暫存檔
-    shutil.copy(template_path, filled_xlsx_path)
-
-    # 打開並填寫
-    wb = load_workbook(filled_xlsx_path)
-
-    # 準備填入之資料
-    date_str = (site_diary.report_date.strftime("%Y-%m-%d")
-                if site_diary.report_date else "")
-    project_name = project.name or ""
-    project_job_number = project.job_number or ""
-    contractor_name = project.contractor or ""
-    day_count_str = str(site_diary.day_count) if site_diary.day_count else ""
-    summary_str = site_diary.summary or ""
-    weather_morning = site_diary.weather_morning or ""
-    weather_noon = site_diary.weather_noon or ""
-
-    if project.start_date:
-        start_date_str = project.start_date.strftime("%Y-%m-%d")
-    else:
-        start_date_str = ""
-
-    if project.duration_days:
-        if project.duration_type == 'business':
-            duration_str = f"{project.duration_days}工作天"
+    # 工期
+    duration_days = project_doc.get("duration_days")
+    duration_type = project_doc.get("duration_type")
+    if duration_days:
+        if duration_type == "business":
+            duration_str = f"{duration_days}工作天"
         else:
-            duration_str = f"{project.duration_days}天"
+            duration_str = f"{duration_days}天"
     else:
         duration_str = ""
 
-    # 映射工人/機器到對應的儲存格
+    # 建立 worker_map / machine_map => 對應 Excel 中的儲存格
     worker_map = {
         "地盤總管": "D19",
         "工程師":  "D20",
@@ -1374,10 +1388,42 @@ def generate_diary_xlsx_only(site_diary: SiteDiary) -> str:
         "風機":   "G21",
         "泥頭車": "G22",
         "吊機":   "G23",
-        "機炮":   "G24",
+        "機炮":   "G24",  # ★ 若有在表單中新增「機炮」，記得對應此儲存格
         "屈鐵機": "G25",
         "風車鋸": "G26",
     }
+
+    # 從 site_diary_doc 取出 workers/machines 這兩個 dict
+    workers_dict = site_diary_doc.get("workers", {})
+    machines_dict = site_diary_doc.get("machines", {})
+
+    # 找到 daily_report.xlsx 模板位置
+    template_path = os.path.join(
+        current_app.root_path,
+        'site_diary',
+        'templates',
+        'daily_report.xlsx'
+    )
+    if not os.path.isfile(template_path):
+        raise FileNotFoundError(f"daily_report.xlsx not found: {template_path}")
+
+    # 在系統臨時資料夾中建立暫存路徑
+    temp_dir = tempfile.mkdtemp(prefix="diary_xlsx_")
+
+    # 用報表日期組出輸出檔名
+    date_str_for_filename = "noDate" if not date_str else report_date.strftime("%Y%m%d")
+    filled_xlsx_path = os.path.join(
+        temp_dir,
+        f"{date_str_for_filename}_daily_report.xlsx"
+    )
+
+    # 複製模板
+    shutil.copy(template_path, filled_xlsx_path)
+
+    # 打開並填寫
+    wb = load_workbook(filled_xlsx_path)
+    # 目前預期兩個 sheet: 「每日施工進度報告表」「每日本地工人及外地勞工施工人員紀錄表」
+    # 若沒有可視情況忽略
 
     # Sheet1: "每日施工進度報告表"
     if "每日施工進度報告表" in wb.sheetnames:
@@ -1415,20 +1461,16 @@ def generate_diary_xlsx_only(site_diary: SiteDiary) -> str:
         sh1["B10"].alignment = Alignment(horizontal='center', vertical='center')
 
         # 工人數量
-        worker_dict = {w.worker_type: w.quantity for w in site_diary.workers}
         for w_type, cell_ref in worker_map.items():
-            qty = worker_dict.get(w_type, 0)
-            cell_obj = sh1[cell_ref]
-            cell_obj.value = str(qty) if qty else ""
-            cell_obj.alignment = Alignment(horizontal='center', vertical='center')
+            qty = workers_dict.get(w_type, 0)
+            sh1[cell_ref].value = str(qty) if qty else ""
+            sh1[cell_ref].alignment = Alignment(horizontal='center', vertical='center')
 
         # 機器數量
-        machine_dict = {m.machine_type: m.quantity for m in site_diary.machines}
         for m_type, cell_ref in machine_map.items():
-            qty = machine_dict.get(m_type, 0)
-            cell_obj = sh1[cell_ref]
-            cell_obj.value = str(qty) if qty else ""
-            cell_obj.alignment = Alignment(horizontal='center', vertical='center')
+            qty = machines_dict.get(m_type, 0)
+            sh1[cell_ref].value = str(qty) if qty else ""
+            sh1[cell_ref].alignment = Alignment(horizontal='center', vertical='center')
 
         # 列印範圍
         sh1.print_area = "A1:L46"
@@ -1436,17 +1478,21 @@ def generate_diary_xlsx_only(site_diary: SiteDiary) -> str:
     # Sheet2: "每日本地工人及外地勞工施工人員紀錄表"
     if "每日本地工人及外地勞工施工人員紀錄表" in wb.sheetnames:
         sh2 = wb["每日本地工人及外地勞工施工人員紀錄表"]
-        b3_date = (site_diary.report_date.strftime("%Y/%m/%d")
-                   if site_diary.report_date else "")
+
+        # B3 放日期 (用 YYYY/MM/DD)
+        b3_date = report_date.strftime("%Y/%m/%d") if report_date else ""
         sh2["B3"].value = b3_date
         sh2["B3"].alignment = Alignment(horizontal='center', vertical='center')
 
+        # 專案名稱
         sh2["B6"].value = project_name
         sh2["B6"].alignment = Alignment(horizontal='center', vertical='center')
 
+        # 工程編號
         sh2["B7"].value = project_job_number
         sh2["B7"].alignment = Alignment(horizontal='center', vertical='center')
 
+        # 承建商
         sh2["B8"].value = contractor_name
         sh2["B8"].alignment = Alignment(horizontal='center', vertical='center')
 
@@ -1459,81 +1505,80 @@ def generate_diary_xlsx_only(site_diary: SiteDiary) -> str:
     return filled_xlsx_path
 
 
-def generate_diary_pdf_sheet(site_diary: SiteDiary, sheet_name: str) -> str:
+def generate_diary_pdf_sheet(site_diary_doc: Dict[str, Any], sheet_name: str) -> str:
     """
-    依照 sheet_name ('sheet1' or 'sheet2')，只輸出對應工作表的 PDF：
-      - sheet1 => "每日施工進度報告表.pdf"
-      - sheet2 => "每日本地工人及外地勞工施工人員紀錄表.pdf"
-    並以 --convert-to pdf:calc_pdf_Export + --infilter="Calc Office Open XML"
-    匯出。若子程序執行失敗，印出 debug log 以便排查。
+    依照 sheet_name ('sheet1' or 'sheet2')，只輸出對應工作表的 PDF:
+      - sheet1 => "每日施工進度報告表"
+      - sheet2 => "每日本地工人及外地勞工施工人員紀錄表"
 
-    ★ 轉檔完成後，我們會將 LibreOffice 輸出的檔名改為程式預期的 pdf_path，
-      避免 "找不到輸出檔" 的狀況。
+    內部流程：
+      1) 先 generate_diary_xlsx_only() 產生含所有工作表的 XLSX
+      2) 複製一份，刪掉不必要的工作表，只保留目標表
+      3) 用 LibreOffice CLI 轉成 PDF (指定內嵌字型、PDF/A-1) 以避免中文亂碼
+      4) 回傳轉好的 PDF 路徑
     """
-    project = Project.query.get(site_diary.project_id)
-    if not project:
-        raise ValueError("Project not found.")
-
-    # 先用 XLSX 產生整本工作簿
-    xlsx_path = generate_diary_xlsx_only(site_diary)
+    # 產生整本 XLSX
+    xlsx_path = generate_diary_xlsx_only(site_diary_doc)
     temp_dir = os.path.dirname(xlsx_path)
 
-    date_str = "noDate"
-    if site_diary.report_date:
-        date_str = site_diary.report_date.strftime("%Y%m%d")
+    # 報表日期（命名用）
+    report_date = site_diary_doc.get("report_date")
+    date_str_for_filename = "noDate"
+    if report_date:
+        date_str_for_filename = report_date.strftime("%Y%m%d")
 
+    # 決定要保留的工作表名稱
     if sheet_name == 'sheet1':
-        pdf_filename = f"{date_str}每日施工進度報告表.pdf"
         target_sheet_name = "每日施工進度報告表"
+        pdf_filename = f"{date_str_for_filename}每日施工進度報告表.pdf"
     else:
-        pdf_filename = f"{date_str}施工人員紀錄表.pdf"
         target_sheet_name = "每日本地工人及外地勞工施工人員紀錄表"
+        pdf_filename = f"{date_str_for_filename}施工人員紀錄表.pdf"
 
-    # 程式想要最終回傳的 PDF 路徑
     pdf_path = os.path.join(temp_dir, pdf_filename)
 
-    # 另存一份只保留指定工作表的 XLSX
-    single_sheet_xlsx = os.path.join(temp_dir, f"{date_str}_{sheet_name}_only.xlsx")
+    # 先另存一份只保留指定工作表的 XLSX
+    single_sheet_xlsx = os.path.join(temp_dir, f"{date_str_for_filename}_{sheet_name}_only.xlsx")
     shutil.copy(xlsx_path, single_sheet_xlsx)
 
     wb = load_workbook(single_sheet_xlsx)
     if target_sheet_name not in wb.sheetnames:
         wb.close()
-        raise RuntimeError(f"目標工作表 '{target_sheet_name}' 不存在")
+        raise RuntimeError(f"指定工作表 '{target_sheet_name}' 不存在於模板中。")
 
+    # 刪除其他工作表
     for sn in wb.sheetnames:
         if sn != target_sheet_name:
             wb.remove(wb[sn])
     wb.save(single_sheet_xlsx)
     wb.close()
 
+    # 執行 LibreOffice CLI 轉 PDF
     lo_exec = get_libreoffice_cmd()
-
-    # 設定輸入 & 輸出 filter
     input_filter = "Calc Office Open XML"
-    output_filter = "pdf:calc_pdf_Export"
 
-    # 根據作業系統，組合子程序指令
+    # ★ 關鍵修正：為了避免中文亂碼，指定 PDF/A-1 與 EmbedStandardFonts=true
+    #   'SelectPdfVersion=1;EmbedStandardFonts=true'
+    pdf_filter_options = "SelectPdfVersion=1;EmbedStandardFonts=true"
+
+    # 在 calc_pdf_Export 後面加上 :<options> 即可
+    # 參考: https://wiki.openoffice.org/wiki/API/Tutorials/PDF_export
+    output_filter = f"pdf:calc_pdf_Export:{pdf_filter_options}"
+
+    # 建立子程序指令 (區分 Windows / 其他系統)
     if platform.system().lower().startswith("win"):
+        # Windows
         cmd = (
             f'"{lo_exec}" --headless --convert-to "{output_filter}" '
             f'--infilter="{input_filter}" "{single_sheet_xlsx}" --outdir "{temp_dir}"'
         )
-        print("==== DEBUG => LibreOffice command (Windows) ====")
-        print(cmd)
         try:
             result = subprocess.run(cmd, shell=True, check=True, capture_output=True)
-            print("==== DEBUG => LibreOffice stdout ====")
-            print(result.stdout.decode('utf-8', errors='replace'))
-            print("==== DEBUG => LibreOffice stderr ====")
-            print(result.stderr.decode('utf-8', errors='replace'))
         except subprocess.CalledProcessError as e:
-            print("==== DEBUG => LibreOffice ERROR return code:", e.returncode)
-            print("==== DEBUG => LibreOffice ERROR output ====")
-            if e.stderr:
-                print(e.stderr.decode('utf-8', errors='replace'))
-            raise RuntimeError(f"LibreOffice PDF conversion failed: {e}") from e
+            err_msg = e.stderr.decode('utf-8', errors='replace') if e.stderr else str(e)
+            raise RuntimeError(f"LibreOffice PDF conversion failed (Windows): {err_msg}") from e
     else:
+        # Linux / Mac
         cmd_list = [
             lo_exec, "--headless",
             "--convert-to", output_filter,
@@ -1541,52 +1586,38 @@ def generate_diary_pdf_sheet(site_diary: SiteDiary, sheet_name: str) -> str:
             single_sheet_xlsx,
             "--outdir", temp_dir
         ]
-        print("==== DEBUG => LibreOffice command (Non-Windows) ====")
-        print(cmd_list)
         try:
             result = subprocess.run(cmd_list, shell=False, check=True, capture_output=True)
-            print("==== DEBUG => LibreOffice stdout ====")
-            print(result.stdout.decode('utf-8', errors='replace'))
-            print("==== DEBUG => LibreOffice stderr ====")
-            print(result.stderr.decode('utf-8', errors='replace'))
         except subprocess.CalledProcessError as e:
-            print("==== DEBUG => LibreOffice ERROR return code:", e.returncode)
-            print("==== DEBUG => LibreOffice ERROR output ====")
-            if e.stderr:
-                print(e.stderr.decode('utf-8', errors='replace'))
-            raise RuntimeError(f"LibreOffice PDF conversion failed: {e}") from e
+            err_msg = e.stderr.decode('utf-8', errors='replace') if e.stderr else str(e)
+            raise RuntimeError(f"LibreOffice PDF conversion failed: {err_msg}") from e
 
-    # ★ LibreOffice 轉檔後實際產生的檔案，預設會以 XLSX 同名但副檔名 .pdf
-    #   例如 single_sheet_xlsx = C:\...\20250204_sheet1_only.xlsx
-    #   則輸出多半是 C:\...\20250204_sheet1_only.pdf
+    # LibreOffice 轉檔後，一般會輸出同名 .pdf
     generated_pdf_name = os.path.splitext(single_sheet_xlsx)[0] + ".pdf"
 
-    # 檔案若確實存在，就將它改名成我們想要的 pdf_path
     if os.path.isfile(generated_pdf_name):
         os.rename(generated_pdf_name, pdf_path)
     else:
-        raise RuntimeError(f"PDF 轉檔失敗：找不到 {generated_pdf_name}")
+        raise RuntimeError(f"PDF 轉檔失敗: {generated_pdf_name} 不存在")
 
-    # 檢查改名後的新檔名是否存在
     if not os.path.isfile(pdf_path):
-        raise RuntimeError(f"PDF 轉檔失敗：找不到 {pdf_path}")
+        raise RuntimeError(f"PDF 轉檔失敗: {pdf_path} 不存在")
 
     return pdf_path
 
 
 def get_libreoffice_cmd() -> str:
     """
-    智能取得 LibreOffice 執行檔：
-      1) 若有環境變數 LIBREOFFICE_PATH（指向檔案或資料夾）則使用
-      2) 否則嘗試於 PATH 搜尋 'soffice' 或 'libreoffice'
-      3) 全部找不到則拋錯
+    取得 LibreOffice 執行檔路徑:
+      1) 若有環境變數 LIBREOFFICE_PATH，先檢查是否有效
+      2) 否則嘗試 which('soffice') 或 which('libreoffice')
+      3) 全部找不到就拋錯
     """
     custom_path = os.environ.get("LIBREOFFICE_PATH")
     if custom_path:
-        # 如果是檔案 => 直接用
+        # 可能是完整檔案 or 資料夾
         if os.path.isfile(custom_path):
             return custom_path
-        # 若只是資料夾，嘗試補上 soffice / libreoffice
         soffice_path = os.path.join(custom_path, "soffice")
         libreoffice_path = os.path.join(custom_path, "libreoffice")
         if os.path.isfile(soffice_path):
@@ -1595,53 +1626,15 @@ def get_libreoffice_cmd() -> str:
             return libreoffice_path
         raise RuntimeError(f"LIBREOFFICE_PATH 無效: {custom_path}")
 
-    # 無自定義 => 從 PATH 中找 soffice / libreoffice
+    # 無自訂 => 用 which 找 soffice / libreoffice
     for candidate in ("soffice", "libreoffice"):
         exe_path = which(candidate)
         if exe_path:
             return exe_path
 
     raise RuntimeError(
-        "系統上找不到 soffice 或 libreoffice，可執行檔未安裝或未加入 PATH。"
-        "請安裝 LibreOffice 或於環境變數 LIBREOFFICE_PATH 指定執行檔路徑。"
+        "無法自動找到 libreoffice/soffice！請安裝 LibreOffice 或設定 LIBREOFFICE_PATH"
     )
-
-================================================================================
-
-backend/staff_management/models.py
-
-================================================================================
-# backend/staff_management/models.py
-from flask_sqlalchemy import SQLAlchemy
-from datetime import datetime
-
-from backend.project_management.models import db
-
-class Staff(db.Model):
-    """
-    施工人員 (Staff)，用來全域管理可用人員
-    """
-    __tablename__ = 'staff'
-
-    id = db.Column(db.Integer, primary_key=True)
-    name = db.Column(db.String(100), nullable=False)  # 人員姓名
-    role = db.Column(db.String(100), nullable=True)    # 角色、職稱(可選)
-
-    # 與 SiteDiary 的多對多關係
-    site_diaries = db.relationship('SiteDiary',
-                                   secondary='site_diary_staff',
-                                   back_populates='staffs',
-                                   lazy=True)
-
-
-class SiteDiaryStaff(db.Model):
-    """
-    替代原本 DailyReportStaff：中介表 (site_diary_staff)
-    """
-    __tablename__ = 'site_diary_staff'
-
-    site_diary_id = db.Column(db.Integer, db.ForeignKey('site_diaries.id'), primary_key=True)
-    staff_id = db.Column(db.Integer, db.ForeignKey('staff.id'), primary_key=True)
 
 ================================================================================
 
@@ -1649,46 +1642,52 @@ backend/staff_management/routes.py
 
 ================================================================================
 # backend/staff_management/routes.py
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request, jsonify, abort
 
-# 改用 from backend.project_management.models
-from backend.project_management.models import db
-from .models import Staff
+from backend.db import mongo, get_next_sequence
 
 staff_bp = Blueprint('staff_bp', __name__)
 
 @staff_bp.route('', methods=['GET'])
 def list_staff():
-    staff_list = Staff.query.all()
+    cursor = mongo.db.staff.find({}, sort=[("id", 1)])
     results = []
-    for s in staff_list:
+    for s in cursor:
         results.append({
-            "id": s.id,
-            "name": s.name,
-            "role": s.role
+            "id": s["id"],
+            "name": s.get("name", ""),
+            "role": s.get("role", "")
         })
     return jsonify(results), 200
 
+
 @staff_bp.route('', methods=['POST'])
 def create_staff():
-    data = request.json
-    staff = Staff(
-        name=data['name'],
-        role=data.get('role', '')
-    )
-    db.session.add(staff)
-    db.session.commit()
+    data = request.json or {}
+    name = data.get("name")
+    if not name:
+        return jsonify({"error": "Name is required"}), 400
+
+    role = data.get("role", "")
+    new_id = get_next_sequence("staff")
+    doc = {
+        "id": new_id,
+        "name": name,
+        "role": role
+    }
+    mongo.db.staff.insert_one(doc)
+
     return jsonify({
         "message": "Staff created",
-        "staff_id": staff.id
+        "staff_id": new_id
     }), 201
 
-# ★ 新增：刪除人員
+
 @staff_bp.route('/<int:staff_id>', methods=['DELETE'])
 def delete_staff(staff_id):
-    staff = Staff.query.get_or_404(staff_id)
-    db.session.delete(staff)
-    db.session.commit()
+    result = mongo.db.staff.delete_one({"id": staff_id})
+    if result.deleted_count == 0:
+        abort(404, description="Staff not found")
     return jsonify({"message": "Staff deleted"}), 200
 
 ================================================================================
@@ -5810,7 +5809,7 @@ package.json
 
 ================================================================================
 {
-    "name": "my-heroku-app",
+    "name": "work-project",
     "version": "1.0.0",
     "scripts": {
       "heroku-postbuild": "cd frontend && npm install && npm run build"

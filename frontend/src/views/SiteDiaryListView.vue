@@ -1,111 +1,122 @@
-<!-- frontend/src/views/SiteDiaryListView.vue -->
 <template>
-  <v-container
-    fluid
-    style="max-width:2000px; margin:0 auto;"
-  >
-    <!-- 此行修改為 2000px，以使列表更寬 -->
-
+  <div class="container-fluid" style="max-width:2000px; margin:0 auto;">
     <h2>Site Diaries Management</h2>
 
-    <div v-if="projectInfo" class="project-info-box mb-4">
+    <div v-if="projectInfo" class="border p-3 mb-4">
       <h3>Project: {{ projectInfo.name }}</h3>
       <p>Owner: {{ projectInfo.owner }}</p>
     </div>
 
-    <v-btn color="success" class="mb-4" @click="openCreateDialog">
+    <button class="btn btn-success mb-4" @click="openCreateDialog">
       NEW SITE DIARY
-    </v-btn>
+    </button>
 
-    <!-- 
-      外層包一層可水平捲動的 div，
-      以防在小螢幕或欄位較多時，仍能左右捲動 
-    -->
-    <div class="table-scroll-wrapper">
-      <v-data-table
-        :headers="headers"
-        :items="siteDiaries"
-        :density="'compact'"
-        class="mb-6 diary-table"
-        :sort-by="['report_date']"
-        :sort-desc="[true]"
-        show-expand
-        :items-per-page="-1"
-        item-key="id"
-      >
-        <!-- 
-          ↑ 使用 :items-per-page="-1" 使預設顯示所有資料、不分頁 
-        -->
-
-        <!-- # 欄位：顯示索引 (row index + 1) -->
-        <template #item.index="{ index }">
-          {{ index + 1 }}
-        </template>
-
-        <!-- last edited( updated_at ) 直接顯示 item.updated_at (字串) -->
-        <template #item.updated_at="{ item }">
-          {{ item.updated_at || '' }}
-        </template>
-
-        <!-- EDIT 按鈕 -->
-        <template #item.edit="{ item }">
-          <v-btn color="warning" variant="text" @click="openEditDialog(item.id)">
-            EDIT
-          </v-btn>
-        </template>
-
-        <!-- DELETE 按鈕 -->
-        <template #item.delete="{ item }">
-          <v-btn color="error" variant="text" @click="deleteDiary(item.id)">
-            DELETE
-          </v-btn>
-        </template>
-
-        <!-- DOWNLOAD 下拉 -->
-        <template #item.download="{ item }">
-          <v-menu>
-            <template #activator="{ props }">
-              <v-btn v-bind="props" variant="outlined" color="info">
-                DOWNLOAD
-              </v-btn>
-            </template>
-            <v-list>
-              <v-list-item @click="downloadReport(item.id, 'xlsx')">
-                <v-list-item-title>Excel (XLSX)</v-list-item-title>
-              </v-list-item>
-              <v-list-item @click="downloadReport(item.id, 'sheet1')">
-                <v-list-item-title>PDF(表1)</v-list-item-title>
-              </v-list-item>
-              <v-list-item @click="downloadReport(item.id, 'sheet2')">
-                <v-list-item-title>PDF(表2)</v-list-item-title>
-              </v-list-item>
-            </v-list>
-          </v-menu>
-        </template>
-      </v-data-table>
+    <div class="table-responsive">
+      <table class="table table-bordered table-hover mb-6">
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>日期</th>
+            <th>天氣(早)</th>
+            <th>天氣(中)</th>
+            <th>日數</th>
+            <th>Last Edited</th>
+            <th>EDIT</th>
+            <th>DELETE</th>
+            <th>DOWNLOAD</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr
+            v-for="(item, index) in siteDiaries"
+            :key="item.id"
+          >
+            <td>{{ index + 1 }}</td>
+            <td>{{ item.report_date }}</td>
+            <td>{{ item.weather_morning }}</td>
+            <td>{{ item.weather_noon }}</td>
+            <td>{{ item.day_count }}</td>
+            <td>{{ item.updated_at || '' }}</td>
+            <td>
+              <button class="btn btn-warning btn-sm" @click="openEditDialog(item.id)">
+                EDIT
+              </button>
+            </td>
+            <td>
+              <button class="btn btn-danger btn-sm" @click="deleteDiary(item.id)">
+                DELETE
+              </button>
+            </td>
+            <td>
+              <div class="dropdown">
+                <button
+                  class="btn btn-info btn-sm dropdown-toggle"
+                  type="button"
+                  data-bs-toggle="dropdown"
+                >
+                  DOWNLOAD
+                </button>
+                <ul class="dropdown-menu">
+                  <li>
+                    <a
+                      class="dropdown-item"
+                      href="#"
+                      @click.prevent="downloadReport(item.id, 'xlsx')"
+                    >
+                      Excel (XLSX)
+                    </a>
+                  </li>
+                  <li>
+                    <a
+                      class="dropdown-item"
+                      href="#"
+                      @click.prevent="downloadReport(item.id, 'sheet1')"
+                    >
+                      PDF(表1)
+                    </a>
+                  </li>
+                  <li>
+                    <a
+                      class="dropdown-item"
+                      href="#"
+                      @click.prevent="downloadReport(item.id, 'sheet2')"
+                    >
+                      PDF(表2)
+                    </a>
+                  </li>
+                </ul>
+              </div>
+            </td>
+          </tr>
+        </tbody>
+      </table>
     </div>
 
-    <!-- 表單對話框 -->
-    <v-dialog
-      v-model="displayFormDialog"
-      max-width="1200px"
-      persistent
+    <!-- Form Modal -->
+    <div
+      class="modal fade"
+      :class="{ show: displayFormDialog }"
+      style="display: block;"
+      tabindex="-1"
+      role="dialog"
+      v-if="displayFormDialog"
     >
-      <v-card>
-        <v-card-title>
-          <span class="text-h6">Site Diary</span>
-        </v-card-title>
-        <v-card-text>
-          <SiteDiaryForm
-            :projectId="projectIdNumber"
-            :diaryId="editingDiaryId"
-            @updated="onDiaryUpdated"
-            @cancel="onDiaryCancelled"
-          />
-        </v-card-text>
-      </v-card>
-    </v-dialog>
-  </v-container>
+      <div class="modal-dialog modal-xl" role="document">
+        <div class="modal-content">
+          <div class="modal-body">
+            <SiteDiaryForm
+              :projectId="projectIdNumber"
+              :diaryId="editingDiaryId"
+              @updated="onDiaryUpdated"
+              @cancel="onDiaryCancelled"
+            />
+          </div>
+        </div>
+      </div>
+      <!-- backdrop -->
+      <div class="modal-backdrop fade show"></div>
+    </div>
+  </div>
 </template>
 
 <script>
@@ -124,22 +135,8 @@ export default {
     const displayFormDialog = ref(false)
     const editingDiaryId = ref(null)
 
-    // 預設欄位配置
-    const headers = ref([
-      { text: '#', value: 'index', width: 50, align: 'center', sortable: false },
-      { text: '日期', value: 'report_date', width: 130, align: 'start', sortable: true },
-      { text: '天氣(早)', value: 'weather_morning', width: 90, align: 'center', sortable: true },
-      { text: '天氣(中)', value: 'weather_noon', width: 90, align: 'center', sortable: true },
-      { text: '日數', value: 'day_count', width: 60, align: 'center', sortable: true },
-      { text: 'Last Edited', value: 'updated_at', align: 'start', sortable: true },
-      { text: 'EDIT', value: 'edit', sortable: false, width: 70, align: 'center' },
-      { text: 'DELETE', value: 'delete', sortable: false, width: 80, align: 'center' },
-      { text: 'DOWNLOAD', value: 'download', sortable: false, width: 110, align: 'center' }
-    ])
-
     const projectIdNumber = computed(() => Number(route.params.projectId))
 
-    // 取得專案資訊
     const fetchProjectInfo = async () => {
       try {
         const { data } = await axios.get(`/api/projects/${projectIdNumber.value}`)
@@ -149,7 +146,6 @@ export default {
       }
     }
 
-    // 取得該專案的所有日報
     const fetchSiteDiaries = async () => {
       try {
         const { data } = await axios.get(
@@ -161,19 +157,16 @@ export default {
       }
     }
 
-    // 建立新的 SiteDiary
     const openCreateDialog = () => {
       editingDiaryId.value = null
       displayFormDialog.value = true
     }
 
-    // 編輯 SiteDiary
     const openEditDialog = (diaryId) => {
       editingDiaryId.value = diaryId
       displayFormDialog.value = true
     }
 
-    // 刪除 SiteDiary
     const deleteDiary = async (diaryId) => {
       if (!confirm('Are you sure you want to delete this Site Diary?')) return
       try {
@@ -185,21 +178,20 @@ export default {
       }
     }
 
-    // 下載報表 (XLSX, PDF(表1), PDF(表2))
     const downloadReport = async (diaryId, fileType) => {
       try {
         const response = await axios.get(
           `/api/projects/${projectIdNumber.value}/site_diaries/${diaryId}/download_report?file=${fileType}`,
           { responseType: 'blob' }
         )
+        let filename =
+          fileType === 'xlsx'
+            ? 'daily_report_filled.xlsx'
+            : fileType === 'sheet1'
+            ? 'daily_report_sheet1.pdf'
+            : 'daily_report_sheet2.pdf'
 
-        let filename = fileType === 'xlsx'
-          ? 'daily_report_filled.xlsx'
-          : (fileType === 'sheet1'
-              ? 'daily_report_sheet1.pdf'
-              : 'daily_report_sheet2.pdf')
-
-        // 嘗試從後端 headers 裡拿檔名
+        // 嘗試從 headers 取得 filename
         const contentDisposition = response.headers['content-disposition']
         if (contentDisposition) {
           const cdRegex = /filename[^;=\n]*=((['"]).*?\2|[^;\n]*)/
@@ -222,13 +214,11 @@ export default {
       }
     }
 
-    // 當表單存檔成功
     const onDiaryUpdated = () => {
       displayFormDialog.value = false
       fetchSiteDiaries()
     }
 
-    // 當表單取消
     const onDiaryCancelled = () => {
       displayFormDialog.value = false
     }
@@ -243,7 +233,6 @@ export default {
       projectInfo,
       displayFormDialog,
       editingDiaryId,
-      headers,
       projectIdNumber,
       openCreateDialog,
       openEditDialog,
@@ -257,25 +246,6 @@ export default {
 </script>
 
 <style scoped>
-.project-info-box {
-  border: 1px solid #ccc;
-  padding: 10px;
-  background-color: #f9f9f9;
-  margin-bottom: 16px;
-}
-
-/* 用於在小螢幕或欄位多時，允許水平捲動 */
-.table-scroll-wrapper {
-  width: 100%;
-  overflow-x: auto;
-  margin-bottom: 16px;
-}
-
-/* 使表格最小寬度稍微大些 */
-.diary-table {
-  min-width: 900px;
-}
-
 .mb-4 {
   margin-bottom: 16px;
 }

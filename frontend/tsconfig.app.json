@@ -6,7 +6,9 @@
     "composite": true,
     "baseUrl": ".",
     "moduleResolution": "node",
-    "types": ["node", "vuetify"],
+    "types": [
+      "node"
+    ],
     "paths": {
       "@/*": ["./src/*"]
     }

@@ -1,45 +1,61 @@
 <template>
-  <div>
+  <div class="container">
     <h1>人員管理</h1>
 
-    <!-- 以 Vuetify 的 v-data-table 展示 staffList -->
-    <v-data-table
-      :headers="headers"
-      :items="staffList"
-      class="mb-6"
-    >
-      <!-- Actions 欄位 (刪除按鈕) -->
-      <template #item.actions="{ item }">
-        <v-btn color="error" variant="outlined" @click="deleteStaff(item.id)">
-          Delete
-        </v-btn>
-      </template>
-    </v-data-table>
+    <table class="table table-bordered mb-6">
+      <thead>
+        <tr>
+          <th>ID</th>
+          <th>Name</th>
+          <th>Role</th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr v-for="item in staffList" :key="item.id">
+          <td>{{ item.id }}</td>
+          <td>{{ item.name }}</td>
+          <td>{{ item.role }}</td>
+          <td>
+            <button
+              class="btn btn-danger btn-sm"
+              @click="deleteStaff(item.id)"
+            >
+              Delete
+            </button>
+          </td>
+        </tr>
+      </tbody>
+    </table>
 
-    <!-- 新增人員表單 -->
     <h3>新增人員</h3>
-    <v-card class="pa-4">
-      <v-text-field
-        v-model="name"
-        label="姓名"
-        class="mb-3"
-      />
-      <v-text-field
-        v-model="role"
-        label="角色"
-        class="mb-3"
-      />
-      <v-btn variant="outlined" color="primary" @click="createStaff">
+    <div class="border p-3 mb-6">
+      <div class="mb-3">
+        <label class="form-label">姓名</label>
+        <input
+          type="text"
+          v-model="name"
+          class="form-control"
+        />
+      </div>
+      <div class="mb-3">
+        <label class="form-label">角色</label>
+        <input
+          type="text"
+          v-model="role"
+          class="form-control"
+        />
+      </div>
+      <button class="btn btn-primary" @click="createStaff">
         新增
-      </v-btn>
-    </v-card>
+      </button>
+    </div>
   </div>
 </template>
 
 <script>
 import axios from 'axios'
 import { ref, onMounted } from 'vue'
-// Vuetify 已在 main.ts 裝入，這裡只需使用即可
 
 export default {
   name: 'StaffView',
@@ -47,14 +63,6 @@ export default {
     const staffList = ref([])
     const name = ref('')
     const role = ref('')
-
-    // v-data-table 的表頭設定
-    const headers = ref([
-      { text: 'ID', value: 'id', width: 80 },
-      { text: 'Name', value: 'name' },
-      { text: 'Role', value: 'role' },
-      { text: 'Actions', value: 'actions', sortable: false }
-    ])
 
     const fetchStaff = async () => {
       try {
@@ -98,7 +106,6 @@ export default {
 
     return {
       staffList,
-      headers,
       name,
       role,
       createStaff,

@@ -1,41 +1,83 @@
 <template>
   <div>
-    <v-data-table
-      :headers="headers"
-      :items="projects"
-      :density="'compact'"
-      class="mb-6"
-    >
-      <template #item.actions="{ item }">
-        <v-btn color="info" variant="text" class="me-2" @click="showDetail(item.id)">
-          Detail
-        </v-btn>
-        <v-btn color="warning" variant="text" class="me-2" @click="editProject(item.id)">
-          Edit
-        </v-btn>
-        <v-btn color="error" variant="text" @click="deleteProject(item.id)">
-          Delete
-        </v-btn>
-      </template>
-    </v-data-table>
+    <!-- 專案列表 Table -->
+    <table class="table table-bordered table-hover mb-6">
+      <thead>
+        <tr>
+          <th>ID</th>
+          <th>Project Name</th>
+          <th>Job #</th>
+          <th>Contractor</th>
+          <th>Start Date</th>
+          <th>End Date</th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr v-for="item in projects" :key="item.id">
+          <td>{{ item.id }}</td>
+          <td>{{ item.name }}</td>
+          <td>{{ item.job_number }}</td>
+          <td>{{ item.contractor }}</td>
+          <td>{{ item.start_date }}</td>
+          <td>{{ item.end_date }}</td>
+          <td>
+            <button class="btn btn-info btn-sm me-2" @click="showDetail(item.id)">
+              Detail
+            </button>
+            <button class="btn btn-warning btn-sm me-2" @click="editProject(item.id)">
+              Edit
+            </button>
+            <button class="btn btn-danger btn-sm" @click="deleteProject(item.id)">
+              Delete
+            </button>
+          </td>
+        </tr>
+      </tbody>
+    </table>
 
-    <!-- 詳細資訊 Dialog -->
-    <v-dialog v-model="detailDialog" max-width="600px">
-      <v-card>
-        <v-card-title>
-          <span class="text-h6">Project Detail</span>
-        </v-card-title>
-        <v-card-text>
-          <ProjectDetail :projectId="detailProjectId" />
-        </v-card-text>
-        <v-card-actions>
-          <v-spacer></v-spacer>
-          <v-btn color="primary" text @click="detailDialog=false">
-            Close
-          </v-btn>
-        </v-card-actions>
-      </v-card>
-    </v-dialog>
+    <!-- Detail Modal (Bootstrap) -->
+    <div
+      class="modal"
+      :class="{ fade: true, show: detailDialog }"
+      :style="{ display: detailDialog ? 'block' : 'none' }"
+      tabindex="-1"
+      role="dialog"
+      aria-modal="true"
+      v-if="detailDialog"
+      @click.self="detailDialog = false"
+    >
+      <div class="modal-dialog" role="document">
+        <div class="modal-content">
+          <div class="modal-header">
+            <h5 class="modal-title">Project Detail</h5>
+            <button
+              type="button"
+              class="btn-close"
+              @click="detailDialog = false"
+            ></button>
+          </div>
+          <div class="modal-body">
+            <ProjectDetail :projectId="detailProjectId" />
+          </div>
+          <div class="modal-footer">
+            <button
+              type="button"
+              class="btn btn-secondary"
+              @click="detailDialog = false"
+            >
+              Close
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Modal backdrop -->
+    <div
+      v-if="detailDialog"
+      class="modal-backdrop fade show"
+    ></div>
   </div>
 </template>
 
@@ -55,18 +97,7 @@ export default {
   data() {
     return {
       detailDialog: false,
-      detailProjectId: null,
-      headers: [
-        { text: 'ID', value: 'id', width: 60 },
-        { text: 'Project Name', value: 'name' },
-        // ★ 新增兩欄做示範 (工作編號、承建商)
-        { text: 'Job #', value: 'job_number', width: 120 },
-        { text: 'Contractor', value: 'contractor' },
-        // ---
-        { text: 'Start Date', value: 'start_date', width: 120 },
-        { text: 'End Date', value: 'end_date', width: 120 },
-        { text: 'Actions', value: 'actions', sortable: false }
-      ]
+      detailProjectId: null
     }
   },
   methods: {
@@ -75,7 +106,6 @@ export default {
       this.detailDialog = true
     },
     editProject(projectId) {
-      // 發出事件給父層(ProjectsView)
       this.$emit('edit-project', projectId)
     },
     async deleteProject(id) {
@@ -92,10 +122,18 @@ export default {
 </script>
 
 <style scoped>
+.me-2 {
+  margin-right: 8px;
+}
 .mb-6 {
   margin-bottom: 24px;
 }
-.me-2 {
-  margin-right: 8px;
+
+/* ★ 關鍵：確保 modal 與 backdrop 層級正確 */
+.modal {
+  z-index: 1050; /* Bootstrap默認modal z-index */
+}
+.modal-backdrop {
+  z-index: 1040; /* 低於modal即可 */
 }
 </style>

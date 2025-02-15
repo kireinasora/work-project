@@ -1,101 +1,137 @@
 <template>
-  <v-container fluid>
-    <v-form @submit.prevent="handleSubmit">
-      <v-row dense>
-        <v-col cols="12" md="6">
-          <v-text-field
-            label="Project Name"
+  <div>
+    <form @submit.prevent="handleSubmit">
+      <div class="mb-3 row">
+        <label class="col-sm-3 col-form-label">Project Name</label>
+        <div class="col-sm-9">
+          <input
+            type="text"
             v-model="formData.name"
+            class="form-control"
             required
           />
-        </v-col>
-        <v-col cols="12" md="6">
-          <v-text-field
-            label="Owner"
+        </div>
+      </div>
+
+      <div class="mb-3 row">
+        <label class="col-sm-3 col-form-label">Owner</label>
+        <div class="col-sm-9">
+          <input
+            type="text"
             v-model="formData.owner"
+            class="form-control"
           />
-        </v-col>
-      </v-row>
+        </div>
+      </div>
 
-      <!-- 新增：工作編號 / 承建商 -->
-      <v-row dense>
-        <v-col cols="12" md="6">
-          <v-text-field
-            label="工作編號"
+      <!-- 工作編號 / 承建商 -->
+      <div class="mb-3 row">
+        <label class="col-sm-3 col-form-label">工作編號</label>
+        <div class="col-sm-9">
+          <input
+            type="text"
             v-model="formData.job_number"
+            class="form-control"
           />
-        </v-col>
-        <v-col cols="12" md="6">
-          <v-text-field
-            label="承建商"
+        </div>
+      </div>
+
+      <div class="mb-3 row">
+        <label class="col-sm-3 col-form-label">承建商</label>
+        <div class="col-sm-9">
+          <input
+            type="text"
             v-model="formData.contractor"
+            class="form-control"
           />
-        </v-col>
-      </v-row>
-      <!-- ------------------------- -->
+        </div>
+      </div>
 
-      <v-row dense>
-        <v-col cols="12" md="6">
-          <v-text-field
-            label="Start Date"
+      <div class="mb-3 row">
+        <label class="col-sm-3 col-form-label">Start Date</label>
+        <div class="col-sm-9">
+          <input
+            type="date"
             v-model="formData.start_date"
-            type="date"
+            class="form-control"
           />
-        </v-col>
-        <v-col cols="12" md="6">
-          <v-text-field
-            label="End Date"
+        </div>
+      </div>
+
+      <div class="mb-3 row">
+        <label class="col-sm-3 col-form-label">End Date</label>
+        <div class="col-sm-9">
+          <input
+            type="date"
             v-model="formData.end_date"
-            type="date"
+            class="form-control"
           />
-        </v-col>
-      </v-row>
+        </div>
+      </div>
 
-      <v-row dense>
-        <v-col cols="12" md="6">
-          <v-text-field
-            label="Duration (Days)"
-            v-model.number="formData.duration_days"
+      <div class="mb-3 row">
+        <label class="col-sm-3 col-form-label">Duration (Days)</label>
+        <div class="col-sm-9">
+          <input
             type="number"
+            v-model.number="formData.duration_days"
+            class="form-control"
           />
-        </v-col>
-        <v-col cols="12" md="6">
-          <div>Duration Type</div>
-          <v-radio-group v-model="formData.duration_type" class="mt-2">
-            <v-radio label="Business" value="business" />
-            <v-radio label="Calendar" value="calendar" />
-          </v-radio-group>
-        </v-col>
-      </v-row>
+        </div>
+      </div>
 
-      <v-row dense>
-        <v-col cols="12">
-          <v-textarea
-            label="Description"
-            v-model="formData.description"
-            rows="2"
+      <div class="mb-3">
+        <label>Duration Type:</label>
+        <div class="form-check form-check-inline ms-3">
+          <input
+            class="form-check-input"
+            type="radio"
+            value="business"
+            v-model="formData.duration_type"
+            id="durationBusiness"
           />
-        </v-col>
-      </v-row>
-
-      <v-row dense>
-        <v-col cols="12">
-          <v-textarea
-            label="Project Objective"
-            v-model="formData.objective"
-            rows="2"
+          <label class="form-check-label" for="durationBusiness">Business</label>
+        </div>
+        <div class="form-check form-check-inline">
+          <input
+            class="form-check-input"
+            type="radio"
+            value="calendar"
+            v-model="formData.duration_type"
+            id="durationCalendar"
           />
-        </v-col>
-      </v-row>
+          <label class="form-check-label" for="durationCalendar">Calendar</label>
+        </div>
+      </div>
 
-      <v-row dense class="mt-4" justify="end">
-        <v-btn color="primary" type="submit">
+      <div class="mb-3">
+        <label class="form-label">Description</label>
+        <textarea
+          v-model="formData.description"
+          class="form-control"
+          rows="2"
+        ></textarea>
+      </div>
+
+      <div class="mb-3">
+        <label class="form-label">Project Objective</label>
+        <textarea
+          v-model="formData.objective"
+          class="form-control"
+          rows="2"
+        ></textarea>
+      </div>
+
+      <div class="d-flex justify-content-end mt-4">
+        <button type="submit" class="btn btn-primary">
           {{ projectId ? 'Save' : 'Create' }}
-        </v-btn>
-        <v-btn variant="text" class="ms-2" @click="closeForm">Close</v-btn>
-      </v-row>
-    </v-form>
-  </v-container>
+        </button>
+        <button type="button" class="btn btn-secondary ms-2" @click="closeForm">
+          Close
+        </button>
+      </div>
+    </form>
+  </div>
 </template>
 
 <script>
@@ -117,7 +153,6 @@ export default {
         duration_type: 'business',
         start_date: '',
         end_date: '',
-        // 新增
         job_number: '',
         contractor: ''
       }
@@ -136,8 +171,6 @@ export default {
         this.formData.duration_type = data.duration_type || 'business'
         this.formData.start_date = data.start_date
         this.formData.end_date = data.end_date
-
-        // 載入 job_number / contractor
         this.formData.job_number = data.job_number
         this.formData.contractor = data.contractor
       } catch (err) {

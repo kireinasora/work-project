@@ -1,20 +1,19 @@
 <template>
-  <div v-if="project">
+  <div v-if="project" class="card p-3">
+    <h5 class="card-title">Project Detail</h5>
     <p>Description: {{ project.description }}</p>
     <p>Objective: {{ project.objective }}</p>
     <p>Owner: {{ project.owner }}</p>
     <p>Duration: {{ project.duration_days }} ({{ project.duration_type }})</p>
     <p>Start Date: {{ project.start_date }}</p>
     <p>End Date: {{ project.end_date }}</p>
-
-    <!-- ★ 新增顯示工程編號與承建商 -->
     <p>Job Number: {{ project.job_number }}</p>
     <p>Contractor: {{ project.contractor }}</p>
 
-    <div style="margin-top:20px;">
+    <div class="mt-3">
       <router-link
         :to="`/projects/${projectId}/diaries`"
-        style="background:#646cff; color:white; padding:6px 10px; border-radius:4px; text-decoration:none;"
+        class="btn btn-info"
       >
         Manage Site Diaries
       </router-link>
@@ -55,5 +54,5 @@ export default {
 </script>
 
 <style scoped>
-/* 按需求增添樣式 */
+/* 可視需求，自行增減 */
 </style>

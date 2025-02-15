@@ -1,25 +1,45 @@
 <template>
-  <!-- 根容器 -->
-  <v-app>
-    <!-- 以 v-app-bar 作為頂部導覽列 -->
-    <v-app-bar color="primary" dark>
-      <v-toolbar-title>Project Management System</v-toolbar-title>
-      <v-spacer></v-spacer>
+  <div>
+    <!-- Bootstrap Navbar -->
+    <nav class="navbar navbar-expand-lg navbar-dark bg-primary">
+      <div class="container-fluid">
+        <a class="navbar-brand" href="#">Project Management System</a>
+        <button
+          class="navbar-toggler"
+          type="button"
+          data-bs-toggle="collapse"
+          data-bs-target="#navbarSupportedContent"
+          aria-controls="navbarSupportedContent"
+          aria-expanded="false"
+          aria-label="Toggle navigation"
+        >
+          <span class="navbar-toggler-icon"></span>
+        </button>
 
-      <!-- ★ 改用 to="…" router variant="text" -->
-      <v-btn to="/" router variant="text">Home</v-btn>
-      <v-btn to="/projects" router variant="text">Projects</v-btn>
-      <v-btn to="/material" router variant="text">Material Form</v-btn>
-      <v-btn to="/staff" router variant="text">Staff</v-btn>
-    </v-app-bar>
-
-    <!-- 主要內容區塊 -->
-    <v-main>
-      <div style="max-width:1500px; margin:0 auto; padding:20px;">
-        <router-view />
+        <div class="collapse navbar-collapse" id="navbarSupportedContent">
+          <ul class="navbar-nav ms-auto mb-2 mb-lg-0">
+            <li class="nav-item">
+              <router-link to="/" class="nav-link">Home</router-link>
+            </li>
+            <li class="nav-item">
+              <router-link to="/projects" class="nav-link">Projects</router-link>
+            </li>
+            <li class="nav-item">
+              <router-link to="/material" class="nav-link">Material Form</router-link>
+            </li>
+            <li class="nav-item">
+              <router-link to="/staff" class="nav-link">Staff</router-link>
+            </li>
+          </ul>
+        </div>
       </div>
-    </v-main>
-  </v-app>
+    </nav>
+
+    <!-- Main Content -->
+    <div class="container my-4">
+      <router-view />
+    </div>
+  </div>
 </template>
 
 <script>
@@ -27,3 +47,7 @@ export default {
   name: 'App'
 }
 </script>
+
+<style>
+/* 可視需求自行增減 */
+</style>

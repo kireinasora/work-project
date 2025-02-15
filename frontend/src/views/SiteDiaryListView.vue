@@ -1,6 +1,11 @@
 <!-- frontend/src/views/SiteDiaryListView.vue -->
 <template>
-  <v-container fluid>
+  <v-container
+    fluid
+    style="max-width:2000px; margin:0 auto;"
+  >
+    <!-- 此行修改為 2000px，以使列表更寬 -->
+
     <h2>Site Diaries Management</h2>
 
     <div v-if="projectInfo" class="project-info-box mb-4">
@@ -20,17 +25,28 @@
       <v-data-table
         :headers="headers"
         :items="siteDiaries"
-        item-key="id"
         :density="'compact'"
         class="mb-6 diary-table"
+        :sort-by="['report_date']"
+        :sort-desc="[true]"
+        show-expand
+        :items-per-page="-1"
+        item-key="id"
       >
-        <!-- # 欄位：顯示索引( row index + 1 ) -->
+        <!-- 
+          ↑ 使用 :items-per-page="-1" 使預設顯示所有資料、不分頁 
+        -->
+
+        <!-- # 欄位：顯示索引 (row index + 1) -->
         <template #item.index="{ index }">
           {{ index + 1 }}
         </template>
 
-        <!-- 其餘欄位 (報表日期、天氣(早/中)、日數) 直接顯示 item.xxx -->
-        
+        <!-- last edited( updated_at ) 直接顯示 item.updated_at (字串) -->
+        <template #item.updated_at="{ item }">
+          {{ item.updated_at || '' }}
+        </template>
+
         <!-- EDIT 按鈕 -->
         <template #item.edit="{ item }">
           <v-btn color="warning" variant="text" @click="openEditDialog(item.id)">
@@ -45,7 +61,7 @@
           </v-btn>
         </template>
 
-        <!-- DOWNLOAD 欄位：用 v-menu 做一個下拉選單，讓使用者選擇下載 XLSX 或 PDF(表1 / 表2) -->
+        <!-- DOWNLOAD 下拉 -->
         <template #item.download="{ item }">
           <v-menu>
             <template #activator="{ props }">
@@ -66,11 +82,10 @@
             </v-list>
           </v-menu>
         </template>
-
       </v-data-table>
     </div>
 
-    <!-- 調整對話框的 max-width 以便視窗更寬 -->
+    <!-- 表單對話框 -->
     <v-dialog
       v-model="displayFormDialog"
       max-width="1200px"
@@ -109,22 +124,22 @@ export default {
     const displayFormDialog = ref(false)
     const editingDiaryId = ref(null)
 
-    // 將 XLSX、PDF(表1)、PDF(表2) 三欄合併到同一個 "DOWNLOAD" 欄位
-    // 其餘維持：序號(#)、日期、天氣(早/中)、日數、EDIT、DELETE
+    // 預設欄位配置
     const headers = ref([
-      { text: '#', value: 'index', width: 50, align: 'center' },
-      { text: '日期', value: 'report_date', width: 130, align: 'start' },
-      { text: '天氣(早)', value: 'weather_morning', width: 90, align: 'center' },
-      { text: '天氣(中)', value: 'weather_noon', width: 90, align: 'center' },
-      { text: '日數', value: 'day_count', width: 60, align: 'center' },
+      { text: '#', value: 'index', width: 50, align: 'center', sortable: false },
+      { text: '日期', value: 'report_date', width: 130, align: 'start', sortable: true },
+      { text: '天氣(早)', value: 'weather_morning', width: 90, align: 'center', sortable: true },
+      { text: '天氣(中)', value: 'weather_noon', width: 90, align: 'center', sortable: true },
+      { text: '日數', value: 'day_count', width: 60, align: 'center', sortable: true },
+      { text: 'Last Edited', value: 'updated_at', align: 'start', sortable: true },
       { text: 'EDIT', value: 'edit', sortable: false, width: 70, align: 'center' },
       { text: 'DELETE', value: 'delete', sortable: false, width: 80, align: 'center' },
-      { text: 'DOWNLOAD', value: 'download', sortable: false, width: 110, align: 'center' },
+      { text: 'DOWNLOAD', value: 'download', sortable: false, width: 110, align: 'center' }
     ])
 
     const projectIdNumber = computed(() => Number(route.params.projectId))
 
-    // 取得專案資訊 (顯示 "Project: xxx / Owner: xxx")
+    // 取得專案資訊
     const fetchProjectInfo = async () => {
       try {
         const { data } = await axios.get(`/api/projects/${projectIdNumber.value}`)
@@ -178,12 +193,13 @@ export default {
           { responseType: 'blob' }
         )
 
-        // 預設檔名
         let filename = fileType === 'xlsx'
           ? 'daily_report_filled.xlsx'
-          : (fileType === 'sheet1' ? 'daily_report_sheet1.pdf' : 'daily_report_sheet2.pdf')
+          : (fileType === 'sheet1'
+              ? 'daily_report_sheet1.pdf'
+              : 'daily_report_sheet2.pdf')
 
-        // 如果後端有透過 Content-Disposition 帶檔名，則解析出來用
+        // 嘗試從後端 headers 裡拿檔名
         const contentDisposition = response.headers['content-disposition']
         if (contentDisposition) {
           const cdRegex = /filename[^;=\n]*=((['"]).*?\2|[^;\n]*)/
@@ -193,7 +209,6 @@ export default {
           }
         }
 
-        // 生成可下載 URL
         const blobUrl = window.URL.createObjectURL(response.data)
         const link = document.createElement('a')
         link.href = blobUrl
@@ -256,12 +271,11 @@ export default {
   margin-bottom: 16px;
 }
 
-/* 使表格最小寬度稍微大些 (如 700px) */
+/* 使表格最小寬度稍微大些 */
 .diary-table {
-  min-width: 700px;
+  min-width: 900px;
 }
 
-/* 基本間距調整 */
 .mb-4 {
   margin-bottom: 16px;
 }

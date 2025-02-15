@@ -23,6 +23,7 @@
 │   │   └── services.py # backend/site_diary/services.py
 │   ├── staff_management/
 │   │   └── routes.py # backend/staff_management/routes.py
+├── fonts/
 ├── frontend/
 │   └── index.html
 │   ├── public/
@@ -31,7 +32,6 @@
 │   │   └── style.css
 │   │   ├── assets/
 │   │   ├── components/
-│   │   │   ├── HelloWorld.vue
 │   │   │   ├── ProjectDetail.vue
 │   │   │   ├── ProjectForm.vue
 │   │   │   ├── ProjectList.vue
@@ -42,6 +42,76 @@
 │   │   │   ├── ProjectsView.vue
 │   │   │   ├── SiteDiaryListView.vue
 │   │   │   └── StaffView.vue
+================================================================================
+
+Dockerfile
+
+================================================================================
+###############################################
+# 1) 前端：Node 環境，安裝並打包 Vite/Vue
+###############################################
+FROM node:18-slim AS frontend-builder
+
+WORKDIR /app/frontend
+
+# 複製前端 package.json / package-lock.json
+COPY frontend/package*.json ./
+
+# 安裝前端相依套件
+RUN npm install
+
+# 複製前端程式碼
+COPY frontend/ ./
+
+# 進行前端打包 (輸出到 /app/frontend/dist)
+RUN npm run build
+
+
+###############################################
+# 2) 後端：Python + LibreOffice + 字型
+###############################################
+FROM python:3.10-slim AS backend
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# 安裝 LibreOffice
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libreoffice \
+        fontconfig \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# -- 以下這兩行為「安裝字型」的關鍵步驟 --
+# 建議先建立資料夾：/usr/share/fonts/truetype/custom
+RUN mkdir -p /usr/share/fonts/truetype/custom
+
+# 將本機專案裡 ./fonts/MINGLIU.TTC 複製到容器裡
+COPY ./fonts/MINGLIU.TTC /usr/share/fonts/truetype/custom/MINGLIU.TTC
+
+# 更新字型快取
+RUN fc-cache -f -v
+
+# 安裝 Python 相依
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+
+# 複製後端程式
+COPY backend/ ./backend
+
+# 從前端階段帶入打包成果
+COPY --from=frontend-builder /app/frontend/dist ./frontend/dist
+
+# 設定 PYTHONPATH，確保可用 `from backend.xxx import ...`
+ENV PYTHONPATH=/app
+
+# Flask 對外提供的埠
+EXPOSE 5000
+
+# 改用 Gunicorn 執行 backend/main.py 裡的 create_app()
+CMD ["/bin/sh", "-c", "gunicorn 'backend.main:create_app()' --bind 0.0.0.0:$PORT"]
+
 ================================================================================
 
 backend/__init__.py
@@ -149,6 +219,16 @@ def to_iso_date(date_obj):
         return None
     return date_obj.strftime("%Y-%m-%d")
 
+
+def to_iso_datetime(dt):
+    """
+    將 datetime 轉成 'YYYY-MM-DD HH:MM:SS' 字串。
+    若是 None, 則回傳 None。
+    """
+    if not dt:
+        return None
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
 ================================================================================
 
 backend/main.py
@@ -157,7 +237,9 @@ backend/main.py
 # backend/main.py
 
 import os
-from flask import Flask, send_from_directory
+from flask import Flask, send_from_directory, request, jsonify
+from werkzeug.exceptions import NotFound
+
 from backend.project_management.routes import projects_bp
 from backend.material_management.routes import material_bp
 from backend.site_diary.routes import site_diary_bp
@@ -191,13 +273,19 @@ def create_app():
         else:
             return send_from_directory(dist_dir, 'index.html')
 
-    return app
+    # ===============★ 關鍵新增：處理 404 ★===============
+    # 如果路由未匹配到，而且不是 /api/... ，就回傳 index.html 讓前端接管
+    @app.errorhandler(NotFound)
+    def handle_404(e):
+        # 如果是 API 開頭，則真的是 404
+        if request.path.startswith('/api'):
+            return jsonify({"error": "Not found"}), 404
 
-# === 以下區段已移除 ===
-# if __name__ == "__main__":
-#     app = create_app()
-#     port = int(os.environ.get("PORT", 5000))
-#     app.run(host='0.0.0.0', port=port)
+        # 否則一律回傳前端打包後的 index.html
+        dist_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "frontend", "dist"))
+        return send_from_directory(dist_dir, 'index.html')
+
+    return app
 
 ================================================================================
 
@@ -969,7 +1057,7 @@ from flask import Blueprint, request, jsonify, send_file, Response, abort
 from datetime import datetime
 from urllib.parse import quote
 
-from backend.db import mongo, get_next_sequence, to_iso_date
+from backend.db import mongo, get_next_sequence, to_iso_date, to_iso_datetime
 
 # 建立 logger
 logger = logging.getLogger(__name__)
@@ -1011,6 +1099,8 @@ def create_site_diary(project_id):
         "workers": workers_dict,
         "machines": machines_dict,
         "staff_ids": staff_ids,
+        # ★ 新增：建立時就加上 updated_at
+        "updated_at": datetime.now()
     }
 
     # 若未填 day_count，則自動計算
@@ -1044,6 +1134,7 @@ def get_site_diaries(project_id):
         logger.warning("Project not found: project_id=%s, returning 404", project_id)
         abort(404, description="Project not found")
 
+    # 原本是 sort=[("id", 1)]；此處暫時保留，前端也會做進一步排序
     cursor = mongo.db.site_diaries.find({"project_id": project_id}, sort=[("id", 1)])
     results = []
 
@@ -1083,7 +1174,9 @@ def get_site_diaries(project_id):
             "summary": sd.get("summary", ""),
             "workers": worker_list,
             "machines": machine_list,
-            "staffs": staff_list
+            "staffs": staff_list,
+            # ★ 回傳 updated_at
+            "updated_at": to_iso_datetime(sd.get("updated_at"))
         })
 
     logger.debug("Returning %d diaries for project_id=%s", len(results), project_id)
@@ -1136,12 +1229,18 @@ def update_site_diary(project_id, diary_id):
         else:
             update_fields["day_count"] = 1
 
+    # ★ 更新時刷新 updated_at
+    update_fields["updated_at"] = datetime.now()
+
     if update_fields:
         mongo.db.site_diaries.update_one(
             {"project_id": project_id, "id": diary_id},
             {"$set": update_fields}
         )
-        logger.info("Site diary updated: project_id=%s, diary_id=%s, fields=%s", project_id, diary_id, list(update_fields.keys()))
+        logger.info(
+            "Site diary updated: project_id=%s, diary_id=%s, fields=%s",
+            project_id, diary_id, list(update_fields.keys())
+        )
     else:
         logger.debug("No fields updated, data was empty or invalid.")
 
@@ -1689,6 +1788,10 @@ def delete_staff(staff_id):
     if result.deleted_count == 0:
         abort(404, description="Staff not found")
     return jsonify({"message": "Staff deleted"}), 200
+
+================================================================================
+
+fonts/MINGLIU.TTC
 
 ================================================================================
 
@@ -3755,6 +3858,10 @@ frontend/package.json
 
 ================================================================================
 
+frontend/public/favicon.ico
+
+================================================================================
+
 frontend/public/vite.svg
 
 ================================================================================
@@ -3781,7 +3888,7 @@ frontend/src/App.vue
 
     <!-- 主要內容區塊 -->
     <v-main>
-      <div style="max-width:900px; margin:0 auto; padding:20px;">
+      <div style="max-width:1500px; margin:0 auto; padding:20px;">
         <router-view />
       </div>
     </v-main>
@@ -3800,53 +3907,6 @@ frontend/src/assets/vue.svg
 
 ================================================================================
 <svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" aria-hidden="true" role="img" class="iconify iconify--logos" width="37.07" height="36" preserveAspectRatio="xMidYMid meet" viewBox="0 0 256 198"><path fill="#41B883" d="M204.8 0H256L128 220.8L0 0h97.92L128 51.2L157.44 0h47.36Z"></path><path fill="#41B883" d="m0 0l128 220.8L256 0h-51.2L128 132.48L50.56 0H0Z"></path><path fill="#35495E" d="M50.56 0L128 133.12L204.8 0h-47.36L128 51.2L97.92 0H50.56Z"></path></svg>
-================================================================================
-
-frontend/src/components/HelloWorld.vue
-
-================================================================================
-<script setup lang="ts">
-import { ref } from 'vue'
-
-defineProps<{ msg: string }>()
-
-const count = ref(0)
-</script>
-
-<template>
-  <h1>{{ msg }}</h1>
-
-  <div class="card">
-    <button type="button" @click="count++">count is {{ count }}</button>
-    <p>
-      Edit
-      <code>components/HelloWorld.vue</code> to test HMR
-    </p>
-  </div>
-
-  <p>
-    Check out
-    <a href="https://vuejs.org/guide/quick-start.html#local" target="_blank"
-      >create-vue</a
-    >, the official Vue + Vite starter
-  </p>
-  <p>
-    Learn more about IDE Support for Vue in the
-    <a
-      href="https://vuejs.org/guide/scaling-up/tooling.html#ide-support"
-      target="_blank"
-      >Vue Docs Scaling up Guide</a
-    >.
-  </p>
-  <p class="read-the-docs">Click on the Vite and Vue logos to learn more</p>
-</template>
-
-<style scoped>
-.read-the-docs {
-  color: #888;
-}
-</style>
-
 ================================================================================
 
 frontend/src/components/ProjectDetail.vue
@@ -5297,7 +5357,12 @@ frontend/src/views/SiteDiaryListView.vue
 ================================================================================
 <!-- frontend/src/views/SiteDiaryListView.vue -->
 <template>
-  <v-container fluid>
+  <v-container
+    fluid
+    style="max-width:2000px; margin:0 auto;"
+  >
+    <!-- 此行修改為 2000px，以使列表更寬 -->
+
     <h2>Site Diaries Management</h2>
 
     <div v-if="projectInfo" class="project-info-box mb-4">
@@ -5317,17 +5382,28 @@ frontend/src/views/SiteDiaryListView.vue
       <v-data-table
         :headers="headers"
         :items="siteDiaries"
-        item-key="id"
         :density="'compact'"
         class="mb-6 diary-table"
+        :sort-by="['report_date']"
+        :sort-desc="[true]"
+        show-expand
+        :items-per-page="-1"
+        item-key="id"
       >
-        <!-- # 欄位：顯示索引( row index + 1 ) -->
+        <!-- 
+          ↑ 使用 :items-per-page="-1" 使預設顯示所有資料、不分頁 
+        -->
+
+        <!-- # 欄位：顯示索引 (row index + 1) -->
         <template #item.index="{ index }">
           {{ index + 1 }}
         </template>
 
-        <!-- 其餘欄位 (報表日期、天氣(早/中)、日數) 直接顯示 item.xxx -->
-        
+        <!-- last edited( updated_at ) 直接顯示 item.updated_at (字串) -->
+        <template #item.updated_at="{ item }">
+          {{ item.updated_at || '' }}
+        </template>
+
         <!-- EDIT 按鈕 -->
         <template #item.edit="{ item }">
           <v-btn color="warning" variant="text" @click="openEditDialog(item.id)">
@@ -5342,7 +5418,7 @@ frontend/src/views/SiteDiaryListView.vue
           </v-btn>
         </template>
 
-        <!-- DOWNLOAD 欄位：用 v-menu 做一個下拉選單，讓使用者選擇下載 XLSX 或 PDF(表1 / 表2) -->
+        <!-- DOWNLOAD 下拉 -->
         <template #item.download="{ item }">
           <v-menu>
             <template #activator="{ props }">
@@ -5363,11 +5439,10 @@ frontend/src/views/SiteDiaryListView.vue
             </v-list>
           </v-menu>
         </template>
-
       </v-data-table>
     </div>
 
-    <!-- 調整對話框的 max-width 以便視窗更寬 -->
+    <!-- 表單對話框 -->
     <v-dialog
       v-model="displayFormDialog"
       max-width="1200px"
@@ -5406,22 +5481,22 @@ export default {
     const displayFormDialog = ref(false)
     const editingDiaryId = ref(null)
 
-    // 將 XLSX、PDF(表1)、PDF(表2) 三欄合併到同一個 "DOWNLOAD" 欄位
-    // 其餘維持：序號(#)、日期、天氣(早/中)、日數、EDIT、DELETE
+    // 預設欄位配置
     const headers = ref([
-      { text: '#', value: 'index', width: 50, align: 'center' },
-      { text: '日期', value: 'report_date', width: 130, align: 'start' },
-      { text: '天氣(早)', value: 'weather_morning', width: 90, align: 'center' },
-      { text: '天氣(中)', value: 'weather_noon', width: 90, align: 'center' },
-      { text: '日數', value: 'day_count', width: 60, align: 'center' },
+      { text: '#', value: 'index', width: 50, align: 'center', sortable: false },
+      { text: '日期', value: 'report_date', width: 130, align: 'start', sortable: true },
+      { text: '天氣(早)', value: 'weather_morning', width: 90, align: 'center', sortable: true },
+      { text: '天氣(中)', value: 'weather_noon', width: 90, align: 'center', sortable: true },
+      { text: '日數', value: 'day_count', width: 60, align: 'center', sortable: true },
+      { text: 'Last Edited', value: 'updated_at', align: 'start', sortable: true },
       { text: 'EDIT', value: 'edit', sortable: false, width: 70, align: 'center' },
       { text: 'DELETE', value: 'delete', sortable: false, width: 80, align: 'center' },
-      { text: 'DOWNLOAD', value: 'download', sortable: false, width: 110, align: 'center' },
+      { text: 'DOWNLOAD', value: 'download', sortable: false, width: 110, align: 'center' }
     ])
 
     const projectIdNumber = computed(() => Number(route.params.projectId))
 
-    // 取得專案資訊 (顯示 "Project: xxx / Owner: xxx")
+    // 取得專案資訊
     const fetchProjectInfo = async () => {
       try {
         const { data } = await axios.get(`/api/projects/${projectIdNumber.value}`)
@@ -5475,12 +5550,13 @@ export default {
           { responseType: 'blob' }
         )
 
-        // 預設檔名
         let filename = fileType === 'xlsx'
           ? 'daily_report_filled.xlsx'
-          : (fileType === 'sheet1' ? 'daily_report_sheet1.pdf' : 'daily_report_sheet2.pdf')
+          : (fileType === 'sheet1'
+              ? 'daily_report_sheet1.pdf'
+              : 'daily_report_sheet2.pdf')
 
-        // 如果後端有透過 Content-Disposition 帶檔名，則解析出來用
+        // 嘗試從後端 headers 裡拿檔名
         const contentDisposition = response.headers['content-disposition']
         if (contentDisposition) {
           const cdRegex = /filename[^;=\n]*=((['"]).*?\2|[^;\n]*)/
@@ -5490,7 +5566,6 @@ export default {
           }
         }
 
-        // 生成可下載 URL
         const blobUrl = window.URL.createObjectURL(response.data)
         const link = document.createElement('a')
         link.href = blobUrl
@@ -5553,12 +5628,11 @@ export default {
   margin-bottom: 16px;
 }
 
-/* 使表格最小寬度稍微大些 (如 700px) */
+/* 使表格最小寬度稍微大些 */
 .diary-table {
-  min-width: 700px;
+  min-width: 900px;
 }
 
-/* 基本間距調整 */
 .mb-4 {
   margin-bottom: 16px;
 }
@@ -5816,3 +5890,18 @@ package.json
     }
   }
   
+================================================================================
+
+requirements.txt
+
+================================================================================
+Flask==3.1.0
+Flask-PyMongo==3.0.1
+pymongo==4.11.0
+# 其他你可能需要的套件（openpyxl、gunicorn、requests 等）
+openpyxl==3.1.5
+gunicorn==23.0.0
+requests==2.32.3
+# ...依照專案實際需要增加
+
+# Vue前端的建置不在此列舉：Vite/node_modules 由 npm/yarn 管理

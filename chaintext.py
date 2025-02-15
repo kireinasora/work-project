@@ -13,7 +13,7 @@ def generate_tree(startpath, ignore_dirs=None, ignore_files=None, files_to_show=
         if os.path.isdir(os.path.join(path, name)):
             return name in ignore_dirs
         # 檢查副檔名是否為允許的類型
-        allowed_extensions = {'.py', '.jpg', '.jpeg', '.html', '.css','.vue','ts','js','json','svg'}
+        allowed_extensions = {'.py', '.jpg', '.jpeg', '.html', '.css','.vue','ts','js','json','svg', 'ico', 'txt','ttc'}
         file_ext = os.path.splitext(name)[1].lower()
         if file_ext not in allowed_extensions:
             return True
@@ -79,10 +79,18 @@ def combine_python_files():
     
     # 自動搜尋所有指定類型的檔案
     files_to_read = []
-    allowed_extensions = ('.py', '.jpg', '.jpeg', '.html', '.css','.vue','ts','js','json','svg')
+    allowed_extensions = (
+        '.py', '.jpg', '.jpeg', '.html', '.css', '.vue', 
+        'ts', 'js', 'json', 'svg', 'ico', 'txt', 
+        'Dockerfile','ttc'
+    )
     for root, _, files in os.walk('.'):
         for file in files:
-            if file.lower().endswith(allowed_extensions) and file != 'chaintext.py':
+            if (file.lower().endswith(allowed_extensions) or 
+                file == 'Dockerfile') and (
+                file != 'chaintext.py' and 
+                file != 'combined_code.txt'):
+                
                 file_path = os.path.join(root, file)
                 file_path = file_path.replace('\\', '/')
                 if file_path.startswith('./'):

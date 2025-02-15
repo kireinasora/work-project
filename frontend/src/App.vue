@@ -15,7 +15,7 @@
 
     <!-- 主要內容區塊 -->
     <v-main>
-      <div style="max-width:900px; margin:0 auto; padding:20px;">
+      <div style="max-width:1500px; margin:0 auto; padding:20px;">
         <router-view />
       </div>
     </v-main>

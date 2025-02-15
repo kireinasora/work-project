@@ -6,7 +6,7 @@ from flask import Blueprint, request, jsonify, send_file, Response, abort
 from datetime import datetime
 from urllib.parse import quote
 
-from backend.db import mongo, get_next_sequence, to_iso_date
+from backend.db import mongo, get_next_sequence, to_iso_date, to_iso_datetime
 
 # 建立 logger
 logger = logging.getLogger(__name__)
@@ -48,6 +48,8 @@ def create_site_diary(project_id):
         "workers": workers_dict,
         "machines": machines_dict,
         "staff_ids": staff_ids,
+        # ★ 新增：建立時就加上 updated_at
+        "updated_at": datetime.now()
     }
 
     # 若未填 day_count，則自動計算
@@ -81,6 +83,7 @@ def get_site_diaries(project_id):
         logger.warning("Project not found: project_id=%s, returning 404", project_id)
         abort(404, description="Project not found")
 
+    # 原本是 sort=[("id", 1)]；此處暫時保留，前端也會做進一步排序
     cursor = mongo.db.site_diaries.find({"project_id": project_id}, sort=[("id", 1)])
     results = []
 
@@ -120,7 +123,9 @@ def get_site_diaries(project_id):
             "summary": sd.get("summary", ""),
             "workers": worker_list,
             "machines": machine_list,
-            "staffs": staff_list
+            "staffs": staff_list,
+            # ★ 回傳 updated_at
+            "updated_at": to_iso_datetime(sd.get("updated_at"))
         })
 
     logger.debug("Returning %d diaries for project_id=%s", len(results), project_id)
@@ -173,12 +178,18 @@ def update_site_diary(project_id, diary_id):
         else:
             update_fields["day_count"] = 1
 
+    # ★ 更新時刷新 updated_at
+    update_fields["updated_at"] = datetime.now()
+
     if update_fields:
         mongo.db.site_diaries.update_one(
             {"project_id": project_id, "id": diary_id},
             {"$set": update_fields}
         )
-        logger.info("Site diary updated: project_id=%s, diary_id=%s, fields=%s", project_id, diary_id, list(update_fields.keys()))
+        logger.info(
+            "Site diary updated: project_id=%s, diary_id=%s, fields=%s",
+            project_id, diary_id, list(update_fields.keys())
+        )
     else:
         logger.debug("No fields updated, data was empty or invalid.")
 

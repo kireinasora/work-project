@@ -1,7 +1,9 @@
 # backend/main.py
 
 import os
-from flask import Flask, send_from_directory
+from flask import Flask, send_from_directory, request, jsonify
+from werkzeug.exceptions import NotFound
+
 from backend.project_management.routes import projects_bp
 from backend.material_management.routes import material_bp
 from backend.site_diary.routes import site_diary_bp
@@ -35,10 +37,16 @@ def create_app():
         else:
             return send_from_directory(dist_dir, 'index.html')
 
-    return app
+    # ===============★ 關鍵新增：處理 404 ★===============
+    # 如果路由未匹配到，而且不是 /api/... ，就回傳 index.html 讓前端接管
+    @app.errorhandler(NotFound)
+    def handle_404(e):
+        # 如果是 API 開頭，則真的是 404
+        if request.path.startswith('/api'):
+            return jsonify({"error": "Not found"}), 404
 
-# === 以下區段已移除 ===
-# if __name__ == "__main__":
-#     app = create_app()
-#     port = int(os.environ.get("PORT", 5000))
-#     app.run(host='0.0.0.0', port=port)
+        # 否則一律回傳前端打包後的 index.html
+        dist_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "frontend", "dist"))
+        return send_from_directory(dist_dir, 'index.html')
+
+    return app

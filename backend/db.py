@@ -93,3 +93,13 @@ def to_iso_date(date_obj):
     if not date_obj:
         return None
     return date_obj.strftime("%Y-%m-%d")
+
+
+def to_iso_datetime(dt):
+    """
+    將 datetime 轉成 'YYYY-MM-DD HH:MM:SS' 字串。
+    若是 None, 則回傳 None。
+    """
+    if not dt:
+        return None
+    return dt.strftime("%Y-%m-%d %H:%M:%S")

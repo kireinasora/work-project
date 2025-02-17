@@ -59,7 +59,7 @@ def generate_diary_xlsx_only(site_diary_doc: Dict[str, Any]) -> str:
     else:
         duration_str = ""
 
-    # 建立 worker_map / machine_map => 對應 Excel 中的儲存格
+    # 建立 worker_map / machine_map => 對應 Excel 中的儲存格 (Sheet1)
     worker_map = {
         "地盤總管": "D19",
         "工程師":  "D20",
@@ -69,7 +69,7 @@ def generate_diary_xlsx_only(site_diary_doc: Dict[str, Any]) -> str:
         "機手":    "D24",
         "泥水工":  "D25",
         "紮鐵工":  "D26",
-        "木板工":  "D27",
+        "木板工":  "D27", 
         "電工":    "D28",
         "水喉工":  "D29",
         "雜工":    "D30",
@@ -80,9 +80,9 @@ def generate_diary_xlsx_only(site_diary_doc: Dict[str, Any]) -> str:
         "風機":   "G21",
         "泥頭車": "G22",
         "吊機":   "G23",
-        "機炮":   "G24",  # ★ 若有在表單中新增「機炮」，記得對應此儲存格
-        "屈鐵機": "G25",
-        "風車鋸": "G26",
+        "機炮":   "G24",
+        "屈鐵機": "G25",  
+        "風車鋸": "G26",  
     }
 
     # 從 site_diary_doc 取出 workers/machines 這兩個 dict
@@ -115,7 +115,6 @@ def generate_diary_xlsx_only(site_diary_doc: Dict[str, Any]) -> str:
     # 打開並填寫
     wb = load_workbook(filled_xlsx_path)
     # 目前預期兩個 sheet: 「每日施工進度報告表」「每日本地工人及外地勞工施工人員紀錄表」
-    # 若沒有可視情況忽略
 
     # Sheet1: "每日施工進度報告表"
     if "每日施工進度報告表" in wb.sheetnames:
@@ -188,7 +187,22 @@ def generate_diary_xlsx_only(site_diary_doc: Dict[str, Any]) -> str:
         sh2["B8"].value = contractor_name
         sh2["B8"].alignment = Alignment(horizontal='center', vertical='center')
 
-        # 列印範圍
+        # ===== 關鍵需求：若全部工人 + 機器皆為 0，則 B11-D25, B28-C32 全填 "☐"，並 C33=0, C34=0 =====
+        total_workers_sum = sum(workers_dict.values())
+        total_machines_sum = sum(machines_dict.values())
+        if (total_workers_sum + total_machines_sum) == 0:
+            # B11 ~ D25
+            for row in range(11, 26):
+                for col in range(2, 5):  # 2~4 => B, C, D
+                    sh2.cell(row=row, column=col, value="☐")
+            # B28 ~ C32
+            for row in range(28, 33):
+                for col in range(2, 4):  # 2~3 => B, C
+                    sh2.cell(row=row, column=col, value="☐")
+            # C33 = 0, C34 = 0
+            sh2["C33"].value = 0
+            sh2["C34"].value = 0
+
         sh2.print_area = "A1:E40"
 
     wb.save(filled_xlsx_path)
@@ -249,17 +263,12 @@ def generate_diary_pdf_sheet(site_diary_doc: Dict[str, Any], sheet_name: str) ->
     lo_exec = get_libreoffice_cmd()
     input_filter = "Calc Office Open XML"
 
-    # ★ 關鍵修正：為了避免中文亂碼，指定 PDF/A-1 與 EmbedStandardFonts=true
-    #   'SelectPdfVersion=1;EmbedStandardFonts=true'
+    # ★ 為了避免中文亂碼，指定 PDF/A-1 與 EmbedStandardFonts=true
     pdf_filter_options = "SelectPdfVersion=1;EmbedStandardFonts=true"
-
-    # 在 calc_pdf_Export 後面加上 :<options> 即可
-    # 參考: https://wiki.openoffice.org/wiki/API/Tutorials/PDF_export
     output_filter = f"pdf:calc_pdf_Export:{pdf_filter_options}"
 
-    # 建立子程序指令 (區分 Windows / 其他系統)
     if platform.system().lower().startswith("win"):
-        # Windows
+        # Windows系統
         cmd = (
             f'"{lo_exec}" --headless --convert-to "{output_filter}" '
             f'--infilter="{input_filter}" "{single_sheet_xlsx}" --outdir "{temp_dir}"'
@@ -284,9 +293,7 @@ def generate_diary_pdf_sheet(site_diary_doc: Dict[str, Any], sheet_name: str) ->
             err_msg = e.stderr.decode('utf-8', errors='replace') if e.stderr else str(e)
             raise RuntimeError(f"LibreOffice PDF conversion failed: {err_msg}") from e
 
-    # LibreOffice 轉檔後，一般會輸出同名 .pdf
     generated_pdf_name = os.path.splitext(single_sheet_xlsx)[0] + ".pdf"
-
     if os.path.isfile(generated_pdf_name):
         os.rename(generated_pdf_name, pdf_path)
     else:
@@ -307,7 +314,6 @@ def get_libreoffice_cmd() -> str:
     """
     custom_path = os.environ.get("LIBREOFFICE_PATH")
     if custom_path:
-        # 可能是完整檔案 or 資料夾
         if os.path.isfile(custom_path):
             return custom_path
         soffice_path = os.path.join(custom_path, "soffice")
@@ -318,7 +324,6 @@ def get_libreoffice_cmd() -> str:
             return libreoffice_path
         raise RuntimeError(f"LIBREOFFICE_PATH 無效: {custom_path}")
 
-    # 無自訂 => 用 which 找 soffice / libreoffice
     for candidate in ("soffice", "libreoffice"):
         exe_path = which(candidate)
         if exe_path:

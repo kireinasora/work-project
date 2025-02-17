@@ -54,7 +54,8 @@
     </div>
 
     <div class="table-responsive">
-      <table class="table table-bordered table-hover mb-6">
+      <!-- 使用 table-sm 並在 :class="getRowClass(item)" 來標示星期天 -->
+      <table class="table table-sm table-bordered table-hover mb-6">
         <thead>
           <tr>
             <th>#</th>
@@ -70,7 +71,11 @@
           </tr>
         </thead>
         <tbody>
-          <tr v-for="(item, index) in siteDiaries" :key="item.id">
+          <tr
+            v-for="(item, index) in siteDiaries"
+            :key="item.id"
+            :class="getRowClass(item)"
+          >
             <td>{{ index + 1 }}</td>
             <td>
               <input
@@ -86,10 +91,14 @@
             <td>{{ item.day_count }}</td>
             <td>{{ item.updated_at || '' }}</td>
             <td>
-              <button class="btn btn-warning btn-sm" @click="openEditDialog(item.id)">EDIT</button>
+              <button class="btn btn-warning btn-sm" @click="openEditDialog(item.id)">
+                EDIT
+              </button>
             </td>
             <td>
-              <button class="btn btn-danger btn-sm" @click="deleteDiary(item.id)">DELETE</button>
+              <button class="btn btn-danger btn-sm" @click="deleteDiary(item.id)">
+                DELETE
+              </button>
             </td>
             <td>
               <div class="dropdown">
@@ -102,17 +111,29 @@
                 </button>
                 <ul class="dropdown-menu">
                   <li>
-                    <a class="dropdown-item" href="#" @click.prevent="downloadReport(item.id, 'xlsx')">
+                    <a
+                      class="dropdown-item"
+                      href="#"
+                      @click.prevent="downloadReport(item.id, 'xlsx')"
+                    >
                       Excel (XLSX)
                     </a>
                   </li>
                   <li>
-                    <a class="dropdown-item" href="#" @click.prevent="downloadReport(item.id, 'sheet1')">
+                    <a
+                      class="dropdown-item"
+                      href="#"
+                      @click.prevent="downloadReport(item.id, 'sheet1')"
+                    >
                       PDF(表1)
                     </a>
                   </li>
                   <li>
-                    <a class="dropdown-item" href="#" @click.prevent="downloadReport(item.id, 'sheet2')">
+                    <a
+                      class="dropdown-item"
+                      href="#"
+                      @click.prevent="downloadReport(item.id, 'sheet2')"
+                    >
                       PDF(表2)
                     </a>
                   </li>
@@ -124,7 +145,8 @@
       </table>
     </div>
 
-    <!-- Diary Form Modal (Bootstrap) -->
+    <!-- Diary Form Modal -->
+    <!-- (移除 @click.self => 點擊背景不會關閉) -->
     <div
       class="modal"
       :class="{ fade: true, show: displayFormDialog }"
@@ -133,7 +155,6 @@
       role="dialog"
       aria-modal="true"
       v-if="displayFormDialog"
-      @click.self="closeFormModal"
     >
       <div class="modal-dialog modal-xl" role="document">
         <div class="modal-content">
@@ -246,7 +267,7 @@ export default {
           filename = 'daily_report_sheet2.pdf'
         }
 
-        // 嘗試從 headers 取得檔名
+        // 嘗試從 headers 取得後端回傳的檔名
         const cd = response.headers['content-disposition']
         if (cd) {
           const m = /filename[^;=\n]*=((['"]).*?\2|[^;\n]*)/.exec(cd)
@@ -268,7 +289,7 @@ export default {
       }
     }
 
-    // 多筆下載 => 取得ZIP
+    // 多筆下載 => 下載 ZIP
     const downloadMultiple = async (fileType) => {
       if (!selectedDiaryIds.value.length) {
         alert('請先勾選一筆以上的日報！')
@@ -311,24 +332,20 @@ export default {
       }
     }
 
-    // DiaryForm回調
+    // 點擊「儲存 / 更新」後 => 關閉表單並重整列表
     const onDiaryUpdated = () => {
       displayFormDialog.value = false
       fetchSiteDiaries()
     }
+    // 點擊 Cancel => 僅關閉表單
     const onDiaryCancelled = () => {
       displayFormDialog.value = false
     }
 
-    // 關閉整個 Modal (在 modal 背景上點擊或 Close)
-    const closeFormModal = () => {
-      displayFormDialog.value = false
-    }
-
-    // 全選 / 全取消
+    // 是否全選
     const isAllSelected = computed(() => {
       return siteDiaries.value.length > 0 &&
-             selectedDiaryIds.value.length === siteDiaries.value.length
+        selectedDiaryIds.value.length === siteDiaries.value.length
     })
     const toggleSelectAll = (e) => {
       if (e.target.checked) {
@@ -336,6 +353,13 @@ export default {
       } else {
         selectedDiaryIds.value = []
       }
+    }
+
+    // 若是星期天 => 顯示特殊背景
+    const getRowClass = (diary) => {
+      if (!diary.report_date) return ''
+      const d = new Date(diary.report_date)
+      return d.getDay() === 0 ? 'sunday-row' : ''
     }
 
     onMounted(() => {
@@ -365,7 +389,7 @@ export default {
       downloadMultiple,
       onDiaryUpdated,
       onDiaryCancelled,
-      closeFormModal
+      getRowClass
     }
   }
 }
@@ -376,7 +400,18 @@ export default {
   margin-bottom: 24px;
 }
 
-/* ★ 關鍵：確保 modal 與 backdrop 層級正確 */
+/*  專門針對星期天列，套用底色 */
+.sunday-row td {
+  background-color: #e9e9e9 !important;
+}
+
+/*  更改 table-sm 的內補與行高 => 更緊湊的列高 */
+.table-sm > :not(caption) > * > * {
+  padding: 0.3rem 0.5rem !important;
+  line-height: 1.1 !important;
+}
+
+/* Modal 層級調整 */
 .modal {
   z-index: 1050;
 }

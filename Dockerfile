@@ -23,19 +23,28 @@ RUN npm run build
 ###############################################
 FROM python:3.10-slim AS backend
 
+# 確保 APT 安裝過程不出現互動式介面
 ENV DEBIAN_FRONTEND=noninteractive
 
-# 安裝 LibreOffice
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        libreoffice \
-        fontconfig \
-    && apt-get clean \
-    && rm -rf /var/lib/apt/lists/*
+# 先更新並安裝可能需要的工具（包含 GNUPG / CA certificate 等）
+RUN apt-get update --allow-releaseinfo-change \
+ && apt-get install -y --no-install-recommends \
+    gnupg \
+    ca-certificates \
+ && apt-get clean \
+ && rm -rf /var/lib/apt/lists/*
+
+# 再進行 LibreOffice 與 fontconfig 安裝
+RUN apt-get update --allow-releaseinfo-change \
+ && apt-get install -y --no-install-recommends \
+    libreoffice \
+    fontconfig \
+ && apt-get clean \
+ && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
 # -- 以下這兩行為「安裝字型」的關鍵步驟 --
-# 建議先建立資料夾：/usr/share/fonts/truetype/custom
 RUN mkdir -p /usr/share/fonts/truetype/custom
 
 # 將本機專案裡 ./fonts/MINGLIU.TTC 複製到容器裡
@@ -60,5 +69,11 @@ ENV PYTHONPATH=/app
 # Flask 對外提供的埠
 EXPOSE 5000
 
-# 改用 Gunicorn 執行 backend/main.py 裡的 create_app()
-CMD ["/bin/sh", "-c", "gunicorn 'backend.main:create_app()' --bind 0.0.0.0:$PORT"]
+################################################################################
+# 直接在 Gunicorn 的參數中設定較高的 timeout、使用多 workers/threads，以避免大量生成檔案時被殺掉
+################################################################################
+CMD ["/bin/sh", "-c", "gunicorn 'backend.main:create_app()' \
+--bind 0.0.0.0:$PORT \
+--workers 2 \
+--threads 4 \
+--timeout 300"]

@@ -20,7 +20,8 @@
 │   │   └── routes.py # backend/project_management/routes.py
 │   ├── site_diary/
 │   │   ├── routes.py # backend/site_diary/routes.py
-│   │   └── services.py # backend/site_diary/services.py
+│   │   ├── services.py # backend/site_diary/services.py
+│   │   └── tasks.py # backend/site_diary/tasks.py
 │   ├── staff_management/
 │   │   └── routes.py # backend/staff_management/routes.py
 ├── fonts/
@@ -47,9 +48,9 @@
 Dockerfile
 
 ================================================================================
-###############################################
+################################################################################
 # 1) 前端：Node 環境，安裝並打包 Vite/Vue
-###############################################
+################################################################################
 FROM node:18-slim AS frontend-builder
 
 WORKDIR /app/frontend
@@ -67,30 +68,36 @@ COPY frontend/ ./
 RUN npm run build
 
 
-###############################################
-# 2) 後端：Python + LibreOffice + 字型
-###############################################
+################################################################################
+# 2) 後端：Python + LibreOffice + fontconfig + redis-server + supervisor
+################################################################################
 FROM python:3.10-slim AS backend
 
+# 確保 APT 安裝過程不出現互動式介面
 ENV DEBIAN_FRONTEND=noninteractive
 
-# 安裝 LibreOffice
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        libreoffice \
-        fontconfig \
-    && apt-get clean \
-    && rm -rf /var/lib/apt/lists/*
+# 更新並安裝可能需要的系統套件
+RUN apt-get update --allow-releaseinfo-change \
+ && apt-get install -y --no-install-recommends \
+    gnupg \
+    ca-certificates \
+ && apt-get clean \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN apt-get update --allow-releaseinfo-change \
+ && apt-get install -y --no-install-recommends \
+    libreoffice \
+    fontconfig \
+    redis-server \
+    supervisor \
+ && apt-get clean \
+ && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
 # -- 以下這兩行為「安裝字型」的關鍵步驟 --
-# 建議先建立資料夾：/usr/share/fonts/truetype/custom
 RUN mkdir -p /usr/share/fonts/truetype/custom
-
-# 將本機專案裡 ./fonts/MINGLIU.TTC 複製到容器裡
 COPY ./fonts/MINGLIU.TTC /usr/share/fonts/truetype/custom/MINGLIU.TTC
-
-# 更新字型快取
 RUN fc-cache -f -v
 
 # 安裝 Python 相依
@@ -100,17 +107,23 @@ RUN pip install --no-cache-dir -r requirements.txt
 # 複製後端程式
 COPY backend/ ./backend
 
-# 從前端階段帶入打包成果
+# 從前端階段帶入打包成果 (dist)
 COPY --from=frontend-builder /app/frontend/dist ./frontend/dist
 
-# 設定 PYTHONPATH，確保可用 `from backend.xxx import ...`
+# Supervisord 設定檔 (需在專案裡自行準備 supervisord.conf)
+COPY supervisord.conf /app/supervisord.conf
+
+# 設定 PYTHONPATH，讓 Flask 可 `from backend.xxx import ...`
 ENV PYTHONPATH=/app
 
-# Flask 對外提供的埠
+# Gunicorn / Flask 對外提供的埠
 EXPOSE 5000
 
-# 改用 Gunicorn 執行 backend/main.py 裡的 create_app()
-CMD ["/bin/sh", "-c", "gunicorn 'backend.main:create_app()' --bind 0.0.0.0:$PORT"]
+# 以 supervisord 同時啟動：
+# 1) redis-server
+# 2) Gunicorn (Flask)
+# 3) RQ Worker
+CMD ["/usr/bin/supervisord", "-c", "/app/supervisord.conf"]
 
 ================================================================================
 
@@ -1055,14 +1068,12 @@ import traceback
 import logging
 from flask import Blueprint, request, jsonify, send_file, Response, abort
 from datetime import datetime
-from urllib.parse import quote
 import os
 import tempfile
 import shutil
 import zipfile
 
 from backend.db import mongo, get_next_sequence, to_iso_date, to_iso_datetime
-
 logger = logging.getLogger(__name__)
 
 site_diary_bp = Blueprint('site_diary_bp', __name__)
@@ -1331,22 +1342,30 @@ def download_site_diary_report(project_id, diary_id):
         return jsonify({"error": str(e), "traceback": tb}), 500
 
 
-def _send_file_with_utf8_filename(file_path: str, full_chinese_name: str, ascii_fallback: str = None) -> Response:
+def _send_file_with_utf8_filename(file_path: str, download_name: str, ascii_fallback: str = None) -> Response:
+    """
+    統一版本：可接收 2~3 個參數。
+      file_path:      實際檔案路徑
+      download_name:  想顯示給使用者下載的檔名(可能含中文)
+      ascii_fallback: 若瀏覽器不支援 RFC 5987 filename*=UTF-8 用的備用檔名
+    """
     from flask import send_file
     from urllib.parse import quote
 
     response = send_file(file_path, as_attachment=True)
-    if not ascii_fallback:
-        ascii_fallback = "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "_" for ch in full_chinese_name)
-    utf8_quoted = quote(full_chinese_name, encoding="utf-8")
 
+    if not ascii_fallback:
+        # 若呼叫者沒傳入 ascii_fallback 就自動生成簡易檔名 (只保留英數、-、_、.)
+        ascii_fallback = "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "_" for ch in download_name)
+
+    utf8_quoted = quote(download_name, encoding="utf-8")
     disposition_value = (
         f'attachment; filename="{ascii_fallback}"; '
         f'filename*=UTF-8\'\'{utf8_quoted}'
     )
-
     safe_disposition = disposition_value.encode('latin-1', 'replace').decode('latin-1')
     response.headers["Content-Disposition"] = safe_disposition
+
     return response
 
 
@@ -1404,91 +1423,107 @@ def get_last_site_diary(project_id):
 
 
 # ============================================================================
-# [多筆下載] - 現在正式實作 ZIP 打包: ex. ? "xlsx" or "sheet1" or "sheet2"
+# [多筆下載 - 改用 RQ 排程] - 只排程，不同步生成
 # ============================================================================
 @site_diary_bp.route('/<int:project_id>/site_diaries/multi_download', methods=['POST'])
 def multi_download_site_diary(project_id):
+    """
+    改為只負責「排隊任務」，不再同步產出 ZIP。
+    JSON Body 需包含：
+      {
+        "diary_ids": [...],
+        "file_type": "xlsx" | "sheet1" | "sheet2"
+      }
+    成功後立即回傳 {"job_id": "xxxx"}，HTTP 202。
+    前端再呼叫 /multi_download/status/<job_id> 查詢進度，
+    完成後以 /multi_download/result/<job_id> 下載。
+    """
     data = request.json or {}
     diary_ids = data.get("diary_ids", [])
     file_type = data.get("file_type", "xlsx")
-    logger.info("multi_download_site_diary called => diary_ids=%s, file_type=%s", diary_ids, file_type)
+    logger.info("multi_download_site_diary => queueing job, diary_ids=%s, file_type=%s",
+                diary_ids, file_type)
 
-    # 若沒勾選任何 diaries, 直接回傳 400
     if not diary_ids:
         return jsonify({"error": "No diary_ids provided"}), 400
 
-    # 準備在 tempdir 製作檔案後打包
-    temp_dir = tempfile.mkdtemp(prefix="multi_diary_")
-    zip_filename = f"multiple_diaries_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
-    zip_path = os.path.join(temp_dir, zip_filename)
+    project_doc = mongo.db.projects.find_one({"id": project_id})
+    if not project_doc:
+        return jsonify({"error": "Project not found"}), 404
 
-    from backend.site_diary.services import generate_diary_xlsx_only, generate_diary_pdf_sheet
+    from backend.site_diary.tasks import queue_multi_download
+    job = queue_multi_download(project_id, diary_ids, file_type)
+    logger.info("Enqueued multi-download job: %s", job.id)
+
+    return jsonify({"job_id": job.id}), 202
+
+
+@site_diary_bp.route('/<int:project_id>/site_diaries/multi_download/status/<job_id>', methods=['GET'])
+def multi_download_status(project_id, job_id):
+    """
+    查詢此多筆下載任務的狀態。
+    回傳:
+      {
+        "status": "queued" | "running" | "done" | "failed" | "not_found",
+        "progress": 0~100,
+        "error": "...",  // 若失敗時
+      }
+    """
+    from redis import Redis
+    from rq.job import Job
+
+    redis_url = os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0")
+    redis_conn = Redis.from_url(redis_url)
 
     try:
-        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-            for d_id in diary_ids:
-                diary_doc = mongo.db.site_diaries.find_one({"project_id": project_id, "id": d_id})
-                if not diary_doc:
-                    # 若找不到該 diary, 直接略過 or 也可做特別處理
-                    logger.warning("Diary not found or belongs to another project: id=%s", d_id)
-                    continue
+        job = Job.fetch(job_id, connection=redis_conn)
+    except:
+        return jsonify({"status": "not_found"}), 404
 
-                # 先計算檔名的日期部份
-                if diary_doc.get("report_date"):
-                    date_prefix = diary_doc["report_date"].strftime("%Y%m%d")
-                else:
-                    date_prefix = f"id{d_id}"
+    # 此示範未檢查 project_id 與 job 是否對應，視需要再檢查
 
-                # 依 file_type 產生對應檔案
-                if file_type == 'xlsx':
-                    xlsx_path = generate_diary_xlsx_only(diary_doc)
-                    archive_name = f"{date_prefix}_daily_report_{d_id}.xlsx"
-                    zf.write(xlsx_path, arcname=archive_name)
-                elif file_type in ('sheet1', 'sheet2'):
-                    pdf_path = generate_diary_pdf_sheet(diary_doc, sheet_name=file_type)
-                    # sheet1 => "每日施工進度報告表.pdf"
-                    # sheet2 => "每日本地工人及外地勞工施工人員紀錄表.pdf"
-                    if file_type == 'sheet1':
-                        archive_name = f"{date_prefix}_daily_report_{d_id}.pdf"
-                    else:
-                        archive_name = f"{date_prefix}_workers_{d_id}.pdf"
-                    zf.write(pdf_path, arcname=archive_name)
-                else:
-                    # 如果遇到未知的 type, 可直接忽略或報錯
-                    logger.warning("Skipping unknown file_type=%s for diary_id=%s", file_type, d_id)
-                    continue
+    status = job.get_status()  # RQ 內部狀態: queued/started/finished/failed
+    meta = job.meta or {}
+    ret = {
+        "status": meta.get("status", status),  # 可能是 running/done/failed
+        "progress": meta.get("progress", 0),
+    }
+    if meta.get("status") == "failed":
+        ret["error"] = meta.get("error")
 
-        # 打包完成，回傳 ZIP
-        logger.info("multi_download => created ZIP: %s", zip_path)
-        return _send_file_with_utf8_filename(zip_path, zip_filename)
-
-    except Exception as exc:
-        logger.exception("multi_download_site_diary() exception: ")
-        # cleanup
-        shutil.rmtree(temp_dir, ignore_errors=True)
-        return jsonify({"error": str(exc)}), 500
+    return jsonify(ret), 200
 
 
-def _send_file_with_utf8_filename(file_path: str, download_name: str) -> Response:
-    """類似單筆下載的設計，但用於 ZIP 報表."""
-    from flask import send_file
-    from urllib.parse import quote
+@site_diary_bp.route('/<int:project_id>/site_diaries/multi_download/result/<job_id>', methods=['GET'])
+def multi_download_result(project_id, job_id):
+    """
+    若該 job 已完成 => 回傳打包好的 ZIP 檔供下載。
+    """
+    from redis import Redis
+    from rq.job import Job
 
-    response = send_file(file_path, as_attachment=True, mimetype="application/zip")
-    ascii_fallback = "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "_" for ch in download_name)
-    utf8_quoted = quote(download_name, encoding="utf-8")
+    redis_url = os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0")
+    redis_conn = Redis.from_url(redis_url)
 
-    disposition_value = (
-        f'attachment; filename="{ascii_fallback}"; '
-        f'filename*=UTF-8\'\'{utf8_quoted}'
-    )
-    safe_disposition = disposition_value.encode('latin-1', 'replace').decode('latin-1')
-    response.headers["Content-Disposition"] = safe_disposition
+    try:
+        job = Job.fetch(job_id, connection=redis_conn)
+    except:
+        return jsonify({"error": "Job not found"}), 404
 
-    # ★ 注意: 等檔案回傳完後再刪除 temp_dir
-    #   但 Flask/Gunicorn 未必有on_close callback; 常見做法是由callback/thread處理
-    #   這裡為簡化Demo不特別實現; 生產可考慮celery or advanced technique
-    return response
+    meta = job.meta or {}
+    if meta.get("status") != "done":
+        # 還沒完成或已失敗
+        return jsonify({
+            "error": f"Job not done yet, current status={meta.get('status')}"
+        }), 400
+
+    # 取得當初產生好的 ZIP 路徑
+    zip_path = meta.get("result_file")
+    if not zip_path or not os.path.isfile(zip_path):
+        return jsonify({"error": "Zip file not found on server"}), 404
+
+    download_name = os.path.basename(zip_path)
+    return send_file(zip_path, as_attachment=True, download_name=download_name)
 
 ================================================================================
 
@@ -1518,12 +1553,16 @@ def generate_diary_xlsx_only(site_diary_doc: Dict[str, Any]) -> str:
     """
     產生/填寫 daily_report.xlsx 後，回傳填好的暫存 XLSX 檔路徑 (含所有工作表)。
     目前只用 Sheet1/Sheet2，但整份 workbook 都會被保留。
+
+    為了符合「多檔案下載時，檔名不得含ID」之需求，
+    最終輸出檔名一律固定為 daily_report.xlsx，不再加入任何日期或ID。
     """
+
     # 先依 project_id 找出對應的專案資料 (Mongo)
     project_id = site_diary_doc.get("project_id")
     project_doc = mongo.db.projects.find_one({"id": project_id})
     if not project_doc:
-        raise ValueError("Project not found in MongoDB (id={}).".format(project_id))
+        raise ValueError(f"Project not found in MongoDB (id={project_id}).")
 
     # 日報日期
     report_date = site_diary_doc.get("report_date")
@@ -1556,7 +1595,7 @@ def generate_diary_xlsx_only(site_diary_doc: Dict[str, Any]) -> str:
     else:
         duration_str = ""
 
-    # 建立 worker_map / machine_map => 對應 Excel 中的儲存格
+    # 建立 worker_map / machine_map => 對應 Excel 中的儲存格 (Sheet1)
     worker_map = {
         "地盤總管": "D19",
         "工程師":  "D20",
@@ -1577,7 +1616,7 @@ def generate_diary_xlsx_only(site_diary_doc: Dict[str, Any]) -> str:
         "風機":   "G21",
         "泥頭車": "G22",
         "吊機":   "G23",
-        "機炮":   "G24",  # ★ 若有在表單中新增「機炮」，記得對應此儲存格
+        "機炮":   "G24",
         "屈鐵機": "G25",
         "風車鋸": "G26",
     }
@@ -1599,12 +1638,8 @@ def generate_diary_xlsx_only(site_diary_doc: Dict[str, Any]) -> str:
     # 在系統臨時資料夾中建立暫存路徑
     temp_dir = tempfile.mkdtemp(prefix="diary_xlsx_")
 
-    # 用報表日期組出輸出檔名
-    date_str_for_filename = "noDate" if not date_str else report_date.strftime("%Y%m%d")
-    filled_xlsx_path = os.path.join(
-        temp_dir,
-        f"{date_str_for_filename}_daily_report.xlsx"
-    )
+    # 輸出檔名固定為 "daily_report.xlsx" (不加日期、不加ID)
+    filled_xlsx_path = os.path.join(temp_dir, "daily_report.xlsx")
 
     # 複製模板
     shutil.copy(template_path, filled_xlsx_path)
@@ -1612,7 +1647,6 @@ def generate_diary_xlsx_only(site_diary_doc: Dict[str, Any]) -> str:
     # 打開並填寫
     wb = load_workbook(filled_xlsx_path)
     # 目前預期兩個 sheet: 「每日施工進度報告表」「每日本地工人及外地勞工施工人員紀錄表」
-    # 若沒有可視情況忽略
 
     # Sheet1: "每日施工進度報告表"
     if "每日施工進度報告表" in wb.sheetnames:
@@ -1685,7 +1719,19 @@ def generate_diary_xlsx_only(site_diary_doc: Dict[str, Any]) -> str:
         sh2["B8"].value = contractor_name
         sh2["B8"].alignment = Alignment(horizontal='center', vertical='center')
 
-        # 列印範圍
+        # ===== 若全部工人 + 機器皆為 0，則 B11-D25, B28-C32 全填 "☐"，並 C33=0, C34=0 =====
+        total_workers_sum = sum(workers_dict.values())
+        total_machines_sum = sum(machines_dict.values())
+        if (total_workers_sum + total_machines_sum) == 0:
+            for row in range(11, 26):
+                for col in range(2, 5):  # 2~4 => B, C, D
+                    sh2.cell(row=row, column=col, value="☐")
+            for row in range(28, 33):
+                for col in range(2, 4):  # 2~3 => B, C
+                    sh2.cell(row=row, column=col, value="☐")
+            sh2["C33"].value = 0
+            sh2["C34"].value = 0
+
         sh2.print_area = "A1:E40"
 
     wb.save(filled_xlsx_path)
@@ -1705,29 +1751,28 @@ def generate_diary_pdf_sheet(site_diary_doc: Dict[str, Any], sheet_name: str) ->
       2) 複製一份，刪掉不必要的工作表，只保留目標表
       3) 用 LibreOffice CLI 轉成 PDF (指定內嵌字型、PDF/A-1) 以避免中文亂碼
       4) 回傳轉好的 PDF 路徑
+
+    為了符合「多檔案下載時，檔名不得含ID」之需求，
+    最終輸出 PDF 檔名只以表名區分，不再加入任何日期或ID。
     """
+
     # 產生整本 XLSX
     xlsx_path = generate_diary_xlsx_only(site_diary_doc)
     temp_dir = os.path.dirname(xlsx_path)
 
-    # 報表日期（命名用）
-    report_date = site_diary_doc.get("report_date")
-    date_str_for_filename = "noDate"
-    if report_date:
-        date_str_for_filename = report_date.strftime("%Y%m%d")
-
-    # 決定要保留的工作表名稱
+    # 決定要保留的工作表名稱 & PDF輸出檔名
     if sheet_name == 'sheet1':
         target_sheet_name = "每日施工進度報告表"
-        pdf_filename = f"{date_str_for_filename}每日施工進度報告表.pdf"
+        pdf_filename = "每日施工進度報告表.pdf"
     else:
         target_sheet_name = "每日本地工人及外地勞工施工人員紀錄表"
-        pdf_filename = f"{date_str_for_filename}施工人員紀錄表.pdf"
+        pdf_filename = "施工人員紀錄表.pdf"
 
     pdf_path = os.path.join(temp_dir, pdf_filename)
 
     # 先另存一份只保留指定工作表的 XLSX
-    single_sheet_xlsx = os.path.join(temp_dir, f"{date_str_for_filename}_{sheet_name}_only.xlsx")
+    # 此處不再加上任何日期或ID, 直接使用固定暫存檔名
+    single_sheet_xlsx = os.path.join(temp_dir, "temp_single_sheet.xlsx")
     shutil.copy(xlsx_path, single_sheet_xlsx)
 
     wb = load_workbook(single_sheet_xlsx)
@@ -1746,17 +1791,12 @@ def generate_diary_pdf_sheet(site_diary_doc: Dict[str, Any], sheet_name: str) ->
     lo_exec = get_libreoffice_cmd()
     input_filter = "Calc Office Open XML"
 
-    # ★ 關鍵修正：為了避免中文亂碼，指定 PDF/A-1 與 EmbedStandardFonts=true
-    #   'SelectPdfVersion=1;EmbedStandardFonts=true'
+    # ★ 為了避免中文亂碼，指定 PDF/A-1 與 EmbedStandardFonts=true
     pdf_filter_options = "SelectPdfVersion=1;EmbedStandardFonts=true"
-
-    # 在 calc_pdf_Export 後面加上 :<options> 即可
-    # 參考: https://wiki.openoffice.org/wiki/API/Tutorials/PDF_export
     output_filter = f"pdf:calc_pdf_Export:{pdf_filter_options}"
 
-    # 建立子程序指令 (區分 Windows / 其他系統)
     if platform.system().lower().startswith("win"):
-        # Windows
+        # Windows系統
         cmd = (
             f'"{lo_exec}" --headless --convert-to "{output_filter}" '
             f'--infilter="{input_filter}" "{single_sheet_xlsx}" --outdir "{temp_dir}"'
@@ -1781,9 +1821,8 @@ def generate_diary_pdf_sheet(site_diary_doc: Dict[str, Any], sheet_name: str) ->
             err_msg = e.stderr.decode('utf-8', errors='replace') if e.stderr else str(e)
             raise RuntimeError(f"LibreOffice PDF conversion failed: {err_msg}") from e
 
-    # LibreOffice 轉檔後，一般會輸出同名 .pdf
+    # LibreOffice 轉出的 PDF 與原檔同名、只副檔名不同
     generated_pdf_name = os.path.splitext(single_sheet_xlsx)[0] + ".pdf"
-
     if os.path.isfile(generated_pdf_name):
         os.rename(generated_pdf_name, pdf_path)
     else:
@@ -1804,7 +1843,6 @@ def get_libreoffice_cmd() -> str:
     """
     custom_path = os.environ.get("LIBREOFFICE_PATH")
     if custom_path:
-        # 可能是完整檔案 or 資料夾
         if os.path.isfile(custom_path):
             return custom_path
         soffice_path = os.path.join(custom_path, "soffice")
@@ -1815,7 +1853,6 @@ def get_libreoffice_cmd() -> str:
             return libreoffice_path
         raise RuntimeError(f"LIBREOFFICE_PATH 無效: {custom_path}")
 
-    # 無自訂 => 用 which 找 soffice / libreoffice
     for candidate in ("soffice", "libreoffice"):
         exe_path = which(candidate)
         if exe_path:
@@ -1823,6 +1860,135 @@ def get_libreoffice_cmd() -> str:
 
     raise RuntimeError(
         "無法自動找到 libreoffice/soffice！請安裝 LibreOffice 或設定 LIBREOFFICE_PATH"
+    )
+
+================================================================================
+
+backend/site_diary/tasks.py
+
+================================================================================
+# backend/site_diary/tasks.py
+
+import os
+import tempfile
+import zipfile
+import shutil
+from datetime import datetime
+
+from rq import Queue, get_current_job
+from redis import Redis
+
+from backend.db import mongo
+from backend.site_diary.services import (
+    generate_diary_xlsx_only,
+    generate_diary_pdf_sheet
+)
+
+# 連到本機 redis 或從環境變數 REDIS_URL 取得
+redis_url = os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0")
+redis_conn = Redis.from_url(redis_url)
+diary_queue = Queue("diary-queue", connection=redis_conn)
+
+
+def async_multi_download_task(project_id: int, diary_ids: list[int], file_type: str):
+    """
+    後台實際執行「多筆日報打包成 ZIP」的函式：
+    - 先根據 diary_ids 一一生成對應檔（XLSX 或 PDF）。
+    - 最後打包成 ZIP。
+    - 回傳最終的 ZIP 路徑。
+    - job.meta['status'] = 'done' 並存入 zip_path 後存檔。
+    """
+
+    job = get_current_job()
+    if not job:
+        # RQ 理論上執行時一定有 job context；若沒有就直接拋錯
+        raise RuntimeError("No RQ job found in context.")
+
+    job.meta["status"] = "running"
+    job.meta["progress"] = 0
+    job.save_meta()
+
+    temp_dir = tempfile.mkdtemp(prefix="multi_diary_")
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    zip_filename = f"multiple_diaries_{timestamp}.zip"
+    zip_path = os.path.join(temp_dir, zip_filename)
+
+    used_names = set()
+
+    def ensure_unique_filename(base_name, used):
+        if base_name not in used:
+            used.add(base_name)
+            return base_name
+        base, ext = os.path.splitext(base_name)
+        i = 2
+        new_name = f"{base}_{i}{ext}"
+        while new_name in used:
+            i += 1
+            new_name = f"{base}_{i}{ext}"
+        used.add(new_name)
+        return new_name
+
+    try:
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for idx, d_id in enumerate(diary_ids):
+                diary_doc = mongo.db.site_diaries.find_one({
+                    "project_id": project_id,
+                    "id": d_id
+                })
+                if not diary_doc:
+                    continue  # 若找不到則跳過
+
+                # 取日報日期命名
+                if diary_doc.get("report_date"):
+                    date_prefix = diary_doc["report_date"].strftime("%Y%m%d")
+                else:
+                    date_prefix = "noDate"
+
+                if file_type == 'xlsx':
+                    xlsx_path = generate_diary_xlsx_only(diary_doc)
+                    base_name = f"{date_prefix}_daily_report.xlsx"
+                    final_name = ensure_unique_filename(base_name, used_names)
+                    zf.write(xlsx_path, arcname=final_name)
+
+                elif file_type in ('sheet1', 'sheet2'):
+                    pdf_path = generate_diary_pdf_sheet(diary_doc, sheet_name=file_type)
+                    if file_type == 'sheet1':
+                        base_name = f"{date_prefix}_daily_report.pdf"
+                    else:
+                        base_name = f"{date_prefix}_worker_log.pdf"
+                    final_name = ensure_unique_filename(base_name, used_names)
+                    zf.write(pdf_path, arcname=final_name)
+
+                # 每處理一筆，更新進度
+                job.meta["progress"] = int((idx + 1) * 100 / len(diary_ids))
+                job.save_meta()
+
+        # 全部成功完成
+        job.meta["status"] = "done"
+        job.meta["result_file"] = zip_path
+        job.save_meta()
+
+        return zip_path
+
+    except Exception as e:
+        job.meta["status"] = "failed"
+        job.meta["error"] = str(e)
+        job.save_meta()
+        # 若需清理 temp_dir，可於此處或 job 結束後再行刪除
+        raise e
+
+
+def queue_multi_download(project_id: int, diary_ids: list[int], file_type: str):
+    """
+    封裝提交 RQ 後台工作。
+    傳回 RQ job 物件，可取得 job_id。
+    """
+    return diary_queue.enqueue(
+        async_multi_download_task,
+        project_id,
+        diary_ids,
+        file_type,
+        job_timeout=1800  # 若量很多，給 30 分鐘 timeout
     )
 
 ================================================================================
@@ -5504,7 +5670,8 @@ frontend/src/views/SiteDiaryListView.vue
     </div>
 
     <div class="table-responsive">
-      <table class="table table-bordered table-hover mb-6">
+      <!-- 使用 table-sm 並在 :class="getRowClass(item)" 來標示星期天 -->
+      <table class="table table-sm table-bordered table-hover mb-6">
         <thead>
           <tr>
             <th>#</th>
@@ -5520,7 +5687,11 @@ frontend/src/views/SiteDiaryListView.vue
           </tr>
         </thead>
         <tbody>
-          <tr v-for="(item, index) in siteDiaries" :key="item.id">
+          <tr
+            v-for="(item, index) in siteDiaries"
+            :key="item.id"
+            :class="getRowClass(item)"
+          >
             <td>{{ index + 1 }}</td>
             <td>
               <input
@@ -5536,10 +5707,14 @@ frontend/src/views/SiteDiaryListView.vue
             <td>{{ item.day_count }}</td>
             <td>{{ item.updated_at || '' }}</td>
             <td>
-              <button class="btn btn-warning btn-sm" @click="openEditDialog(item.id)">EDIT</button>
+              <button class="btn btn-warning btn-sm" @click="openEditDialog(item.id)">
+                EDIT
+              </button>
             </td>
             <td>
-              <button class="btn btn-danger btn-sm" @click="deleteDiary(item.id)">DELETE</button>
+              <button class="btn btn-danger btn-sm" @click="deleteDiary(item.id)">
+                DELETE
+              </button>
             </td>
             <td>
               <div class="dropdown">
@@ -5552,17 +5727,29 @@ frontend/src/views/SiteDiaryListView.vue
                 </button>
                 <ul class="dropdown-menu">
                   <li>
-                    <a class="dropdown-item" href="#" @click.prevent="downloadReport(item.id, 'xlsx')">
+                    <a
+                      class="dropdown-item"
+                      href="#"
+                      @click.prevent="downloadReport(item.id, 'xlsx')"
+                    >
                       Excel (XLSX)
                     </a>
                   </li>
                   <li>
-                    <a class="dropdown-item" href="#" @click.prevent="downloadReport(item.id, 'sheet1')">
+                    <a
+                      class="dropdown-item"
+                      href="#"
+                      @click.prevent="downloadReport(item.id, 'sheet1')"
+                    >
                       PDF(表1)
                     </a>
                   </li>
                   <li>
-                    <a class="dropdown-item" href="#" @click.prevent="downloadReport(item.id, 'sheet2')">
+                    <a
+                      class="dropdown-item"
+                      href="#"
+                      @click.prevent="downloadReport(item.id, 'sheet2')"
+                    >
                       PDF(表2)
                     </a>
                   </li>
@@ -5575,12 +5762,14 @@ frontend/src/views/SiteDiaryListView.vue
     </div>
 
     <!-- Diary Form Modal -->
+    <!-- (移除 @click.self => 點擊背景不會關閉) -->
     <div
-      class="modal fade"
-      :class="{ show: displayFormDialog }"
-      style="display: block;"
+      class="modal"
+      :class="{ fade: true, show: displayFormDialog }"
+      :style="{ display: displayFormDialog ? 'block' : 'none' }"
       tabindex="-1"
       role="dialog"
+      aria-modal="true"
       v-if="displayFormDialog"
     >
       <div class="modal-dialog modal-xl" role="document">
@@ -5595,8 +5784,13 @@ frontend/src/views/SiteDiaryListView.vue
           </div>
         </div>
       </div>
-      <div class="modal-backdrop fade show"></div>
     </div>
+
+    <!-- Modal backdrop -->
+    <div
+      v-if="displayFormDialog"
+      class="modal-backdrop fade show"
+    ></div>
   </div>
 </template>
 
@@ -5625,6 +5819,7 @@ export default {
 
     const projectIdNumber = computed(() => Number(route.params.projectId))
 
+    // 取得專案資訊
     const fetchProjectInfo = async () => {
       try {
         const { data } = await axios.get(`/api/projects/${projectIdNumber.value}`)
@@ -5634,31 +5829,33 @@ export default {
       }
     }
 
+    // 取得日報列表
     const fetchSiteDiaries = async () => {
       try {
-        const { data } = await axios.get(`/api/projects/${projectIdNumber.value}/site_diaries`, {
-          params: {
-            sort_by: sortBy.value,
-            sort_order: sortOrder.value
-          }
-        })
+        const { data } = await axios.get(
+          `/api/projects/${projectIdNumber.value}/site_diaries`,
+          { params: { sort_by: sortBy.value, sort_order: sortOrder.value } }
+        )
         siteDiaries.value = data
-        selectedDiaryIds.value = []
+        selectedDiaryIds.value = [] // 每次重新載入都清空勾選
       } catch (err) {
         console.error(err)
       }
     }
 
+    // 開啟「新建」對話框
     const openCreateDialog = () => {
       editingDiaryId.value = null
       displayFormDialog.value = true
     }
 
+    // 開啟「編輯」對話框
     const openEditDialog = (diaryId) => {
       editingDiaryId.value = diaryId
       displayFormDialog.value = true
     }
 
+    // 刪除日報
     const deleteDiary = async (diaryId) => {
       if (!confirm('Are you sure you want to delete this Site Diary?')) return
       try {
@@ -5677,14 +5874,16 @@ export default {
           `/api/projects/${projectIdNumber.value}/site_diaries/${diaryId}/download_report?file=${fileType}`,
           { responseType: 'blob' }
         )
+        let filename
+        if (fileType === 'xlsx') {
+          filename = 'daily_report_filled.xlsx'
+        } else if (fileType === 'sheet1') {
+          filename = 'daily_report_sheet1.pdf'
+        } else {
+          filename = 'daily_report_sheet2.pdf'
+        }
 
-        let filename = fileType === 'xlsx'
-          ? 'daily_report_filled.xlsx'
-          : (fileType === 'sheet1'
-             ? 'daily_report_sheet1.pdf'
-             : 'daily_report_sheet2.pdf')
-
-        // 嘗試從 headers 取得檔名
+        // 嘗試從 headers 取得後端回傳的檔名
         const cd = response.headers['content-disposition']
         if (cd) {
           const m = /filename[^;=\n]*=((['"]).*?\2|[^;\n]*)/.exec(cd)
@@ -5706,7 +5905,7 @@ export default {
       }
     }
 
-    // 多筆下載 => 取得ZIP
+    // 多筆下載 => 下載 ZIP
     const downloadMultiple = async (fileType) => {
       if (!selectedDiaryIds.value.length) {
         alert('請先勾選一筆以上的日報！')
@@ -5749,17 +5948,20 @@ export default {
       }
     }
 
+    // 點擊「儲存 / 更新」後 => 關閉表單並重整列表
     const onDiaryUpdated = () => {
       displayFormDialog.value = false
       fetchSiteDiaries()
     }
+    // 點擊 Cancel => 僅關閉表單
     const onDiaryCancelled = () => {
       displayFormDialog.value = false
     }
 
-    // 全選 / 全取消
+    // 是否全選
     const isAllSelected = computed(() => {
-      return siteDiaries.value.length > 0 && selectedDiaryIds.value.length === siteDiaries.value.length
+      return siteDiaries.value.length > 0 &&
+        selectedDiaryIds.value.length === siteDiaries.value.length
     })
     const toggleSelectAll = (e) => {
       if (e.target.checked) {
@@ -5767,6 +5969,13 @@ export default {
       } else {
         selectedDiaryIds.value = []
       }
+    }
+
+    // 若是星期天 => 顯示特殊背景
+    const getRowClass = (diary) => {
+      if (!diary.report_date) return ''
+      const d = new Date(diary.report_date)
+      return d.getDay() === 0 ? 'sunday-row' : ''
     }
 
     onMounted(() => {
@@ -5786,8 +5995,8 @@ export default {
 
       sortBy,
       sortOrder,
-
       projectIdNumber,
+
       fetchSiteDiaries,
       openCreateDialog,
       openEditDialog,
@@ -5795,7 +6004,8 @@ export default {
       downloadReport,
       downloadMultiple,
       onDiaryUpdated,
-      onDiaryCancelled
+      onDiaryCancelled,
+      getRowClass
     }
   }
 }
@@ -5804,6 +6014,25 @@ export default {
 <style scoped>
 .mb-6 {
   margin-bottom: 24px;
+}
+
+/*  專門針對星期天列，套用底色 */
+.sunday-row td {
+  background-color: #e9e9e9 !important;
+}
+
+/*  更改 table-sm 的內補與行高 => 更緊湊的列高 */
+.table-sm > :not(caption) > * > * {
+  padding: 0.3rem 0.5rem !important;
+  line-height: 1.1 !important;
+}
+
+/* Modal 層級調整 */
+.modal {
+  z-index: 1050;
+}
+.modal-backdrop {
+  z-index: 1040;
 }
 </style>
 
@@ -6073,10 +6302,10 @@ requirements.txt
 Flask==3.1.0
 Flask-PyMongo==3.0.1
 pymongo==4.11.0
-# 其他你可能需要的套件（openpyxl、gunicorn、requests 等）
 openpyxl==3.1.5
 gunicorn==23.0.0
 requests==2.32.3
-# ...依照專案實際需要增加
 
-# Vue前端的建置不在此列舉：Vite/node_modules 由 npm/yarn 管理
+# 新增以下
+redis==4.5.5
+rq==1.13.0

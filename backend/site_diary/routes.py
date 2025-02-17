@@ -11,7 +11,6 @@ import shutil
 import zipfile
 
 from backend.db import mongo, get_next_sequence, to_iso_date, to_iso_datetime
-
 logger = logging.getLogger(__name__)
 
 site_diary_bp = Blueprint('site_diary_bp', __name__)
@@ -280,22 +279,30 @@ def download_site_diary_report(project_id, diary_id):
         return jsonify({"error": str(e), "traceback": tb}), 500
 
 
-def _send_file_with_utf8_filename(file_path: str, full_chinese_name: str, ascii_fallback: str = None) -> Response:
+def _send_file_with_utf8_filename(file_path: str, download_name: str, ascii_fallback: str = None) -> Response:
+    """
+    統一版本：可接收 2~3 個參數。
+      file_path:      實際檔案路徑
+      download_name:  想顯示給使用者下載的檔名(可能含中文)
+      ascii_fallback: 若瀏覽器不支援 RFC 5987 filename*=UTF-8 用的備用檔名
+    """
     from flask import send_file
     from urllib.parse import quote
 
     response = send_file(file_path, as_attachment=True)
-    if not ascii_fallback:
-        ascii_fallback = "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "_" for ch in full_chinese_name)
-    utf8_quoted = quote(full_chinese_name, encoding="utf-8")
 
+    if not ascii_fallback:
+        # 若呼叫者沒傳入 ascii_fallback 就自動生成簡易檔名 (只保留英數、-、_、.)
+        ascii_fallback = "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "_" for ch in download_name)
+
+    utf8_quoted = quote(download_name, encoding="utf-8")
     disposition_value = (
         f'attachment; filename="{ascii_fallback}"; '
         f'filename*=UTF-8\'\'{utf8_quoted}'
     )
-
     safe_disposition = disposition_value.encode('latin-1', 'replace').decode('latin-1')
     response.headers["Content-Disposition"] = safe_disposition
+
     return response
 
 
@@ -353,88 +360,86 @@ def get_last_site_diary(project_id):
 
 
 # ============================================================================
-# [多筆下載] - 現在正式實作 ZIP 打包: ex. ? "xlsx" or "sheet1" or "sheet2"
+# [多筆下載] - ZIP 打包
 # ============================================================================
 @site_diary_bp.route('/<int:project_id>/site_diaries/multi_download', methods=['POST'])
 def multi_download_site_diary(project_id):
+    """
+    接收 diary_ids (list[int]) 以及 file_type (xlsx|sheet1|sheet2)，
+    打包成 ZIP 後回傳。
+    - 修正後：檔名去掉日報ID，與單檔下載一致（ex: 20241111_daily_report.xlsx / 20241111_worker_log.pdf 等）
+    - 若多筆日報皆有同日期，ZIP 內檔名會重覆，故檔名衝突時自動加 `_2`, `_3`... 以避免覆蓋。
+    """
     data = request.json or {}
     diary_ids = data.get("diary_ids", [])
     file_type = data.get("file_type", "xlsx")
     logger.info("multi_download_site_diary called => diary_ids=%s, file_type=%s", diary_ids, file_type)
 
-    # 若沒勾選任何 diaries, 直接回傳 400
     if not diary_ids:
         return jsonify({"error": "No diary_ids provided"}), 400
 
-    # 準備在 tempdir 製作檔案後打包
     temp_dir = tempfile.mkdtemp(prefix="multi_diary_")
     zip_filename = f"multiple_diaries_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
     zip_path = os.path.join(temp_dir, zip_filename)
 
     from backend.site_diary.services import generate_diary_xlsx_only, generate_diary_pdf_sheet
 
+    # 小工具：檔名若重複，自动加 _2, _3... 以防衝突
+    def ensure_unique_filename(base_name, used_names):
+        if base_name not in used_names:
+            used_names.add(base_name)
+            return base_name
+
+        base, ext = os.path.splitext(base_name)
+        i = 2
+        new_name = f"{base}_{i}{ext}"
+        while new_name in used_names:
+            i += 1
+            new_name = f"{base}_{i}{ext}"
+        used_names.add(new_name)
+        return new_name
+
     try:
+        used_names = set()
+
         with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
             for d_id in diary_ids:
                 diary_doc = mongo.db.site_diaries.find_one({"project_id": project_id, "id": d_id})
                 if not diary_doc:
-                    # 若找不到該 diary, 直接略過 or 也可做特別處理
                     logger.warning("Diary not found or belongs to another project: id=%s", d_id)
                     continue
 
-                # 先計算檔名的日期部份
+                # 統一改用與單一下載相同的日期命名 (若無日期則用 "noDate")
                 if diary_doc.get("report_date"):
                     date_prefix = diary_doc["report_date"].strftime("%Y%m%d")
                 else:
-                    date_prefix = f"id{d_id}"
+                    date_prefix = "noDate"
 
-                # 依 file_type 產生對應檔案
                 if file_type == 'xlsx':
                     xlsx_path = generate_diary_xlsx_only(diary_doc)
-                    archive_name = f"{date_prefix}_daily_report_{d_id}.xlsx"
-                    zf.write(xlsx_path, arcname=archive_name)
+                    base_name = f"{date_prefix}_daily_report.xlsx"
+
+                    final_name = ensure_unique_filename(base_name, used_names)
+                    zf.write(xlsx_path, arcname=final_name)
+
                 elif file_type in ('sheet1', 'sheet2'):
                     pdf_path = generate_diary_pdf_sheet(diary_doc, sheet_name=file_type)
-                    # sheet1 => "每日施工進度報告表.pdf"
-                    # sheet2 => "每日本地工人及外地勞工施工人員紀錄表.pdf"
                     if file_type == 'sheet1':
-                        archive_name = f"{date_prefix}_daily_report_{d_id}.pdf"
+                        base_name = f"{date_prefix}_daily_report.pdf"
                     else:
-                        archive_name = f"{date_prefix}_workers_{d_id}.pdf"
-                    zf.write(pdf_path, arcname=archive_name)
+                        base_name = f"{date_prefix}_worker_log.pdf"
+
+                    final_name = ensure_unique_filename(base_name, used_names)
+                    zf.write(pdf_path, arcname=final_name)
+
                 else:
-                    # 如果遇到未知的 type, 可直接忽略或報錯
                     logger.warning("Skipping unknown file_type=%s for diary_id=%s", file_type, d_id)
                     continue
 
-        # 打包完成，回傳 ZIP
         logger.info("multi_download => created ZIP: %s", zip_path)
         return _send_file_with_utf8_filename(zip_path, zip_filename)
 
     except Exception as exc:
         logger.exception("multi_download_site_diary() exception: ")
-        # cleanup
         shutil.rmtree(temp_dir, ignore_errors=True)
         return jsonify({"error": str(exc)}), 500
-
-
-def _send_file_with_utf8_filename(file_path: str, download_name: str) -> Response:
-    """類似單筆下載的設計，但用於 ZIP 報表."""
-    from flask import send_file
-    from urllib.parse import quote
-
-    response = send_file(file_path, as_attachment=True, mimetype="application/zip")
-    ascii_fallback = "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "_" for ch in download_name)
-    utf8_quoted = quote(download_name, encoding="utf-8")
-
-    disposition_value = (
-        f'attachment; filename="{ascii_fallback}"; '
-        f'filename*=UTF-8\'\'{utf8_quoted}'
-    )
-    safe_disposition = disposition_value.encode('latin-1', 'replace').decode('latin-1')
-    response.headers["Content-Disposition"] = safe_disposition
-
-    # ★ 注意: 等檔案回傳完後再刪除 temp_dir
-    #   但 Flask/Gunicorn 未必有on_close callback; 常見做法是由callback/thread處理
-    #   這裡為簡化Demo不特別實現; 生產可考慮celery or advanced technique
-    return response

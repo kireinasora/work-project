@@ -2,7 +2,7 @@
 
 import traceback
 import logging
-from flask import Blueprint, request, jsonify, send_file, Response, abort
+from flask import Blueprint, request, jsonify, send_file, Response, abort, current_app
 from datetime import datetime
 from urllib.parse import quote
 import os
@@ -14,6 +14,15 @@ from backend.db import mongo, get_next_sequence, to_iso_date, to_iso_datetime
 logger = logging.getLogger(__name__)
 
 site_diary_bp = Blueprint('site_diary_bp', __name__)
+
+# ★ 新增
+import threading
+import uuid
+from backend.site_diary.progress_sse import progress_store
+from backend.site_diary.services import (
+    generate_diary_xlsx_only,
+    generate_diary_pdf_sheet,
+)
 
 
 @site_diary_bp.route('/<int:project_id>/site_diaries', methods=['POST'])
@@ -292,7 +301,7 @@ def _send_file_with_utf8_filename(file_path: str, download_name: str, ascii_fall
     response = send_file(file_path, as_attachment=True)
 
     if not ascii_fallback:
-        # 若呼叫者沒傳入 ascii_fallback 就自動生成簡易檔名 (只保留英數、-、_、.)
+        # 若呼叫者沒傳入 ascii_fallback 就自動生成簡易檔名
         ascii_fallback = "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "_" for ch in download_name)
 
     utf8_quoted = quote(download_name, encoding="utf-8")
@@ -360,15 +369,13 @@ def get_last_site_diary(project_id):
 
 
 # ============================================================================
-# [多筆下載] - ZIP 打包
+# [多筆下載 - 同步版] (原本就有) - 量小可直接使用
 # ============================================================================
 @site_diary_bp.route('/<int:project_id>/site_diaries/multi_download', methods=['POST'])
 def multi_download_site_diary(project_id):
     """
-    接收 diary_ids (list[int]) 以及 file_type (xlsx|sheet1|sheet2)，
-    打包成 ZIP 後回傳。
-    - 修正後：檔名去掉日報ID，與單檔下載一致（ex: 20241111_daily_report.xlsx / 20241111_worker_log.pdf 等）
-    - 若多筆日報皆有同日期，ZIP 內檔名會重覆，故檔名衝突時自動加 `_2`, `_3`... 以避免覆蓋。
+    多筆下載 - 同步版。
+    數量較大時，若處理時間過長可能導致 Gunicorn timeout。
     """
     data = request.json or {}
     diary_ids = data.get("diary_ids", [])
@@ -382,26 +389,24 @@ def multi_download_site_diary(project_id):
     zip_filename = f"multiple_diaries_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
     zip_path = os.path.join(temp_dir, zip_filename)
 
+    used_names = set()
+
     from backend.site_diary.services import generate_diary_xlsx_only, generate_diary_pdf_sheet
 
-    # 小工具：檔名若重複，自动加 _2, _3... 以防衝突
-    def ensure_unique_filename(base_name, used_names):
-        if base_name not in used_names:
-            used_names.add(base_name)
+    def ensure_unique_filename(base_name, used):
+        if base_name not in used:
+            used.add(base_name)
             return base_name
-
         base, ext = os.path.splitext(base_name)
         i = 2
         new_name = f"{base}_{i}{ext}"
-        while new_name in used_names:
+        while new_name in used:
             i += 1
             new_name = f"{base}_{i}{ext}"
-        used_names.add(new_name)
+        used.add(new_name)
         return new_name
 
     try:
-        used_names = set()
-
         with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
             for d_id in diary_ids:
                 diary_doc = mongo.db.site_diaries.find_one({"project_id": project_id, "id": d_id})
@@ -409,7 +414,7 @@ def multi_download_site_diary(project_id):
                     logger.warning("Diary not found or belongs to another project: id=%s", d_id)
                     continue
 
-                # 統一改用與單一下載相同的日期命名 (若無日期則用 "noDate")
+                # 依 file_type 產檔
                 if diary_doc.get("report_date"):
                     date_prefix = diary_doc["report_date"].strftime("%Y%m%d")
                 else:
@@ -418,7 +423,6 @@ def multi_download_site_diary(project_id):
                 if file_type == 'xlsx':
                     xlsx_path = generate_diary_xlsx_only(diary_doc)
                     base_name = f"{date_prefix}_daily_report.xlsx"
-
                     final_name = ensure_unique_filename(base_name, used_names)
                     zf.write(xlsx_path, arcname=final_name)
 
@@ -428,7 +432,6 @@ def multi_download_site_diary(project_id):
                         base_name = f"{date_prefix}_daily_report.pdf"
                     else:
                         base_name = f"{date_prefix}_worker_log.pdf"
-
                     final_name = ensure_unique_filename(base_name, used_names)
                     zf.write(pdf_path, arcname=final_name)
 
@@ -443,3 +446,148 @@ def multi_download_site_diary(project_id):
         logger.exception("multi_download_site_diary() exception: ")
         shutil.rmtree(temp_dir, ignore_errors=True)
         return jsonify({"error": str(exc)}), 500
+
+
+# ============================================================================
+# [多筆下載 - 非同步版 + SSE進度]  ---------------------------------------------
+# ============================================================================
+
+@site_diary_bp.route('/<int:project_id>/site_diaries/multi_download_async', methods=['POST'])
+def multi_download_site_diary_async(project_id):
+    """
+    非同步版 + SSE:
+      1) 前端 POST {diary_ids, file_type} 進來
+      2) 後端產生 job_id, 用執行緒背景處理, 立即回傳 {"job_id": ...}
+      3) 前端用 SSE(/api/progress-sse/<job_id>) 監看進度
+      4) 完成後 (status=done), 再呼叫 multi_download_result 取得最後ZIP
+    """
+    data = request.json or {}
+    diary_ids = data.get("diary_ids", [])
+    file_type = data.get("file_type", "xlsx")
+    if not diary_ids:
+        return jsonify({"error": "No diary_ids provided"}), 400
+
+    project_doc = mongo.db.projects.find_one({"id": project_id})
+    if not project_doc:
+        abort(404, description="Project not found")
+
+    job_id = str(uuid.uuid4())
+    progress_store[job_id] = {
+        "status": "in_progress",
+        "progress": 0,
+        "file_path": None,
+        "error_msg": ""
+    }
+
+    # ★ 關鍵修正：在啟動背景執行緒前，先抓取「當前 app 物件」並傳進去
+    appctx = current_app._get_current_object()
+
+    t = threading.Thread(
+        target=_background_zip_generation,
+        args=(appctx, job_id, project_id, diary_ids, file_type),
+        daemon=True
+    )
+    t.start()
+
+    return jsonify({"job_id": job_id}), 200
+
+
+def _background_zip_generation(app, job_id, project_id, diary_ids, file_type):
+    """
+    在背景執行的打包函式，會更新 progress_store[job_id] 中的 progress/status/file_path
+
+    ★ 使用 with app.app_context(): 避免 'Working outside of application context' 錯誤
+    """
+    try:
+        with app.app_context():
+            total = len(diary_ids)
+            if total == 0:
+                raise ValueError("No diaries specified.")
+
+            temp_dir = tempfile.mkdtemp(prefix="multi_diary_")
+            zip_filename = f"multiple_diaries_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+            zip_path = os.path.join(temp_dir, zip_filename)
+
+            used_names = set()
+
+            from backend.site_diary.services import generate_diary_xlsx_only, generate_diary_pdf_sheet
+
+            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                for idx, d_id in enumerate(diary_ids, start=1):
+                    # 更新進度
+                    progress_store[job_id]["progress"] = int(idx * 100 / total)
+
+                    diary_doc = mongo.db.site_diaries.find_one({"project_id": project_id, "id": d_id})
+                    if not diary_doc:
+                        continue
+
+                    if diary_doc.get("report_date"):
+                        date_str = diary_doc["report_date"].strftime("%Y%m%d")
+                    else:
+                        date_str = "noDate"
+
+                    if file_type == 'xlsx':
+                        path_ = generate_diary_xlsx_only(diary_doc)
+                        base_name = f"{date_str}_daily_report.xlsx"
+                    elif file_type == 'sheet1':
+                        path_ = generate_diary_pdf_sheet(diary_doc, sheet_name='sheet1')
+                        base_name = f"{date_str}_daily_report.pdf"
+                    elif file_type == 'sheet2':
+                        path_ = generate_diary_pdf_sheet(diary_doc, sheet_name='sheet2')
+                        base_name = f"{date_str}_worker_log.pdf"
+                    else:
+                        continue
+
+                    final_name = _ensure_unique_filename(base_name, used_names)
+                    zf.write(path_, arcname=final_name)
+
+            progress_store[job_id]["status"] = "done"
+            progress_store[job_id]["file_path"] = zip_path
+
+    except Exception as e:
+        progress_store[job_id]["status"] = "error"
+        progress_store[job_id]["error_msg"] = str(e)
+        logger.exception("background_zip_generation error:")
+    finally:
+        # 確保結束時強制 progress=100
+        progress_store[job_id]["progress"] = 100
+
+
+def _ensure_unique_filename(base_name, used_names):
+    if base_name not in used_names:
+        used_names.add(base_name)
+        return base_name
+    base, ext = os.path.splitext(base_name)
+    i = 2
+    new_name = f"{base}_{i}{ext}"
+    while new_name in used_names:
+        i += 1
+        new_name = f"{base}_{i}{ext}"
+    used_names.add(new_name)
+    return new_name
+
+
+@site_diary_bp.route('/<int:project_id>/site_diaries/multi_download_result', methods=['GET'])
+def multi_download_result(project_id):
+    """
+    當 SSE 監測到 status=done 後，前端呼叫:
+       GET /api/projects/<project_id>/site_diaries/multi_download_result?job_id=xxx
+    以實際拿到 ZIP 檔。
+    """
+    job_id = request.args.get('job_id')
+    if not job_id:
+        return jsonify({"error": "Missing job_id"}), 400
+
+    job_info = progress_store.get(job_id)
+    if not job_info:
+        return jsonify({"error": "Invalid job_id"}), 400
+
+    if job_info["status"] != "done":
+        return jsonify({"error": f"Job not done. status={job_info['status']}"}), 400
+
+    zip_path = job_info["file_path"]
+    if not zip_path or not os.path.isfile(zip_path):
+        return jsonify({"error": "File not found for this job."}), 404
+
+    filename = os.path.basename(zip_path)
+    return send_file(zip_path, as_attachment=True, download_name=filename)

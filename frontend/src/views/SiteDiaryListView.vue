@@ -42,14 +42,15 @@
         <label class="form-check-label" for="selectAll">全選</label>
       </div>
 
-      <button class="btn btn-outline-primary btn-sm" @click="downloadMultiple('xlsx')">
-        Download XLSX (多筆)
+      <!-- 改用非同步 + SSE 的下載按鈕 -->
+      <button class="btn btn-outline-primary btn-sm" @click="downloadMultipleAsync('xlsx')">
+        Download XLSX (多筆, SSE)
       </button>
-      <button class="btn btn-outline-primary btn-sm" @click="downloadMultiple('sheet1')">
-        Download PDF(表1) (多筆)
+      <button class="btn btn-outline-primary btn-sm" @click="downloadMultipleAsync('sheet1')">
+        Download PDF(表1) (SSE)
       </button>
-      <button class="btn btn-outline-primary btn-sm" @click="downloadMultiple('sheet2')">
-        Download PDF(表2) (多筆)
+      <button class="btn btn-outline-primary btn-sm" @click="downloadMultipleAsync('sheet2')">
+        Download PDF(表2) (SSE)
       </button>
     </div>
 
@@ -67,7 +68,7 @@
             <th>Last Edited</th>
             <th>EDIT</th>
             <th>DELETE</th>
-            <th>DOWNLOAD</th>
+            <th>DOWNLOAD (Single)</th>
           </tr>
         </thead>
         <tbody>
@@ -146,7 +147,6 @@
     </div>
 
     <!-- Diary Form Modal -->
-    <!-- (移除 @click.self => 點擊背景不會關閉) -->
     <div
       class="modal"
       :class="{ fade: true, show: displayFormDialog }"
@@ -170,9 +170,75 @@
       </div>
     </div>
 
-    <!-- Modal backdrop -->
+    <!-- Modal backdrop for form -->
     <div
       v-if="displayFormDialog"
+      class="modal-backdrop fade show"
+    ></div>
+
+    <!-- SSE 進度 Modal -->
+    <div
+      class="modal"
+      :class="{ fade: true, show: showProgressModal }"
+      :style="{ display: showProgressModal ? 'block' : 'none' }"
+      tabindex="-1"
+      role="dialog"
+      aria-modal="true"
+      v-if="showProgressModal"
+    >
+      <div class="modal-dialog modal-sm" role="document">
+        <div class="modal-content">
+          <div class="modal-header">
+            <h5 class="modal-title">Export Progress</h5>
+            <button
+              type="button"
+              class="btn-close"
+              @click="abortSse"
+            ></button>
+          </div>
+          <div class="modal-body text-center">
+            <p v-if="progressStatus === 'error'" class="text-danger">
+              Error: {{ progressErrorMsg }}
+            </p>
+            <p v-else-if="progressStatus === 'done'" class="text-success">
+              All done!
+            </p>
+            <p v-else>
+              Exporting... ({{ sseProgress }}%)
+            </p>
+
+            <!-- Bootstrap 進度條範例 -->
+            <div class="progress" style="height: 24px;">
+              <div
+                class="progress-bar"
+                role="progressbar"
+                :style="{width: sseProgress + '%'}"
+                :aria-valuenow="sseProgress"
+                aria-valuemin="0"
+                aria-valuemax="100"
+              >
+                {{ sseProgress }}%
+              </div>
+            </div>
+
+          </div>
+          <div class="modal-footer">
+            <button
+              v-if="progressStatus === 'done' || progressStatus === 'error'"
+              type="button"
+              class="btn btn-secondary"
+              @click="closeProgressModal"
+            >
+              Close
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Modal backdrop for SSE progress -->
+    <div
+      v-if="showProgressModal"
       class="modal-backdrop fade show"
     ></div>
   </div>
@@ -202,6 +268,13 @@ export default {
     const sortOrder = ref(1)
 
     const projectIdNumber = computed(() => Number(route.params.projectId))
+
+    // =============== SSE 相關的狀態 ===============
+    const showProgressModal = ref(false)
+    const sseProgress = ref(0)
+    const progressStatus = ref('idle') // idle, in_progress, done, error
+    const progressErrorMsg = ref('')
+    let sse = null // 用於記錄 SSE 連線物件 (EventSource)
 
     // 取得專案資訊
     const fetchProjectInfo = async () => {
@@ -251,7 +324,7 @@ export default {
       }
     }
 
-    // 單筆下載
+    // 單筆下載 (維持原狀)
     const downloadReport = async (diaryId, fileType) => {
       try {
         const response = await axios.get(
@@ -267,7 +340,7 @@ export default {
           filename = 'daily_report_sheet2.pdf'
         }
 
-        // 嘗試從 headers 取得後端回傳的檔名
+        // 嘗試從 headers 取得後端回傳檔名
         const cd = response.headers['content-disposition']
         if (cd) {
           const m = /filename[^;=\n]*=((['"]).*?\2|[^;\n]*)/.exec(cd)
@@ -289,54 +362,103 @@ export default {
       }
     }
 
-    // 多筆下載 => 下載 ZIP
-    const downloadMultiple = async (fileType) => {
+    // ================ 重新改寫多筆下載 (SSE 版本) ====================
+    const downloadMultipleAsync = async (fileType) => {
       if (!selectedDiaryIds.value.length) {
         alert('請先勾選一筆以上的日報！')
         return
       }
+      // 先呼叫非同步 API => 取得 job_id
       try {
+        // 重置 SSE 狀態
+        sseProgress.value = 0
+        progressStatus.value = 'in_progress'
+        progressErrorMsg.value = ''
+        showProgressModal.value = true
+
         const payload = {
           diary_ids: selectedDiaryIds.value,
           file_type: fileType
         }
-        const response = await axios.post(
-          `/api/projects/${projectIdNumber.value}/site_diaries/multi_download`,
-          payload,
-          { responseType: 'blob' }
+        const res = await axios.post(
+          `/api/projects/${projectIdNumber.value}/site_diaries/multi_download_async`,
+          payload
         )
+        const { job_id } = res.data
 
-        // 預設檔名
-        let filename = 'multiple_diaries.zip'
-        const cd = response.headers['content-disposition']
-        if (cd) {
-          const m = /filename[^;=\n]*=((['"]).*?\2|[^;\n]*)/.exec(cd)
-          if (m && m[1]) {
-            filename = m[1].replace(/['"]/g, '')
-          }
-        }
-
-        const blobUrl = window.URL.createObjectURL(response.data)
-        const link = document.createElement('a')
-        link.href = blobUrl
-        link.setAttribute('download', filename)
-        document.body.appendChild(link)
-        link.click()
-        link.remove()
-        window.URL.revokeObjectURL(blobUrl)
+        // 開始 SSE 監聽
+        startSse(job_id)
       } catch (err) {
-        console.error('Multi download error:', err)
-        if (err.response && err.response.data && err.response.data.error) {
-          alert(`後端多筆下載失敗：\n${err.response.data.error}`)
-        }
+        console.error('multi_download_async error:', err)
+        alert('多筆下載時發生錯誤。請查看 console log')
       }
     }
+
+    function startSse(jobId) {
+      const sseUrl = `/api/progress-sse/${jobId}`
+      sse = new EventSource(sseUrl)
+
+      sse.onmessage = (evt) => {
+        const data = JSON.parse(evt.data) // { progress, status, error_msg? }
+        sseProgress.value = data.progress
+        progressStatus.value = data.status || 'unknown'
+
+        if (data.status === 'error') {
+          progressErrorMsg.value = data.error_msg || ''
+          sse.close()
+        } else if (data.status === 'done') {
+          sse.close()
+
+          // SSE 結束後，再下載最後 ZIP
+          fetchFinalZip(jobId)
+        }
+      }
+
+      sse.onerror = (err) => {
+        console.error('SSE error:', err)
+        if (sse) {
+          sse.close()
+        }
+        progressStatus.value = 'error'
+        progressErrorMsg.value = 'SSE 連線出錯'
+      }
+    }
+
+    async function fetchFinalZip(jobId) {
+      try {
+        // 直接透過 window.location 下載
+        //   GET /api/projects/:projectId/site_diaries/multi_download_result?job_id=xxx
+        const finalUrl = `/api/projects/${projectIdNumber.value}/site_diaries/multi_download_result?job_id=${jobId}`
+        window.location = finalUrl
+      } catch (err) {
+        console.error('fetchFinalZip error:', err)
+        progressStatus.value = 'error'
+        progressErrorMsg.value = String(err)
+      }
+    }
+
+    // 讓使用者有機會手動關閉 SSE
+    function abortSse() {
+      if (sse) {
+        sse.close()
+      }
+      progressStatus.value = 'error'
+      progressErrorMsg.value = 'User aborted.'
+    }
+
+    // 關閉 SSE 進度視窗
+    function closeProgressModal() {
+      showProgressModal.value = false
+    }
+
+    // ===============================================
 
     // 點擊「儲存 / 更新」後 => 關閉表單並重整列表
     const onDiaryUpdated = () => {
       displayFormDialog.value = false
       fetchSiteDiaries()
     }
+
     // 點擊 Cancel => 僅關閉表單
     const onDiaryCancelled = () => {
       displayFormDialog.value = false
@@ -386,7 +508,16 @@ export default {
       openEditDialog,
       deleteDiary,
       downloadReport,
-      downloadMultiple,
+
+      // 新增 SSE 相關
+      downloadMultipleAsync,
+      showProgressModal,
+      sseProgress,
+      progressStatus,
+      progressErrorMsg,
+      abortSse,
+      closeProgressModal,
+
       onDiaryUpdated,
       onDiaryCancelled,
       getRowClass

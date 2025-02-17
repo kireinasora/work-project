@@ -13,6 +13,9 @@ from backend.server import download_bp
 # ★ 新增：改用我們的 db.py 來初始化 Mongo
 from backend.db import init_mongo_app
 
+# ★ 新增：SSE Blueprint
+from backend.site_diary.progress_sse import progress_sse_bp
+
 def create_app():
     app = Flask(__name__, static_folder="../frontend/dist", static_url_path="/")
 
@@ -25,6 +28,9 @@ def create_app():
     app.register_blueprint(site_diary_bp, url_prefix='/api/projects')
     app.register_blueprint(staff_bp, url_prefix='/api/staff')
     app.register_blueprint(download_bp)
+
+    # ★ 新增：SSE blueprint
+    app.register_blueprint(progress_sse_bp, url_prefix='/api')
 
     # 提供前端打包後檔案 (SPA)
     @app.route('/', defaults={'path': ''})

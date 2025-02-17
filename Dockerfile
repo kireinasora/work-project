@@ -70,7 +70,7 @@ ENV PYTHONPATH=/app
 EXPOSE 5000
 
 ################################################################################
-# 直接在 Gunicorn 的參數中設定較高的 timeout、使用多 workers/threads，以避免大量生成檔案時被殺掉
+# 直接在 Gunicorn 的參數中設定較高的 timeout、使用多 workers/threads
 ################################################################################
 CMD ["/bin/sh", "-c", "gunicorn 'backend.main:create_app()' \
 --bind 0.0.0.0:$PORT \

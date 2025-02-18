@@ -13,10 +13,19 @@
     <div class="mt-3">
       <router-link
         :to="`/projects/${projectId}/diaries`"
-        class="btn btn-info"
+        class="btn btn-info me-2"
       >
         Manage Site Diaries
       </router-link>
+
+      <!-- ★ 新增的按鈕: Go to Gantt Chart -->
+      <router-link
+        :to="`/projects/${projectId}/gantt`"
+        class="btn btn-warning"
+      >
+        Gantt
+      </router-link>
+      <!-- -------------- -->
     </div>
   </div>
 </template>
@@ -54,5 +63,7 @@ export default {
 </script>
 
 <style scoped>
-/* 可視需求，自行增減 */
+.me-2 {
+  margin-right: 8px;
+}
 </style>

@@ -40,6 +40,7 @@
 │   │   ├── views/
 │   │   │   ├── HomeView.vue
 │   │   │   ├── MaterialFormView.vue
+│   │   │   ├── ProjectsGanttView.vue
 │   │   │   ├── ProjectsView.vue
 │   │   │   ├── SiteDiaryListView.vue
 │   │   │   └── StaffView.vue
@@ -1143,7 +1144,7 @@ backend/site_diary/routes.py
 
 import traceback
 import logging
-from flask import Blueprint, request, jsonify, send_file, Response, abort
+from flask import Blueprint, request, jsonify, send_file, Response, abort, current_app
 from datetime import datetime
 from urllib.parse import quote
 import os
@@ -1592,6 +1593,7 @@ def multi_download_site_diary(project_id):
 # ============================================================================
 # [多筆下載 - 非同步版 + SSE進度]  ---------------------------------------------
 # ============================================================================
+
 @site_diary_bp.route('/<int:project_id>/site_diaries/multi_download_async', methods=['POST'])
 def multi_download_site_diary_async(project_id):
     """
@@ -1619,9 +1621,12 @@ def multi_download_site_diary_async(project_id):
         "error_msg": ""
     }
 
+    # ★ 關鍵修正：在啟動背景執行緒前，先抓取「當前 app 物件」並傳進去
+    appctx = current_app._get_current_object()
+
     t = threading.Thread(
         target=_background_zip_generation,
-        args=(job_id, project_id, diary_ids, file_type),
+        args=(appctx, job_id, project_id, diary_ids, file_type),
         daemon=True
     )
     t.start()
@@ -1629,54 +1634,57 @@ def multi_download_site_diary_async(project_id):
     return jsonify({"job_id": job_id}), 200
 
 
-def _background_zip_generation(job_id, project_id, diary_ids, file_type):
+def _background_zip_generation(app, job_id, project_id, diary_ids, file_type):
     """
     在背景執行的打包函式，會更新 progress_store[job_id] 中的 progress/status/file_path
+
+    ★ 使用 with app.app_context(): 避免 'Working outside of application context' 錯誤
     """
     try:
-        total = len(diary_ids)
-        if total == 0:
-            raise ValueError("No diaries specified.")
+        with app.app_context():
+            total = len(diary_ids)
+            if total == 0:
+                raise ValueError("No diaries specified.")
 
-        temp_dir = tempfile.mkdtemp(prefix="multi_diary_")
-        zip_filename = f"multiple_diaries_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
-        zip_path = os.path.join(temp_dir, zip_filename)
+            temp_dir = tempfile.mkdtemp(prefix="multi_diary_")
+            zip_filename = f"multiple_diaries_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+            zip_path = os.path.join(temp_dir, zip_filename)
 
-        used_names = set()
+            used_names = set()
 
-        from backend.site_diary.services import generate_diary_xlsx_only, generate_diary_pdf_sheet
+            from backend.site_diary.services import generate_diary_xlsx_only, generate_diary_pdf_sheet
 
-        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-            for idx, d_id in enumerate(diary_ids, start=1):
-                # 更新進度
-                progress_store[job_id]["progress"] = int(idx * 100 / total)
+            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                for idx, d_id in enumerate(diary_ids, start=1):
+                    # 更新進度
+                    progress_store[job_id]["progress"] = int(idx * 100 / total)
 
-                diary_doc = mongo.db.site_diaries.find_one({"project_id": project_id, "id": d_id})
-                if not diary_doc:
-                    continue
+                    diary_doc = mongo.db.site_diaries.find_one({"project_id": project_id, "id": d_id})
+                    if not diary_doc:
+                        continue
 
-                if diary_doc.get("report_date"):
-                    date_str = diary_doc["report_date"].strftime("%Y%m%d")
-                else:
-                    date_str = "noDate"
+                    if diary_doc.get("report_date"):
+                        date_str = diary_doc["report_date"].strftime("%Y%m%d")
+                    else:
+                        date_str = "noDate"
 
-                if file_type == 'xlsx':
-                    path_ = generate_diary_xlsx_only(diary_doc)
-                    base_name = f"{date_str}_daily_report.xlsx"
-                elif file_type == 'sheet1':
-                    path_ = generate_diary_pdf_sheet(diary_doc, sheet_name='sheet1')
-                    base_name = f"{date_str}_daily_report.pdf"
-                elif file_type == 'sheet2':
-                    path_ = generate_diary_pdf_sheet(diary_doc, sheet_name='sheet2')
-                    base_name = f"{date_str}_worker_log.pdf"
-                else:
-                    continue
+                    if file_type == 'xlsx':
+                        path_ = generate_diary_xlsx_only(diary_doc)
+                        base_name = f"{date_str}_daily_report.xlsx"
+                    elif file_type == 'sheet1':
+                        path_ = generate_diary_pdf_sheet(diary_doc, sheet_name='sheet1')
+                        base_name = f"{date_str}_daily_report.pdf"
+                    elif file_type == 'sheet2':
+                        path_ = generate_diary_pdf_sheet(diary_doc, sheet_name='sheet2')
+                        base_name = f"{date_str}_worker_log.pdf"
+                    else:
+                        continue
 
-                final_name = _ensure_unique_filename(base_name, used_names)
-                zf.write(path_, arcname=final_name)
+                    final_name = _ensure_unique_filename(base_name, used_names)
+                    zf.write(path_, arcname=final_name)
 
-        progress_store[job_id]["status"] = "done"
-        progress_store[job_id]["file_path"] = zip_path
+            progress_store[job_id]["status"] = "done"
+            progress_store[job_id]["file_path"] = zip_path
 
     except Exception as e:
         progress_store[job_id]["status"] = "error"
@@ -2163,10 +2171,12 @@ frontend/package-lock.json
       "version": "0.0.0",
       "dependencies": {
         "axios": "^1.7.9",
+        "bootstrap": "^5.3.1",
+        "html2canvas": "^1.4.1",
+        "jspdf": "^2.5.2",
         "sass": "^1.83.4",
         "vue": "^3.5.13",
-        "vue-router": "^4.5.0",
-        "vuetify": "^3.7.11"
+        "vue-router": "^4.5.0"
       },
       "devDependencies": {
         "@types/node": "^22.13.0",
@@ -2208,6 +2218,18 @@ frontend/package-lock.json
       },
       "engines": {
         "node": ">=6.0.0"
+      }
+    },
+    "node_modules/@babel/runtime": {
+      "version": "7.26.9",
+      "resolved": "https://registry.npmjs.org/@babel/runtime/-/runtime-7.26.9.tgz",
+      "integrity": "sha512-aA63XwOkcl4xxQa3HjPMqOP6LiK0ZDv3mUPYEFXkpHbaFjtGggE1A61FjFzJnB+p7/oy2gA8E+rcBNl/zC1tMg==",
+      "license": "MIT",
+      "dependencies": {
+        "regenerator-runtime": "^0.14.0"
+      },
+      "engines": {
+        "node": ">=6.9.0"
       }
     },
     "node_modules/@babel/types": {
@@ -2950,6 +2972,17 @@ frontend/package-lock.json
         "url": "https://opencollective.com/parcel"
       }
     },
+    "node_modules/@popperjs/core": {
+      "version": "2.11.8",
+      "resolved": "https://registry.npmjs.org/@popperjs/core/-/core-2.11.8.tgz",
+      "integrity": "sha512-P1st0aksCrn9sGZhp8GMYwBnQsbvAWsZAX44oXNNvLHGqAOcoVxmjZiohstwQ7SqKnbR47akdNi+uleWD8+g6A==",
+      "license": "MIT",
+      "peer": true,
+      "funding": {
+        "type": "opencollective",
+        "url": "https://opencollective.com/popperjs"
+      }
+    },
     "node_modules/@rollup/rollup-android-arm-eabi": {
       "version": "4.34.0",
       "resolved": "https://registry.npmjs.org/@rollup/rollup-android-arm-eabi/-/rollup-android-arm-eabi-4.34.0.tgz",
@@ -3233,6 +3266,13 @@ frontend/package-lock.json
         "undici-types": "~6.20.0"
       }
     },
+    "node_modules/@types/raf": {
+      "version": "3.4.3",
+      "resolved": "https://registry.npmjs.org/@types/raf/-/raf-3.4.3.tgz",
+      "integrity": "sha512-c4YAvMedbPZ5tEyxzQdMoOhhJ4RD3rngZIdwC2/qDN3d7JpEhB6fiBRKVY1lg5B7Wk+uPBjn5f39j1/2MY1oOw==",
+      "license": "MIT",
+      "optional": true
+    },
     "node_modules/@vitejs/plugin-vue": {
       "version": "5.2.1",
       "resolved": "https://registry.npmjs.org/@vitejs/plugin-vue/-/plugin-vue-5.2.1.tgz",
@@ -3450,6 +3490,18 @@ frontend/package-lock.json
       "integrity": "sha512-Oei9OH4tRh0YqU3GxhX79dM/mwVgvbZJaSNaRk+bshkj0S5cfHcgYakreBjrHwatXKbz+IoIdYLxrKim2MjW0Q==",
       "license": "MIT"
     },
+    "node_modules/atob": {
+      "version": "2.1.2",
+      "resolved": "https://registry.npmjs.org/atob/-/atob-2.1.2.tgz",
+      "integrity": "sha512-Wm6ukoaOGJi/73p/cl2GvLjTI5JM1k/O14isD73YML8StrH/7/lRFgmg8nICZgD3bZZvjwCGxtMOD3wWNAu8cg==",
+      "license": "(MIT OR Apache-2.0)",
+      "bin": {
+        "atob": "bin/atob.js"
+      },
+      "engines": {
+        "node": ">= 4.5.0"
+      }
+    },
     "node_modules/axios": {
       "version": "1.7.9",
       "resolved": "https://registry.npmjs.org/axios/-/axios-1.7.9.tgz",
@@ -3467,6 +3519,34 @@ frontend/package-lock.json
       "integrity": "sha512-3oSeUO0TMV67hN1AmbXsK4yaqU7tjiHlbxRDZOpH0KW9+CeX4bRAaX0Anxt0tx2MrpRpWwQaPwIlISEJhYU5Pw==",
       "dev": true,
       "license": "MIT"
+    },
+    "node_modules/base64-arraybuffer": {
+      "version": "1.0.2",
+      "resolved": "https://registry.npmjs.org/base64-arraybuffer/-/base64-arraybuffer-1.0.2.tgz",
+      "integrity": "sha512-I3yl4r9QB5ZRY3XuJVEPfc2XhZO6YweFPI+UovAzn+8/hb3oJ6lnysaFcjVpkCPfVWFUDvoZ8kmVDP7WyRtYtQ==",
+      "license": "MIT",
+      "engines": {
+        "node": ">= 0.6.0"
+      }
+    },
+    "node_modules/bootstrap": {
+      "version": "5.3.3",
+      "resolved": "https://registry.npmjs.org/bootstrap/-/bootstrap-5.3.3.tgz",
+      "integrity": "sha512-8HLCdWgyoMguSO9o+aH+iuZ+aht+mzW0u3HIMzVu7Srrpv7EBBxTnrFlSCskwdY1+EOFQSm7uMJhNQHkdPcmjg==",
+      "funding": [
+        {
+          "type": "github",
+          "url": "https://github.com/sponsors/twbs"
+        },
+        {
+          "type": "opencollective",
+          "url": "https://opencollective.com/bootstrap"
+        }
+      ],
+      "license": "MIT",
+      "peerDependencies": {
+        "@popperjs/core": "^2.11.8"
+      }
     },
     "node_modules/brace-expansion": {
       "version": "2.0.1",
@@ -3490,6 +3570,45 @@ frontend/package-lock.json
       "engines": {
         "node": ">=8"
       }
+    },
+    "node_modules/btoa": {
+      "version": "1.2.1",
+      "resolved": "https://registry.npmjs.org/btoa/-/btoa-1.2.1.tgz",
+      "integrity": "sha512-SB4/MIGlsiVkMcHmT+pSmIPoNDoHg+7cMzmt3Uxt628MTz2487DKSqK/fuhFBrkuqrYv5UCEnACpF4dTFNKc/g==",
+      "license": "(MIT OR Apache-2.0)",
+      "bin": {
+        "btoa": "bin/btoa.js"
+      },
+      "engines": {
+        "node": ">= 0.4.0"
+      }
+    },
+    "node_modules/canvg": {
+      "version": "3.0.10",
+      "resolved": "https://registry.npmjs.org/canvg/-/canvg-3.0.10.tgz",
+      "integrity": "sha512-qwR2FRNO9NlzTeKIPIKpnTY6fqwuYSequ8Ru8c0YkYU7U0oW+hLUvWadLvAu1Rl72OMNiFhoLu4f8eUjQ7l/+Q==",
+      "license": "MIT",
+      "optional": true,
+      "dependencies": {
+        "@babel/runtime": "^7.12.5",
+        "@types/raf": "^3.4.0",
+        "core-js": "^3.8.3",
+        "raf": "^3.4.1",
+        "regenerator-runtime": "^0.13.7",
+        "rgbcolor": "^1.0.1",
+        "stackblur-canvas": "^2.0.0",
+        "svg-pathdata": "^6.0.3"
+      },
+      "engines": {
+        "node": ">=10.0.0"
+      }
+    },
+    "node_modules/canvg/node_modules/regenerator-runtime": {
+      "version": "0.13.11",
+      "resolved": "https://registry.npmjs.org/regenerator-runtime/-/regenerator-runtime-0.13.11.tgz",
+      "integrity": "sha512-kY1AZVr2Ra+t+piVaJ4gxaFaReZVH40AKNo7UCX6W+dEwBo/2oZJzqfuN1qLq1oL45o56cPaTXELwrTh8Fpggg==",
+      "license": "MIT",
+      "optional": true
     },
     "node_modules/chokidar": {
       "version": "4.0.3",
@@ -3516,6 +3635,27 @@ frontend/package-lock.json
       },
       "engines": {
         "node": ">= 0.8"
+      }
+    },
+    "node_modules/core-js": {
+      "version": "3.40.0",
+      "resolved": "https://registry.npmjs.org/core-js/-/core-js-3.40.0.tgz",
+      "integrity": "sha512-7vsMc/Lty6AGnn7uFpYT56QesI5D2Y/UkgKounk87OP9Z2H9Z8kj6jzcSGAxFmUtDOS0ntK6lbQz+Nsa0Jj6mQ==",
+      "hasInstallScript": true,
+      "license": "MIT",
+      "optional": true,
+      "funding": {
+        "type": "opencollective",
+        "url": "https://opencollective.com/core-js"
+      }
+    },
+    "node_modules/css-line-break": {
+      "version": "2.1.0",
+      "resolved": "https://registry.npmjs.org/css-line-break/-/css-line-break-2.1.0.tgz",
+      "integrity": "sha512-FHcKFCZcAha3LwfVBhCQbW2nCNbkZXn7KVUJcsT5/P8YmfsVja0FMPJr0B903j/E69HUphKiV9iQArX8SDYA4w==",
+      "license": "MIT",
+      "dependencies": {
+        "utrie": "^1.0.2"
       }
     },
     "node_modules/csstype": {
@@ -3552,6 +3692,13 @@ frontend/package-lock.json
       "engines": {
         "node": ">=0.10"
       }
+    },
+    "node_modules/dompurify": {
+      "version": "2.5.8",
+      "resolved": "https://registry.npmjs.org/dompurify/-/dompurify-2.5.8.tgz",
+      "integrity": "sha512-o1vSNgrmYMQObbSSvF/1brBYEQPHhV1+gsmrusO7/GXtp1T9rCS8cXFqVxK/9crT1jA6Ccv+5MTSjBNqr7Sovw==",
+      "license": "(MPL-2.0 OR Apache-2.0)",
+      "optional": true
     },
     "node_modules/entities": {
       "version": "4.5.0",
@@ -3610,6 +3757,12 @@ frontend/package-lock.json
       "version": "2.0.2",
       "resolved": "https://registry.npmjs.org/estree-walker/-/estree-walker-2.0.2.tgz",
       "integrity": "sha512-Rfkk/Mp/DL7JVje3u18FxFujQlTNR2q6QfMSMB7AvCBx91NGj/ba3kCfza0f6dVDbw7YlRf/nDrn7pQrCCyQ/w==",
+      "license": "MIT"
+    },
+    "node_modules/fflate": {
+      "version": "0.8.2",
+      "resolved": "https://registry.npmjs.org/fflate/-/fflate-0.8.2.tgz",
+      "integrity": "sha512-cPJU47OaAoCbg0pBvzsgpTPhmhqI5eJjh/JIu8tPj5q+T7iLvW/JAYUqmE7KOB4R1ZyEhzBaIQpQpardBF5z8A==",
       "license": "MIT"
     },
     "node_modules/fill-range": {
@@ -3684,6 +3837,19 @@ frontend/package-lock.json
         "he": "bin/he"
       }
     },
+    "node_modules/html2canvas": {
+      "version": "1.4.1",
+      "resolved": "https://registry.npmjs.org/html2canvas/-/html2canvas-1.4.1.tgz",
+      "integrity": "sha512-fPU6BHNpsyIhr8yyMpTLLxAbkaK8ArIBcmZIRiBLiDhjeqvXolaEmDGmELFuX9I4xDcaKKcJl+TKZLqruBbmWA==",
+      "license": "MIT",
+      "dependencies": {
+        "css-line-break": "^2.1.0",
+        "text-segmentation": "^1.0.3"
+      },
+      "engines": {
+        "node": ">=8.0.0"
+      }
+    },
     "node_modules/immutable": {
       "version": "5.0.3",
       "resolved": "https://registry.npmjs.org/immutable/-/immutable-5.0.3.tgz",
@@ -3721,6 +3887,24 @@ frontend/package-lock.json
       "optional": true,
       "engines": {
         "node": ">=0.12.0"
+      }
+    },
+    "node_modules/jspdf": {
+      "version": "2.5.2",
+      "resolved": "https://registry.npmjs.org/jspdf/-/jspdf-2.5.2.tgz",
+      "integrity": "sha512-myeX9c+p7znDWPk0eTrujCzNjT+CXdXyk7YmJq5nD5V7uLLKmSXnlQ/Jn/kuo3X09Op70Apm0rQSnFWyGK8uEQ==",
+      "license": "MIT",
+      "dependencies": {
+        "@babel/runtime": "^7.23.2",
+        "atob": "^2.1.2",
+        "btoa": "^1.2.1",
+        "fflate": "^0.8.1"
+      },
+      "optionalDependencies": {
+        "canvg": "^3.0.6",
+        "core-js": "^3.6.0",
+        "dompurify": "^2.5.4",
+        "html2canvas": "^1.0.0-rc.5"
       }
     },
     "node_modules/magic-string": {
@@ -3822,6 +4006,13 @@ frontend/package-lock.json
       "dev": true,
       "license": "MIT"
     },
+    "node_modules/performance-now": {
+      "version": "2.1.0",
+      "resolved": "https://registry.npmjs.org/performance-now/-/performance-now-2.1.0.tgz",
+      "integrity": "sha512-7EAHlyLHI56VEIdK57uwHdHKIaAGbnXPiw0yWbarQZOKaKpvUIgW0jWRVLiatnM+XXlSwsanIBH/hzGMJulMow==",
+      "license": "MIT",
+      "optional": true
+    },
     "node_modules/picocolors": {
       "version": "1.1.1",
       "resolved": "https://registry.npmjs.org/picocolors/-/picocolors-1.1.1.tgz",
@@ -3875,6 +4066,16 @@ frontend/package-lock.json
       "integrity": "sha512-D+zkORCbA9f1tdWRK0RaCR3GPv50cMxcrz4X8k5LTSUD1Dkw47mKJEZQNunItRTkWwgtaUSo1RVFRIG9ZXiFYg==",
       "license": "MIT"
     },
+    "node_modules/raf": {
+      "version": "3.4.1",
+      "resolved": "https://registry.npmjs.org/raf/-/raf-3.4.1.tgz",
+      "integrity": "sha512-Sq4CW4QhwOHE8ucn6J34MqtZCeWFP2aQSmrlroYgqAV1PjStIhJXxYuTgUIfkEk7zTLjmIjLmU5q+fbD1NnOJA==",
+      "license": "MIT",
+      "optional": true,
+      "dependencies": {
+        "performance-now": "^2.1.0"
+      }
+    },
     "node_modules/readdirp": {
       "version": "4.1.1",
       "resolved": "https://registry.npmjs.org/readdirp/-/readdirp-4.1.1.tgz",
@@ -3886,6 +4087,22 @@ frontend/package-lock.json
       "funding": {
         "type": "individual",
         "url": "https://paulmillr.com/funding/"
+      }
+    },
+    "node_modules/regenerator-runtime": {
+      "version": "0.14.1",
+      "resolved": "https://registry.npmjs.org/regenerator-runtime/-/regenerator-runtime-0.14.1.tgz",
+      "integrity": "sha512-dYnhHh0nJoMfnkZs6GmmhFknAGRrLznOu5nc9ML+EJxGvrx6H7teuevqVqCuPcPK//3eDrrjQhehXVx9cnkGdw==",
+      "license": "MIT"
+    },
+    "node_modules/rgbcolor": {
+      "version": "1.0.1",
+      "resolved": "https://registry.npmjs.org/rgbcolor/-/rgbcolor-1.0.1.tgz",
+      "integrity": "sha512-9aZLIrhRaD97sgVhtJOW6ckOEh6/GnvQtdVNfdZ6s67+3/XwLS9lBcQYzEEhYVeUowN7pRzMLsyGhK2i/xvWbw==",
+      "license": "MIT OR SEE LICENSE IN FEEL-FREE.md",
+      "optional": true,
+      "engines": {
+        "node": ">= 0.8.15"
       }
     },
     "node_modules/rollup": {
@@ -3956,6 +4173,35 @@ frontend/package-lock.json
         "node": ">=0.10.0"
       }
     },
+    "node_modules/stackblur-canvas": {
+      "version": "2.7.0",
+      "resolved": "https://registry.npmjs.org/stackblur-canvas/-/stackblur-canvas-2.7.0.tgz",
+      "integrity": "sha512-yf7OENo23AGJhBriGx0QivY5JP6Y1HbrrDI6WLt6C5auYZXlQrheoY8hD4ibekFKz1HOfE48Ww8kMWMnJD/zcQ==",
+      "license": "MIT",
+      "optional": true,
+      "engines": {
+        "node": ">=0.1.14"
+      }
+    },
+    "node_modules/svg-pathdata": {
+      "version": "6.0.3",
+      "resolved": "https://registry.npmjs.org/svg-pathdata/-/svg-pathdata-6.0.3.tgz",
+      "integrity": "sha512-qsjeeq5YjBZ5eMdFuUa4ZosMLxgr5RZ+F+Y1OrDhuOCEInRMA3x74XdBtggJcj9kOeInz0WE+LgCPDkZFlBYJw==",
+      "license": "MIT",
+      "optional": true,
+      "engines": {
+        "node": ">=12.0.0"
+      }
+    },
+    "node_modules/text-segmentation": {
+      "version": "1.0.3",
+      "resolved": "https://registry.npmjs.org/text-segmentation/-/text-segmentation-1.0.3.tgz",
+      "integrity": "sha512-iOiPUo/BGnZ6+54OsWxZidGCsdU8YbE4PSpdPinp7DeMtUJNJBoJ/ouUSTJjHkh1KntHaltHl/gDs2FC4i5+Nw==",
+      "license": "MIT",
+      "dependencies": {
+        "utrie": "^1.0.2"
+      }
+    },
     "node_modules/to-regex-range": {
       "version": "5.0.1",
       "resolved": "https://registry.npmjs.org/to-regex-range/-/to-regex-range-5.0.1.tgz",
@@ -3989,6 +4235,15 @@ frontend/package-lock.json
       "integrity": "sha512-Ny6QZ2Nju20vw1SRHe3d9jVu6gJ+4e3+MMpqu7pqE5HT6WsTSlce++GQmK5UXS8mzV8DSYHrQH+Xrf2jVcuKNg==",
       "dev": true,
       "license": "MIT"
+    },
+    "node_modules/utrie": {
+      "version": "1.0.2",
+      "resolved": "https://registry.npmjs.org/utrie/-/utrie-1.0.2.tgz",
+      "integrity": "sha512-1MLa5ouZiOmQzUbjbu9VmjLzn1QLXBhwpUa7kdLUQK+KQ5KA9I1vk5U4YHe/X2Ch7PYnJfWuWT+VbuxbGwljhw==",
+      "license": "MIT",
+      "dependencies": {
+        "base64-arraybuffer": "^1.0.2"
+      }
     },
     "node_modules/vite": {
       "version": "6.0.11",
@@ -4121,36 +4376,6 @@ frontend/package-lock.json
       "peerDependencies": {
         "typescript": ">=5.0.0"
       }
-    },
-    "node_modules/vuetify": {
-      "version": "3.7.11",
-      "resolved": "https://registry.npmjs.org/vuetify/-/vuetify-3.7.11.tgz",
-      "integrity": "sha512-50Z2SNwPXbkGmve4CwxOs4sySZGgLwQYIDsKx+coSrfIBqz8IyXgxRFQdrvgoehIwUjGTNqaPZymuK5rMFkfHA==",
-      "license": "MIT",
-      "engines": {
-        "node": "^12.20 || >=14.13"
-      },
-      "funding": {
-        "type": "github",
-        "url": "https://github.com/sponsors/johnleider"
-      },
-      "peerDependencies": {
-        "typescript": ">=4.7",
-        "vite-plugin-vuetify": ">=1.0.0",
-        "vue": "^3.3.0",
-        "webpack-plugin-vuetify": ">=2.0.0"
-      },
-      "peerDependenciesMeta": {
-        "typescript": {
-          "optional": true
-        },
-        "vite-plugin-vuetify": {
-          "optional": true
-        },
-        "webpack-plugin-vuetify": {
-          "optional": true
-        }
-      }
     }
   }
 }
@@ -4173,6 +4398,8 @@ frontend/package.json
   "dependencies": {
     "axios": "^1.7.9",
     "bootstrap": "^5.3.1",
+    "html2canvas": "^1.4.1",
+    "jspdf": "^2.5.2",
     "sass": "^1.83.4",
     "vue": "^3.5.13",
     "vue-router": "^4.5.0"
@@ -4282,10 +4509,19 @@ frontend/src/components/ProjectDetail.vue
     <div class="mt-3">
       <router-link
         :to="`/projects/${projectId}/diaries`"
-        class="btn btn-info"
+        class="btn btn-info me-2"
       >
         Manage Site Diaries
       </router-link>
+
+      <!-- ★ 新增的按鈕: Go to Gantt Chart -->
+      <router-link
+        :to="`/projects/${projectId}/gantt`"
+        class="btn btn-warning"
+      >
+        Gantt
+      </router-link>
+      <!-- -------------- -->
     </div>
   </div>
 </template>
@@ -4323,7 +4559,9 @@ export default {
 </script>
 
 <style scoped>
-/* 可視需求，自行增減 */
+.me-2 {
+  margin-right: 8px;
+}
 </style>
 
 ================================================================================
@@ -5050,18 +5288,20 @@ import HomeView from './views/HomeView.vue'
 import ProjectsView from './views/ProjectsView.vue'
 import MaterialFormView from './views/MaterialFormView.vue'
 import StaffView from './views/StaffView.vue'
-
-// ★ 新增
 import SiteDiaryListView from './views/SiteDiaryListView.vue'
+
+// ★ 新增 import
+import ProjectsGanttView from './views/ProjectsGanttView.vue'
 
 const routes = [
   { path: '/', component: HomeView },
   { path: '/projects', component: ProjectsView },
   { path: '/material', component: MaterialFormView },
   { path: '/staff', component: StaffView },
+  { path: '/projects/:projectId/diaries', component: SiteDiaryListView },
 
-  // 新增日報列表頁（替代舊 daily report）
-  { path: '/projects/:projectId/diaries', component: SiteDiaryListView }
+  // ★ 新增：Gantt 頁面
+  { path: '/projects/:projectId/gantt', component: ProjectsGanttView }
 ]
 
 export default createRouter({
@@ -5546,6 +5786,163 @@ frontend/src/views/MaterialFormView.vue
   }
   .btn-submit:hover {
     background: #535bf2;
+  }
+  </style>
+  
+================================================================================
+
+frontend/src/views/ProjectsGanttView.vue
+
+================================================================================
+<!-- frontend/src/views/ProjectsGanttView.vue -->
+<template>
+    <div class="container-fluid">
+      <h2>Gantt Chart for Project #{{ projectId }}</h2>
+  
+      <div class="mb-3">
+        <button class="btn btn-secondary me-2" @click="goBack">
+          &larr; Back
+        </button>
+        <button class="btn btn-success me-2" @click="addNewTask">
+          Add Task
+        </button>
+        <button class="btn btn-info me-2" @click="exportPDF">
+          Export to PDF
+        </button>
+      </div>
+  
+      <div
+        id="gantt_here"
+        style="width:100%; height:600px; border:1px solid #ccc;"
+      ></div>
+    </div>
+  </template>
+  
+  <script>
+  import { onMounted, onBeforeUnmount, computed } from 'vue'
+  import { useRoute, useRouter } from 'vue-router'
+  
+  // ★ 改成靜態 import
+  import html2canvas from 'html2canvas'
+  import { jsPDF } from 'jspdf'
+  
+  export default {
+    name: 'ProjectsGanttView',
+    setup() {
+      const route = useRoute()
+      const router = useRouter()
+      const projectId = computed(() => Number(route.params.projectId))
+  
+      // 假資料
+      const tasksData = {
+        data: [
+          { id: 1, text: 'Task #1', start_date: '2025-01-01', duration: 5, progress: 0.8, open: true },
+          { id: 2, text: 'Task #2', start_date: '2025-01-06', duration: 3, progress: 0.2, parent: 1 },
+          { id: 3, text: 'Task #3', start_date: '2025-01-09', duration: 5, progress: 0, parent: 1 }
+        ],
+        links: [
+          { id: 1, source: 2, target: 3, type: '0' }
+        ]
+      }
+  
+      function initGantt() {
+        gantt.config.date_format = "%Y-%m-%d"
+        gantt.config.scales = [
+          { unit: "month", step: 1, format: "%Y %M" },
+          { unit: "day", step: 1, format: "%j, %D" }
+        ]
+        gantt.config.columns = [
+          { name: "text", label: "Task Name", width: "*", tree: true },
+          { name: "start_date", label: "Start", align: "center", width: 90 },
+          { name: "duration", label: "Dur.", align: "center", width: 50 },
+          { name: "add", label: "", width: 44 }
+        ]
+  
+        gantt.init("gantt_here")
+        gantt.parse(tasksData)
+  
+        // 觀察甘特圖更新事件
+        gantt.attachEvent("onAfterTaskAdd", (id, item) => {
+          console.log("Task added:", id, item)
+        })
+        gantt.attachEvent("onAfterTaskUpdate", (id, item) => {
+          console.log("Task updated:", id, item)
+        })
+        gantt.attachEvent("onAfterTaskDelete", (id, item) => {
+          console.log("Task deleted:", id, item)
+        })
+      }
+  
+      function addNewTask() {
+        const newId = gantt.uid()
+        gantt.addTask({
+          id: newId,
+          text: "New Task",
+          start_date: "2025-01-15",
+          duration: 4,
+          progress: 0
+        })
+      }
+  
+      async function exportPDF() {
+        // 對指定 DOM (id="gantt_here") 做畫面快照
+        const ganttContainer = document.getElementById('gantt_here')
+        if (!ganttContainer) return
+        const canvas = await html2canvas(ganttContainer, { useCORS: true })
+        const imgData = canvas.toDataURL("image/png")
+  
+        // 產出 PDF
+        const pdf = new jsPDF('landscape', 'pt', 'a4') // 橫向A4
+        const pageWidth = pdf.internal.pageSize.getWidth()
+        const pageHeight = pdf.internal.pageSize.getHeight()
+  
+        const ratio = Math.min(pageWidth / canvas.width, pageHeight / canvas.height)
+        pdf.addImage(imgData, 'PNG', 0, 0, canvas.width * ratio, canvas.height * ratio)
+        pdf.save('gantt_export.pdf')
+      }
+  
+      onMounted(() => {
+        // 動態載入 DHTMLX Gantt
+        const link = document.createElement('link')
+        link.rel = 'stylesheet'
+        link.href = 'https://cdn.dhtmlx.com/gantt/edge/dhtmlxgantt.css'
+        document.head.appendChild(link)
+  
+        const script = document.createElement('script')
+        script.src = 'https://cdn.dhtmlx.com/gantt/edge/dhtmlxgantt.js'
+        script.onload = () => {
+          initGantt()
+        }
+        document.head.appendChild(script)
+      })
+  
+      onBeforeUnmount(() => {
+        if (window.gantt) {
+          gantt.clearAll()
+          gantt.detachAllEvents()
+        }
+      })
+  
+      function goBack() {
+        router.push(`/projects/${projectId.value}`)
+      }
+  
+      return {
+        projectId,
+        goBack,
+        addNewTask,
+        exportPDF
+      }
+    }
+  }
+  </script>
+  
+  <style scoped>
+  .container-fluid {
+    margin-top: 1rem;
+  }
+  .me-2 {
+    margin-right: 8px;
   }
   </style>
   

@@ -16,6 +16,9 @@ from backend.db import init_mongo_app
 # ★ 新增：SSE Blueprint
 from backend.site_diary.progress_sse import progress_sse_bp
 
+# ★ 新增: 匯入 Gantt Management blueprint
+from backend.gantt_management.routes import gantt_bp
+
 def create_app():
     app = Flask(__name__, static_folder="../frontend/dist", static_url_path="/")
 
@@ -31,6 +34,10 @@ def create_app():
 
     # ★ 新增：SSE blueprint
     app.register_blueprint(progress_sse_bp, url_prefix='/api')
+
+    # ★ 新增：Gantt blueprint
+    # 提供 /api/projects/<int:project_id>/gantt/... 路徑
+    app.register_blueprint(gantt_bp, url_prefix='/api/projects')
 
     # 提供前端打包後檔案 (SPA)
     @app.route('/', defaults={'path': ''})

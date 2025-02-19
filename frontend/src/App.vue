@@ -35,19 +35,44 @@
       </div>
     </nav>
 
-    <!-- Main Content -->
-    <div class="container my-4">
+    <!-- 
+      根據是否為 Gantt 頁面，決定要不要包在 .container.my-4
+      這樣即可避免 Gantt 頁面左側產生 offset
+    -->
+    <div v-if="isGanttPage" style="margin:0; padding:0;">
+      <router-view />
+    </div>
+    <div v-else class="container my-4">
       <router-view />
     </div>
   </div>
 </template>
 
 <script>
+import { computed } from 'vue'
+import { useRoute } from 'vue-router'
+
 export default {
-  name: 'App'
+  name: 'App',
+  setup() {
+    const route = useRoute()
+
+    // 簡單判斷路徑中是否包含 /gantt
+    // （也可改更精準判斷 route.name === 'ProjectsGantt' 之類）
+    const isGanttPage = computed(() => {
+      return route.path.includes('/gantt')
+    })
+
+    return {
+      isGanttPage
+    }
+  }
 }
 </script>
 
 <style>
 /* 可視需求自行增減 */
+
+/* 說明：若不是 Gantt 頁面，我們保留 .container.my-4。
+   若是 Gantt 頁面，則改用上方 <div style="margin:0;padding:0;"> 撐滿整個畫面。 */
 </style>

@@ -5,6 +5,9 @@
 │   ├── db.py # backend/db.py
 │   ├── main.py # backend/main.py
 │   └── server.py
+│   ├── gantt_management/
+│   │   ├── routes.py # backend/gantt_management/routes.py
+│   │   └── services.py # backend/gantt_management/services.py
 │   ├── material_management/
 │   │   ├── constants.py # backend/material_management/constants.py
 │   │   ├── routes.py # backend/material_management/routes.py
@@ -248,6 +251,511 @@ def to_iso_datetime(dt):
 
 ================================================================================
 
+backend/gantt_management/routes.py
+
+================================================================================
+# backend/gantt_management/routes.py
+
+import logging
+from datetime import datetime, date, timedelta
+from flask import Blueprint, request, jsonify, abort
+
+from backend.gantt_management.services import (
+    create_gantt_task,
+    update_gantt_task,
+    delete_gantt_task,
+    get_all_tasks_for_project,
+    get_gantt_snapshots_for_project,
+    create_daily_snapshot,
+    get_specific_snapshot,
+    get_holiday_settings,
+    update_holiday_settings,
+    update_gantt_snapshot,       # ★ 新增
+    delete_gantt_snapshot,       # ★ 新增
+)
+from backend.db import to_iso_datetime  # 轉 datetime -> 字串
+
+logger = logging.getLogger(__name__)
+
+gantt_bp = Blueprint("gantt_bp", __name__)
+
+# --------------------------------------------------------------------------------
+# Gantt 任務相關
+# --------------------------------------------------------------------------------
+
+@gantt_bp.route("/<int:project_id>/gantt/tasks", methods=["GET"])
+def list_gantt_tasks(project_id):
+    """
+    取得某專案當前最新(或指定日期版本) 的所有 Gantt Tasks。
+    可帶 query param ?snapshot_date=YYYY-MM-DD 取舊版。
+    """
+    snapshot_date_str = request.args.get("snapshot_date", "").strip()
+    if snapshot_date_str:
+        # 取得舊版快照
+        snapshot_doc = get_specific_snapshot(project_id, snapshot_date_str)
+        if not snapshot_doc:
+            return jsonify({
+                "error": f"No snapshot found for {snapshot_date_str}"
+            }), 404
+        # 回傳該 snapshot 裡的 tasks
+        return jsonify(snapshot_doc["tasks"]), 200
+    else:
+        # 回傳當前最新
+        tasks = get_all_tasks_for_project(project_id)
+        return jsonify(tasks), 200
+
+
+@gantt_bp.route("/<int:project_id>/gantt/tasks", methods=["POST"])
+def create_task(project_id):
+    """
+    新增一筆任務
+    body JSON: {
+      "text": "任務名稱",
+      "start_date": "2025-01-15",
+      "end_date": "2025-01-20",  // 或傳 duration
+      "duration": 5,            // 二擇一
+      "progress": 0.3,
+      "parent_id": null,        // 可支援子任務
+      "depends": [ 2, 3 ],      // 依賴哪些任務(簡化)
+    }
+    """
+    data = request.json or {}
+    data["project_id"] = project_id
+
+    try:
+        task_id = create_gantt_task(data)
+        return jsonify({"message": "Task created", "task_id": task_id}), 201
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@gantt_bp.route("/<int:project_id>/gantt/tasks/<string:task_id>", methods=["PUT"])
+def put_task(project_id, task_id):
+    """
+    更新某任務
+    body JSON 與 create 相似
+    """
+    data = request.json or {}
+    data["project_id"] = project_id
+    data["task_id"] = task_id
+
+    try:
+        update_gantt_task(task_id, data)
+        return jsonify({"message": "Task updated"}), 200
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except KeyError:
+        abort(404, description="Task not found")
+
+
+@gantt_bp.route("/<int:project_id>/gantt/tasks/<string:task_id>", methods=["DELETE"])
+def remove_task(project_id, task_id):
+    """
+    刪除某任務
+    """
+    try:
+        delete_gantt_task(project_id, task_id)
+        return jsonify({"message": "Task deleted"}), 200
+    except KeyError:
+        abort(404, description="Task not found")
+
+
+# --------------------------------------------------------------------------------
+# 版本快照
+# --------------------------------------------------------------------------------
+
+@gantt_bp.route("/<int:project_id>/gantt/snapshots", methods=["GET"])
+def list_snapshots(project_id):
+    """
+    取得某專案所有 Gantt 快照日期列表。
+    """
+    snapshots = get_gantt_snapshots_for_project(project_id)
+    # 僅回傳日期 + created_at 字串
+    out = []
+    for snap in snapshots:
+        out.append({
+            "date": snap["snapshot_date"],
+            "created_at": to_iso_datetime(snap.get("created_at"))
+        })
+    return jsonify(out), 200
+
+
+@gantt_bp.route("/<int:project_id>/gantt/snapshots", methods=["POST"])
+def make_snapshot(project_id):
+    """
+    手動建立當天(或指定日)的快照。
+    body JSON: { "snapshot_date": "2025-06-07" } (可不傳，預設今天)
+    """
+    data = request.json or {}
+    snap_date_str = data.get("snapshot_date")
+    if snap_date_str:
+        snap_date = datetime.strptime(snap_date_str, "%Y-%m-%d").date()
+    else:
+        snap_date = date.today()  # ★ 預設就是今天
+
+    try:
+        snap_id = create_daily_snapshot(project_id, snap_date)
+        return jsonify({
+            "message": "Snapshot created",
+            "snapshot_date": snap_date.isoformat(),
+            "snapshot_id": snap_id
+        }), 201
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+
+# ★★★ 新增：修改 / 刪除舊快照 ★★★
+
+@gantt_bp.route("/<int:project_id>/gantt/snapshots/<snapshot_date_str>", methods=["PUT"])
+def put_snapshot(project_id, snapshot_date_str):
+    """
+    修改已存在的某個日期之 Gantt Snapshot 的 tasks 全量覆蓋，
+    body JSON: { "tasks": [...] }
+    """
+    data = request.json or {}
+    new_tasks = data.get("tasks", [])
+    try:
+        updated = update_gantt_snapshot(project_id, snapshot_date_str, new_tasks)
+        if not updated:
+            return jsonify({"error": "Snapshot not found"}), 404
+        return jsonify({"message": "Snapshot updated"}), 200
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@gantt_bp.route("/<int:project_id>/gantt/snapshots/<snapshot_date_str>", methods=["DELETE"])
+def remove_snapshot(project_id, snapshot_date_str):
+    """
+    刪除某個日期之 Gantt Snapshot
+    """
+    try:
+        deleted = delete_gantt_snapshot(project_id, snapshot_date_str)
+        if not deleted:
+            return jsonify({"error": "Snapshot not found"}), 404
+        return jsonify({"message": "Snapshot deleted"}), 200
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+
+# --------------------------------------------------------------------------------
+# 假日 & 工作日設定
+# --------------------------------------------------------------------------------
+
+@gantt_bp.route("/<int:project_id>/gantt/holidays", methods=["GET"])
+def get_holidays(project_id):
+    """
+    取得該專案的假日設定 (或公司統一維度)
+    結構可包含: {
+       "project_id": int,
+       "holidays": ["2025-01-01", "2025-02-10" ],
+       "workdays_per_week": 5,
+       "workday_weekdays": [1,2,3,4,5],  # ★ 新增: 指定哪些星期幾是工作日 (0=周日,1=周一,...)
+       "special_workdays": [ "2025-02-11" ],
+       ...
+    }
+    """
+    result = get_holiday_settings(project_id)
+    if not result:
+        # 若查無, 回傳預設
+        result = {
+            "project_id": project_id,
+            "holidays": [],
+            "workdays_per_week": 5,
+            "workday_weekdays": [],   # ★ 新增欄位: 預設空陣列
+            "special_workdays": []
+        }
+    return jsonify(result), 200
+
+
+@gantt_bp.route("/<int:project_id>/gantt/holidays", methods=["PUT"])
+def put_holidays(project_id):
+    """
+    更新該專案假日設定
+    body: {
+       "holidays": [ "2025-01-01", "2025-02-10" ],
+       "workdays_per_week": 6,
+       "workday_weekdays": [1,2,3,4,5,6],
+       ...
+    }
+    """
+    data = request.json or {}
+    data["project_id"] = project_id
+    update_holiday_settings(project_id, data)
+    return jsonify({"message": "Holiday settings updated"}), 200
+
+================================================================================
+
+backend/gantt_management/services.py
+
+================================================================================
+# backend/gantt_management/services.py
+
+import math
+import uuid
+from datetime import datetime, date
+from typing import Dict, Any, Optional
+from bson.objectid import ObjectId
+
+from backend.db import mongo
+
+# --------------------------------------------------------------------------
+# Gantt Tasks (當前最新資料，不屬於任何 snapshot)
+# --------------------------------------------------------------------------
+
+def get_all_tasks_for_project(project_id: int):
+    """
+    查詢當前最新資料(不含版本快照)的 tasks。
+    """
+    cursor = mongo.db["gantt_tasks"].find({"project_id": project_id})
+    tasks = []
+    for doc in cursor:
+        tasks.append(_format_task_doc(doc))
+    return tasks
+
+
+def create_gantt_task(data: Dict[str, Any]) -> str:
+    """
+    新增一筆任務
+    """
+    project_id = data["project_id"]
+    text = data.get("text", "Unnamed Task")
+    start_date_str = data.get("start_date")
+    end_date_str = data.get("end_date")
+    duration = data.get("duration")
+    progress = data.get("progress", 0)
+    parent_id = data.get("parent_id")
+    depends = data.get("depends", [])
+
+    if not start_date_str and not end_date_str and not duration:
+        raise ValueError("start_date + (end_date or duration) is required")
+
+    # 計算 end_date 或 duration
+    if start_date_str:
+        start_dt = datetime.strptime(start_date_str, "%Y-%m-%d")
+        if end_date_str:
+            end_dt = datetime.strptime(end_date_str, "%Y-%m-%d")
+            duration = (end_dt - start_dt).days + 1
+        else:
+            # end_date = start_date + duration - 1
+            end_dt = start_dt
+            if duration:
+                end_dt = start_dt + _days_timedelta(duration - 1)
+        start_date_iso = start_dt.date().isoformat()
+        end_date_iso = end_dt.date().isoformat()
+    else:
+        raise ValueError("Must provide start_date")
+
+    task_doc = {
+        "project_id": project_id,
+        "text": text,
+        "start_date": start_date_iso,
+        "end_date": end_date_iso,
+        "progress": float(progress),
+        "parent_id": parent_id,
+        "depends": depends,
+        "created_at": datetime.now(),
+    }
+    # 產生 task_id (string)
+    task_doc["_id"] = str(uuid.uuid4())
+
+    mongo.db["gantt_tasks"].insert_one(task_doc)
+    return task_doc["_id"]
+
+
+def update_gantt_task(task_id: str, data: Dict[str, Any]):
+    """
+    更新任務
+    """
+    doc = mongo.db["gantt_tasks"].find_one({"_id": task_id, "project_id": data["project_id"]})
+    if not doc:
+        raise KeyError("Task not found")
+
+    update_fields = {}
+    if "text" in data:
+        update_fields["text"] = data["text"]
+    if "progress" in data:
+        update_fields["progress"] = float(data["progress"])
+    if "parent_id" in data:
+        update_fields["parent_id"] = data["parent_id"]
+    if "depends" in data:
+        update_fields["depends"] = data["depends"]
+
+    start_date_str = data.get("start_date")
+    end_date_str = data.get("end_date")
+    duration = data.get("duration")
+
+    if start_date_str:
+        start_dt = datetime.strptime(start_date_str, "%Y-%m-%d")
+        update_fields["start_date"] = start_dt.date().isoformat()
+        if end_date_str:
+            end_dt = datetime.strptime(end_date_str, "%Y-%m-%d")
+            update_fields["end_date"] = end_dt.date().isoformat()
+        elif duration:
+            end_dt = start_dt + _days_timedelta(duration - 1)
+            update_fields["end_date"] = end_dt.date().isoformat()
+    elif end_date_str:
+        old_start = doc["start_date"]
+        if not old_start:
+            raise ValueError("No existing start_date to compute from.")
+        start_dt = datetime.strptime(old_start, "%Y-%m-%d")
+        end_dt = datetime.strptime(end_date_str, "%Y-%m-%d")
+        update_fields["end_date"] = end_dt.date().isoformat()
+
+    update_fields["updated_at"] = datetime.now()
+
+    mongo.db["gantt_tasks"].update_one(
+        {"_id": task_id},
+        {"$set": update_fields}
+    )
+
+
+def delete_gantt_task(project_id: int, task_id: str):
+    result = mongo.db["gantt_tasks"].delete_one({
+        "_id": task_id,
+        "project_id": project_id
+    })
+    if result.deleted_count == 0:
+        raise KeyError("Task not found")
+
+
+def _format_task_doc(doc):
+    return {
+        "id": doc["_id"],
+        "text": doc.get("text", ""),
+        "start_date": doc.get("start_date", ""),
+        "end_date": doc.get("end_date", ""),
+        "progress": doc.get("progress", 0.0),
+        "parent": doc.get("parent_id"),
+        "depends": doc.get("depends", []),
+        "duration": _calc_duration(doc.get("start_date"), doc.get("end_date")),
+    }
+
+
+def _calc_duration(start_date_iso, end_date_iso):
+    if not start_date_iso or not end_date_iso:
+        return 1
+    sdt = datetime.strptime(start_date_iso, "%Y-%m-%d")
+    edt = datetime.strptime(end_date_iso, "%Y-%m-%d")
+    return (edt - sdt).days + 1
+
+
+def _days_timedelta(days: int):
+    return timedelta(days=days)
+
+
+# --------------------------------------------------------------------------
+# 版本快照 (gantt_snapshots)
+# --------------------------------------------------------------------------
+
+def get_gantt_snapshots_for_project(project_id: int):
+    cursor = mongo.db["gantt_snapshots"].find(
+        {"project_id": project_id},
+        sort=[("snapshot_date", 1)]
+    )
+    return list(cursor)
+
+
+def get_specific_snapshot(project_id: int, snapshot_date_str: str):
+    snap = mongo.db["gantt_snapshots"].find_one({
+        "project_id": project_id,
+        "snapshot_date": snapshot_date_str
+    })
+    return snap
+
+
+def create_daily_snapshot(project_id: int, snap_date: date) -> str:
+    """
+    建立該日期的快照(若已存在則擲錯或覆蓋)
+    """
+    exists = mongo.db["gantt_snapshots"].find_one({
+        "project_id": project_id,
+        "snapshot_date": snap_date.isoformat()
+    })
+    if exists:
+        # 也可選擇直接覆蓋，但此處先擲錯
+        raise ValueError(f"Snapshot already exists for {snap_date.isoformat()}")
+
+    tasks = get_all_tasks_for_project(project_id)
+    snap_doc = {
+        "project_id": project_id,
+        "snapshot_date": snap_date.isoformat(),
+        "tasks": tasks,
+        "created_at": datetime.now()
+    }
+    result = mongo.db["gantt_snapshots"].insert_one(snap_doc)
+    return str(result.inserted_id)
+
+
+# ★★★ 新增: 修改 / 刪除 舊 snapshot ★★★
+
+def update_gantt_snapshot(project_id: int, snapshot_date_str: str, new_tasks: list) -> bool:
+    """
+    將某個日期的 snapshot 裡的 tasks 全量覆蓋。
+    若找不到該 snapshot，回傳 False。
+    """
+    filter_ = {
+        "project_id": project_id,
+        "snapshot_date": snapshot_date_str
+    }
+    existing = mongo.db["gantt_snapshots"].find_one(filter_)
+    if not existing:
+        return False
+
+    # 全量覆蓋 tasks
+    update_data = {
+        "tasks": new_tasks,
+        "updated_at": datetime.now()
+    }
+    mongo.db["gantt_snapshots"].update_one(filter_, {"$set": update_data})
+    return True
+
+
+def delete_gantt_snapshot(project_id: int, snapshot_date_str: str) -> bool:
+    """
+    刪除某個日期的 snapshot，若找不到則回傳 False
+    """
+    filter_ = {
+        "project_id": project_id,
+        "snapshot_date": snapshot_date_str
+    }
+    result = mongo.db["gantt_snapshots"].delete_one(filter_)
+    return (result.deleted_count > 0)
+
+
+# --------------------------------------------------------------------------
+# 假日 & 工作日設定 (gantt_holidays)
+# --------------------------------------------------------------------------
+
+def get_holiday_settings(project_id: int) -> Optional[dict]:
+    doc = mongo.db["gantt_holidays"].find_one({"project_id": project_id})
+    return doc
+
+
+def update_holiday_settings(project_id: int, data: Dict[str, Any]):
+    """
+    可支援:
+    - holidays: [...],
+    - workdays_per_week: int,
+    - workday_weekdays: [...],  # <--- 新增
+    - special_workdays: [...]
+    """
+    filter_ = {"project_id": project_id}
+    update_data = {
+        "project_id": project_id,
+        "holidays": data.get("holidays", []),
+        "workdays_per_week": data.get("workdays_per_week", 5),
+        "workday_weekdays": data.get("workday_weekdays", []),  # ★ 新增或預設空
+        "special_workdays": data.get("special_workdays", []),
+        "updated_at": datetime.now()
+    }
+    mongo.db["gantt_holidays"].update_one(
+        filter_,
+        {"$set": update_data},
+        upsert=True
+    )
+
+================================================================================
+
 backend/main.py
 
 ================================================================================
@@ -269,6 +777,9 @@ from backend.db import init_mongo_app
 # ★ 新增：SSE Blueprint
 from backend.site_diary.progress_sse import progress_sse_bp
 
+# ★ 新增: 匯入 Gantt Management blueprint
+from backend.gantt_management.routes import gantt_bp
+
 def create_app():
     app = Flask(__name__, static_folder="../frontend/dist", static_url_path="/")
 
@@ -284,6 +795,10 @@ def create_app():
 
     # ★ 新增：SSE blueprint
     app.register_blueprint(progress_sse_bp, url_prefix='/api')
+
+    # ★ 新增：Gantt blueprint
+    # 提供 /api/projects/<int:project_id>/gantt/... 路徑
+    app.register_blueprint(gantt_bp, url_prefix='/api/projects')
 
     # 提供前端打包後檔案 (SPA)
     @app.route('/', defaults={'path': ''})
@@ -2172,6 +2687,7 @@ frontend/package-lock.json
       "dependencies": {
         "axios": "^1.7.9",
         "bootstrap": "^5.3.1",
+        "dhtmlx-gantt": "^9.0.3",
         "html2canvas": "^1.4.1",
         "jspdf": "^2.5.2",
         "sass": "^1.83.4",
@@ -3693,6 +4209,12 @@ frontend/package-lock.json
         "node": ">=0.10"
       }
     },
+    "node_modules/dhtmlx-gantt": {
+      "version": "9.0.3",
+      "resolved": "https://registry.npmjs.org/dhtmlx-gantt/-/dhtmlx-gantt-9.0.3.tgz",
+      "integrity": "sha512-bc6ypBpp1XdE9s7iop5j+O41gLcfxg1nAerV1wHcmG11NxpYI5iOmSAAzdLfC8wqCnIOYQhRz7ca2t4KURFJhQ==",
+      "license": "GPL-2.0"
+    },
     "node_modules/dompurify": {
       "version": "2.5.8",
       "resolved": "https://registry.npmjs.org/dompurify/-/dompurify-2.5.8.tgz",
@@ -4398,6 +4920,7 @@ frontend/package.json
   "dependencies": {
     "axios": "^1.7.9",
     "bootstrap": "^5.3.1",
+    "dhtmlx-gantt": "^9.0.3",
     "html2canvas": "^1.4.1",
     "jspdf": "^2.5.2",
     "sass": "^1.83.4",
@@ -4466,21 +4989,46 @@ frontend/src/App.vue
       </div>
     </nav>
 
-    <!-- Main Content -->
-    <div class="container my-4">
+    <!-- 
+      根據是否為 Gantt 頁面，決定要不要包在 .container.my-4
+      這樣即可避免 Gantt 頁面左側產生 offset
+    -->
+    <div v-if="isGanttPage" style="margin:0; padding:0;">
+      <router-view />
+    </div>
+    <div v-else class="container my-4">
       <router-view />
     </div>
   </div>
 </template>
 
 <script>
+import { computed } from 'vue'
+import { useRoute } from 'vue-router'
+
 export default {
-  name: 'App'
+  name: 'App',
+  setup() {
+    const route = useRoute()
+
+    // 簡單判斷路徑中是否包含 /gantt
+    // （也可改更精準判斷 route.name === 'ProjectsGantt' 之類）
+    const isGanttPage = computed(() => {
+      return route.path.includes('/gantt')
+    })
+
+    return {
+      isGanttPage
+    }
+  }
 }
 </script>
 
 <style>
 /* 可視需求自行增減 */
+
+/* 說明：若不是 Gantt 頁面，我們保留 .container.my-4。
+   若是 Gantt 頁面，則改用上方 <div style="margin:0;padding:0;"> 撐滿整個畫面。 */
 </style>
 
 ================================================================================
@@ -5794,158 +6342,754 @@ frontend/src/views/MaterialFormView.vue
 frontend/src/views/ProjectsGanttView.vue
 
 ================================================================================
-<!-- frontend/src/views/ProjectsGanttView.vue -->
 <template>
-    <div class="container-fluid">
-      <h2>Gantt Chart for Project #{{ projectId }}</h2>
-  
-      <div class="mb-3">
-        <button class="btn btn-secondary me-2" @click="goBack">
-          &larr; Back
-        </button>
-        <button class="btn btn-success me-2" @click="addNewTask">
-          Add Task
-        </button>
-        <button class="btn btn-info me-2" @click="exportPDF">
-          Export to PDF
-        </button>
+  <!-- 
+    為達到「全螢幕」與「高度自定」，此處用 style="height:100vh; width:100vw; margin:0; padding:0; overflow: hidden;"
+    同時支援 Zoom、假日管理、snapshot 功能等。
+  -->
+  <div
+    class="full-gantt d-flex flex-column"
+    style="height: 100vh; width: 100vw; margin:0; padding:0; overflow: hidden;"
+  >
+    <!-- 工具列 (固定高度) -->
+    <div
+      class="bg-light border-bottom d-flex align-items-center flex-wrap"
+      style="padding: 0.5rem; gap: 1rem; flex: 0 0 auto;"
+    >
+      <button class="btn btn-secondary" @click="goBack">
+        ← Back
+      </button>
+
+      <!-- 版本快照 下拉 / 新增 -->
+      <div class="d-flex align-items-center" style="gap: 0.5rem;">
+        <label>Snapshot:</label>
+        <select
+          v-model="selectedSnapshot"
+          @change="loadSnapshot"
+          class="form-select form-select-sm"
+          style="width:auto;"
+        >
+          <option value="">(Latest)</option>
+          <option
+            v-for="(snap, idx) in snapshots"
+            :key="idx"
+            :value="snap.date"
+          >
+            {{ snap.date }} (created {{ snap.created_at ? snap.created_at.substring(0,16) : '' }})
+          </option>
+        </select>
       </div>
-  
-      <div
-        id="gantt_here"
-        style="width:100%; height:600px; border:1px solid #ccc;"
-      ></div>
+
+      <button class="btn btn-info btn-sm" @click="createSnapshot">
+        Save Snapshot
+      </button>
+
+      <!-- Zoom 選擇 -->
+      <div class="d-flex align-items-center" style="gap: 0.5rem;">
+        <label>Zoom:</label>
+        <select
+          v-model="activeZoomLevel"
+          @change="applyZoomLevel"
+          class="form-select form-select-sm"
+          style="width:auto;"
+        >
+          <option
+            v-for="z in zoomConfigs"
+            :key="z.name"
+            :value="z.name"
+          >
+            {{ z.name }}
+          </option>
+        </select>
+      </div>
+
+      <!-- Prev / Next Day -->
+      <div class="btn-group">
+        <button class="btn btn-outline-secondary btn-sm" @click="shiftDate(-1)">Prev Day</button>
+        <button class="btn btn-outline-secondary btn-sm" @click="shiftDate(1)">Next Day</button>
+      </div>
+
+      <!-- Go to Date -->
+      <div class="d-flex align-items-center">
+        <label for="gotoDate" class="me-1">Go to:</label>
+        <input
+          type="date"
+          id="gotoDate"
+          v-model="gotoDateStr"
+          class="form-control form-control-sm"
+          style="width:auto;"
+          @change="jumpToDate"
+        />
+      </div>
+
+      <!-- 假日管理 -->
+      <button class="btn btn-warning btn-sm" @click="openHolidayModal">
+        Manage Holidays
+      </button>
     </div>
-  </template>
-  
-  <script>
-  import { onMounted, onBeforeUnmount, computed } from 'vue'
-  import { useRoute, useRouter } from 'vue-router'
-  
-  // ★ 改成靜態 import
-  import html2canvas from 'html2canvas'
-  import { jsPDF } from 'jspdf'
-  
-  export default {
-    name: 'ProjectsGanttView',
-    setup() {
-      const route = useRoute()
-      const router = useRouter()
-      const projectId = computed(() => Number(route.params.projectId))
-  
-      // 假資料
-      const tasksData = {
-        data: [
-          { id: 1, text: 'Task #1', start_date: '2025-01-01', duration: 5, progress: 0.8, open: true },
-          { id: 2, text: 'Task #2', start_date: '2025-01-06', duration: 3, progress: 0.2, parent: 1 },
-          { id: 3, text: 'Task #3', start_date: '2025-01-09', duration: 5, progress: 0, parent: 1 }
-        ],
-        links: [
-          { id: 1, source: 2, target: 3, type: '0' }
+
+    <!-- Gantt 容器，撐滿剩餘空間 -->
+    <div id="gantt_here" style="flex:1; width:100%;"></div>
+
+    <!-- 建立每日快照手動輸入日期 Modal -->
+    <div
+      class="modal"
+      :class="{ fade: true, show: showSnapshotModal }"
+      :style="{ display: showSnapshotModal ? 'block' : 'none' }"
+      tabindex="-1"
+      role="dialog"
+      aria-modal="true"
+      @click.self="closeSnapshotModal"
+    >
+      <div class="modal-dialog" role="document">
+        <div class="modal-content p-3">
+          <h5>建立每日快照</h5>
+          <label for="snapDate">Snapshot Date:</label>
+          <input
+            type="date"
+            id="snapDate"
+            v-model="tempSnapDate"
+            class="form-control"
+          />
+          <div class="mt-3 d-flex justify-content-end">
+            <button class="btn btn-secondary me-2" @click="closeSnapshotModal">
+              Cancel
+            </button>
+            <button class="btn btn-primary" @click="confirmSnapshotDate">
+              OK
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div v-if="showSnapshotModal" class="modal-backdrop fade show"></div>
+
+    <!-- 假日管理 Modal -->
+    <div
+      class="modal"
+      :class="{ fade: true, show: showHolidayModal }"
+      :style="{ display: showHolidayModal ? 'block' : 'none' }"
+      tabindex="-1"
+      role="dialog"
+      aria-modal="true"
+      @click.self="closeHolidayModal"
+    >
+      <div class="modal-dialog" role="document">
+        <div class="modal-content p-3">
+          <h5>Holidays &amp; Workday Settings</h5>
+          <div class="mb-3">
+            <label class="form-label">Workdays / week:</label>
+            <input
+              type="number"
+              v-model.number="holidaySettings.workdays_per_week"
+              class="form-control"
+              min="1"
+              max="7"
+            />
+          </div>
+          <div class="mb-3">
+            <label class="form-label">
+              指定哪幾天是工作日 (0=Sun,1=Mon,...6=Sat)：
+            </label>
+            <p class="small text-muted">
+              如空陣列則改用上方 workdays_per_week 的舊機制；
+              若這裡有填任何數字，則優先以此為準。
+            </p>
+            <div
+              v-for="(dw, idx) in holidaySettings.workday_weekdays"
+              :key="'dw_'+idx"
+              class="d-flex align-items-center mb-1"
+            >
+              <input
+                type="number"
+                class="form-control form-control-sm me-2"
+                v-model.number="holidaySettings.workday_weekdays[idx]"
+                min="0"
+                max="6"
+              />
+              <button class="btn btn-danger btn-sm" @click="removeWorkdayWeekday(idx)">X</button>
+            </div>
+            <button class="btn btn-secondary btn-sm" @click="addWorkdayWeekday">+ Add Day</button>
+          </div>
+
+          <div class="mb-3">
+            <label class="form-label">Holidays (YYYY-MM-DD):</label>
+            <div
+              v-for="(h, idx) in holidaySettings.holidays"
+              :key="'hol_'+idx"
+              class="d-flex align-items-center mb-1"
+            >
+              <input
+                type="text"
+                v-model="holidaySettings.holidays[idx]"
+                class="form-control form-control-sm me-2"
+              />
+              <button class="btn btn-danger btn-sm" @click="removeHoliday(idx)">X</button>
+            </div>
+            <button class="btn btn-secondary btn-sm" @click="addHoliday">+ Add Holiday</button>
+          </div>
+
+          <div class="mb-3">
+            <label class="form-label">Special Workdays:</label>
+            <p class="small text-muted">(若週末或假日也算工作日，可在此輸入特例日期)</p>
+            <div
+              v-for="(sw, idx) in holidaySettings.special_workdays"
+              :key="'sw_'+idx"
+              class="d-flex align-items-center mb-1"
+            >
+              <input
+                type="text"
+                v-model="holidaySettings.special_workdays[idx]"
+                class="form-control form-control-sm me-2"
+              />
+              <button class="btn btn-danger btn-sm" @click="removeSpecialWorkday(idx)">X</button>
+            </div>
+            <button class="btn btn-secondary btn-sm" @click="addSpecialWorkday">
+              + Add Special Workday
+            </button>
+          </div>
+
+          <div class="mt-3 d-flex justify-content-end">
+            <button class="btn btn-secondary me-2" @click="closeHolidayModal">
+              Cancel
+            </button>
+            <button class="btn btn-primary" @click="saveHolidays">
+              Save
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div v-if="showHolidayModal" class="modal-backdrop fade show"></div>
+  </div>
+</template>
+
+<script>
+import { onMounted, onBeforeUnmount, ref, computed } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
+import axios from 'axios'
+// dhtmlx-gantt
+import { gantt } from 'dhtmlx-gantt'
+import 'dhtmlx-gantt/codebase/dhtmlxgantt.css'
+
+export default {
+  name: 'ProjectsGanttView',
+  setup() {
+    const route = useRoute()
+    const router = useRouter()
+    const projectId = computed(() => Number(route.params.projectId))
+
+    // 假日管理
+    const showHolidayModal = ref(false)
+    const holidaySettings = ref({
+      project_id: projectId.value,
+      holidays: [],
+      workdays_per_week: 5,
+      workday_weekdays: [],       // 新增欄位
+      special_workdays: []
+    })
+
+    // 版本快照
+    const snapshots = ref([])
+    const selectedSnapshot = ref('') // 空 = 最新
+
+    // Modal: 建立 snapshot
+    const showSnapshotModal = ref(false)
+    const tempSnapDate = ref('')
+
+    // Gantt 是否已初始化
+    let ganttInited = false
+
+    // Zoom configs
+    const zoomConfigs = [
+      {
+        name: 'hour',
+        scale_height: 60,
+        min_column_width: 50,
+        scales: [
+          { unit: 'day', step: 1, format: '%Y-%m-%d' },
+          { unit: 'hour', step: 1, format: '%H:%i' }
+        ]
+      },
+      {
+        name: 'day',
+        scale_height: 60,
+        min_column_width: 70,
+        scales: [
+          { unit: 'day', step: 1, format: '%Y-%m-%d' }
+        ]
+      },
+      {
+        name: 'week',
+        scale_height: 50,
+        min_column_width: 50,
+        scales: [
+          { unit: 'week', step: 1, format: 'Week %W, %Y' },
+          { unit: 'day', step: 1, format: '%D' }
+        ]
+      },
+      {
+        name: 'month',
+        scale_height: 50,
+        min_column_width: 70,
+        scales: [
+          { unit: 'month', step: 1, format: '%Y %M' },
+          { unit: 'week', step: 1, format: 'Week %W' }
+        ]
+      },
+      {
+        name: 'quarter',
+        scale_height: 50,
+        min_column_width: 90,
+        scales: [
+          { unit: 'month', step: 1, format: '%M' },
+          { unit: 'quarter', step: 1, format: 'Q%q' }
+        ]
+      },
+      {
+        name: 'year',
+        scale_height: 50,
+        min_column_width: 80,
+        scales: [
+          { unit: 'year', step: 1, format: '%Y' }
         ]
       }
-  
-      function initGantt() {
-        gantt.config.date_format = "%Y-%m-%d"
-        gantt.config.scales = [
-          { unit: "month", step: 1, format: "%Y %M" },
-          { unit: "day", step: 1, format: "%j, %D" }
+    ]
+    const activeZoomLevel = ref('month')  // 預設
+
+    // Go to date
+    const gotoDateStr = ref('')
+
+    function initGantt() {
+      if (ganttInited) return
+      ganttInited = true
+
+      // 讓欄位可用滑鼠 resize
+      gantt.config.layout = {
+        css: "gantt_container",
+        rows: [
+          {
+            cols: [
+              {
+                view: "grid",
+                scrollX: "gridScroll",
+                scrollY: "scrollVer",
+                scrollable: true,
+                config: {
+                  columns: [
+                    {
+                      name: "text",
+                      label: "Task Name",
+                      tree: true,
+                      width: 250,    // 預設寬度大一些
+                      resize: true   // 可用滑鼠拖曳調整
+                    },
+                    {
+                      name: "start_date",
+                      label: "Start",
+                      align: "center",
+                      width: 120,
+                      resize: true
+                    },
+                    {
+                      name: "end_date",
+                      label: "End",
+                      align: "center",
+                      width: 120,
+                      resize: true
+                    },
+                    {
+                      name: "duration",
+                      label: "Dur.",
+                      align: "center",
+                      width: 50,
+                      resize: true
+                    },
+                    { name: "add", label: "", width: 44 }
+                  ]
+                }
+              },
+              { view: "scrollbar", id: "gridScroll" },
+              {
+                view: "timeline",
+                scrollX: "scrollHor",
+                scrollY: "scrollVer"
+              },
+              { view: "scrollbar", id: "scrollVer" },
+              { view: "scrollbar", id: "scrollHor", height: 20 }
+            ]
+          }
         ]
-        gantt.config.columns = [
-          { name: "text", label: "Task Name", width: "*", tree: true },
-          { name: "start_date", label: "Start", align: "center", width: 90 },
-          { name: "duration", label: "Dur.", align: "center", width: 50 },
-          { name: "add", label: "", width: 44 }
-        ]
-  
-        gantt.init("gantt_here")
-        gantt.parse(tasksData)
-  
-        // 觀察甘特圖更新事件
-        gantt.attachEvent("onAfterTaskAdd", (id, item) => {
-          console.log("Task added:", id, item)
-        })
-        gantt.attachEvent("onAfterTaskUpdate", (id, item) => {
-          console.log("Task updated:", id, item)
-        })
-        gantt.attachEvent("onAfterTaskDelete", (id, item) => {
-          console.log("Task deleted:", id, item)
-        })
       }
-  
-      function addNewTask() {
-        const newId = gantt.uid()
-        gantt.addTask({
-          id: newId,
-          text: "New Task",
-          start_date: "2025-01-15",
-          duration: 4,
-          progress: 0
-        })
-      }
-  
-      async function exportPDF() {
-        // 對指定 DOM (id="gantt_here") 做畫面快照
-        const ganttContainer = document.getElementById('gantt_here')
-        if (!ganttContainer) return
-        const canvas = await html2canvas(ganttContainer, { useCORS: true })
-        const imgData = canvas.toDataURL("image/png")
-  
-        // 產出 PDF
-        const pdf = new jsPDF('landscape', 'pt', 'a4') // 橫向A4
-        const pageWidth = pdf.internal.pageSize.getWidth()
-        const pageHeight = pdf.internal.pageSize.getHeight()
-  
-        const ratio = Math.min(pageWidth / canvas.width, pageHeight / canvas.height)
-        pdf.addImage(imgData, 'PNG', 0, 0, canvas.width * ratio, canvas.height * ratio)
-        pdf.save('gantt_export.pdf')
-      }
-  
-      onMounted(() => {
-        // 動態載入 DHTMLX Gantt
-        const link = document.createElement('link')
-        link.rel = 'stylesheet'
-        link.href = 'https://cdn.dhtmlx.com/gantt/edge/dhtmlxgantt.css'
-        document.head.appendChild(link)
-  
-        const script = document.createElement('script')
-        script.src = 'https://cdn.dhtmlx.com/gantt/edge/dhtmlxgantt.js'
-        script.onload = () => {
-          initGantt()
+
+      gantt.config.date_format = '%Y-%m-%d'
+      gantt.config.drag_move = true
+      gantt.config.drag_resize = true
+      gantt.config.drag_progress = true
+      gantt.config.prevent_default_scroll = true
+      // 使用 altKey 來水平捲動
+      gantt.config.horizontal_scroll_key = 'altKey'
+
+      // 自定 scale cell class
+      gantt.templates.scale_cell_class = (date) => {
+        const ymd = formatDateToYMD(date)
+        if (holidaySettings.value.holidays.includes(ymd)) {
+          return 'weekend'
         }
-        document.head.appendChild(script)
-      })
-  
-      onBeforeUnmount(() => {
-        if (window.gantt) {
-          gantt.clearAll()
-          gantt.detachAllEvents()
+        return ''
+      }
+      gantt.templates.timeline_cell_class = (item, date) => {
+        const ymd = formatDateToYMD(date)
+        if (holidaySettings.value.holidays.includes(ymd)) {
+          return 'weekend'
+        }
+        return ''
+      }
+
+      // 綁定 CRUD 事件
+      gantt.attachEvent('onAfterTaskAdd', async (id, item) => {
+        if (selectedSnapshot.value) {
+          alert('Cannot modify a historical snapshot.')
+          gantt.deleteTask(id)
+          return
+        }
+        try {
+          const newId = await createTaskInServer(item)
+          if (newId) {
+            gantt.changeTaskId(id, newId)
+          }
+        } catch (err) {
+          console.error(err)
+          gantt.deleteTask(id)
         }
       })
-  
-      function goBack() {
-        router.push(`/projects/${projectId.value}`)
+
+      gantt.attachEvent('onAfterTaskUpdate', async (id, item) => {
+        if (selectedSnapshot.value) {
+          alert('Cannot modify a historical snapshot.')
+          loadTasks()
+          return
+        }
+        try {
+          await updateTaskInServer(item)
+        } catch (err) {
+          console.error(err)
+          loadTasks()
+        }
+      })
+
+      gantt.attachEvent('onAfterTaskDelete', async (id, item) => {
+        if (selectedSnapshot.value) {
+          alert('Cannot modify a historical snapshot.')
+          loadTasks()
+          return
+        }
+        try {
+          await deleteTaskInServer(id)
+        } catch (err) {
+          console.error(err)
+          loadTasks()
+        }
+      })
+
+      gantt.init('gantt_here')
+      gantt.plugins({ zoom: true })
+      applyZoomLevel()
+    }
+
+    // 後端 CRUD
+    async function createTaskInServer(item) {
+      const startDateYMD = formatDateToYMD(item.start_date)
+      const endDateYMD = item.end_date ? formatDateToYMD(item.end_date) : null
+      const payload = {
+        text: item.text,
+        start_date: startDateYMD,
+        duration: item.duration || 1,
+        progress: item.progress || 0,
+        parent_id: item.parent || null
       }
-  
-      return {
-        projectId,
-        goBack,
-        addNewTask,
-        exportPDF
+      if (endDateYMD) {
+        payload.end_date = endDateYMD
+      }
+      const { data } = await axios.post(`/api/projects/${projectId.value}/gantt/tasks`, payload)
+      return data.task_id
+    }
+    async function updateTaskInServer(item) {
+      const startDateYMD = formatDateToYMD(item.start_date)
+      const endDateYMD = item.end_date ? formatDateToYMD(item.end_date) : null
+      const payload = {
+        text: item.text,
+        start_date: startDateYMD,
+        duration: item.duration,
+        progress: item.progress || 0,
+        parent_id: item.parent || null
+      }
+      if (endDateYMD) {
+        payload.end_date = endDateYMD
+      }
+      await axios.put(`/api/projects/${projectId.value}/gantt/tasks/${item.id}`, payload)
+    }
+    async function deleteTaskInServer(taskId) {
+      await axios.delete(`/api/projects/${projectId.value}/gantt/tasks/${taskId}`)
+    }
+
+    // 載入 Tasks
+    async function loadTasks() {
+      try {
+        const params = {}
+        if (selectedSnapshot.value) {
+          params.snapshot_date = selectedSnapshot.value
+        }
+        const { data } = await axios.get(`/api/projects/${projectId.value}/gantt/tasks`, { params })
+        gantt.clearAll()
+        gantt.parse({ data })
+      } catch (err) {
+        console.error(err)
+        alert('Load tasks failed.')
       }
     }
+
+    // Snapshot
+    async function loadSnapshotsList() {
+      try {
+        const { data } = await axios.get(`/api/projects/${projectId.value}/gantt/snapshots`)
+        snapshots.value = data
+      } catch (err) {
+        console.error(err)
+      }
+    }
+    function loadSnapshot() {
+      loadTasks()
+    }
+    function createSnapshot() {
+      showSnapshotModal.value = true
+      tempSnapDate.value = ''
+    }
+    function closeSnapshotModal() {
+      showSnapshotModal.value = false
+    }
+    async function confirmSnapshotDate() {
+      closeSnapshotModal()
+      const body = {}
+      if (tempSnapDate.value) {
+        body.snapshot_date = tempSnapDate.value
+      }
+      try {
+        const { data } = await axios.post(`/api/projects/${projectId.value}/gantt/snapshots`, body)
+        alert(`Snapshot created for ${data.snapshot_date}`)
+        loadSnapshotsList()
+      } catch (err) {
+        console.error(err)
+        alert('Create snapshot failed.')
+      }
+    }
+
+    // 假日
+    async function fetchHolidays() {
+      try {
+        const { data } = await axios.get(`/api/projects/${projectId.value}/gantt/holidays`)
+        holidaySettings.value = data
+      } catch (err) {
+        console.error(err)
+      }
+    }
+    function openHolidayModal() {
+      showHolidayModal.value = true
+    }
+    function closeHolidayModal() {
+      showHolidayModal.value = false
+    }
+    function addWorkdayWeekday() {
+      holidaySettings.value.workday_weekdays.push(1) // 預設 push 一個
+    }
+    function removeWorkdayWeekday(idx) {
+      holidaySettings.value.workday_weekdays.splice(idx, 1)
+    }
+    function addHoliday() {
+      holidaySettings.value.holidays.push('')
+    }
+    function removeHoliday(idx) {
+      holidaySettings.value.holidays.splice(idx, 1)
+    }
+    function addSpecialWorkday() {
+      holidaySettings.value.special_workdays.push('')
+    }
+    function removeSpecialWorkday(idx) {
+      holidaySettings.value.special_workdays.splice(idx, 1)
+    }
+    async function saveHolidays() {
+      try {
+        await axios.put(`/api/projects/${projectId.value}/gantt/holidays`, holidaySettings.value)
+        alert('Holidays updated!')
+        closeHolidayModal()
+        applyHolidaysToGantt()
+      } catch (err) {
+        console.error(err)
+        alert('Save holiday failed.')
+      }
+    }
+    function applyHolidaysToGantt() {
+      // 先全部 unset
+      gantt.unsetWorkTime({ day: "fullweek" })
+      // ★ 若 workday_weekdays 有指定 => 以它為主
+      if (holidaySettings.value.workday_weekdays && holidaySettings.value.workday_weekdays.length) {
+        // 先全部關，再針對指定的 weekday 開放
+        holidaySettings.value.workday_weekdays.forEach(dw => {
+          gantt.setWorkTime({ day: dw, hours: "full" })
+        })
+      } else {
+        // 沒指定 => 用舊的 workdays_per_week 邏輯
+        // 先全開(0~6)
+        gantt.setWorkTime({ day: [0,1,2,3,4,5,6] })
+        // 如果 workdays_per_week=5 => 關 Sat(6), Sun(0)
+        // 如果=6 => 關 Sun(0)
+        // 依原本簡化寫法
+        if (holidaySettings.value.workdays_per_week === 5) {
+          gantt.setWorkTime({ day: 0, hours: false })
+          gantt.setWorkTime({ day: 6, hours: false })
+        } else if (holidaySettings.value.workdays_per_week === 6) {
+          gantt.setWorkTime({ day: 0, hours: false })
+        }
+      }
+      // 逐一關 holidays
+      holidaySettings.value.holidays.forEach(h => {
+        const d = parseYMD(h)
+        if (d) {
+          gantt.setWorkTime({ date: d, hours: false })
+        }
+      })
+      // special_workdays => 打開
+      holidaySettings.value.special_workdays.forEach(sw => {
+        const d = parseYMD(sw)
+        if (d) {
+          gantt.setWorkTime({ date: d, hours: "full" })
+        }
+      })
+      gantt.render()
+    }
+
+    // Zoom
+    function applyZoomLevel() {
+      gantt.ext.zoom.init({
+        levels: zoomConfigs,
+        useKey: 'shiftKey',
+        trigger: 'wheel'
+      })
+      gantt.ext.zoom.setLevel(activeZoomLevel.value)
+    }
+    function shiftDate(delta) {
+      const state = gantt.getState()
+      const shiftTime = 24 * 60 * 60 * 1000 * delta
+      const newMin = new Date(state.min_date.getTime() + shiftTime)
+      const newMax = new Date(state.max_date.getTime() + shiftTime)
+      gantt.ext.zoom.setDateRange(newMin, newMax)
+    }
+    function jumpToDate() {
+      if (!gotoDateStr.value) return
+      const d = parseYMD(gotoDateStr.value)
+      if (!d) return
+      const state = gantt.getState()
+      const range = state.max_date - state.min_date
+      const halfRange = range / 2
+      const newMin = new Date(d.getTime() - halfRange)
+      const newMax = new Date(d.getTime() + halfRange)
+      gantt.ext.zoom.setDateRange(newMin, newMax)
+    }
+
+    // 工具
+    function formatDateToYMD(dateVal) {
+      if (!(dateVal instanceof Date)) return ''
+      const year = dateVal.getFullYear()
+      const month = String(dateVal.getMonth() + 1).padStart(2, '0')
+      const day = String(dateVal.getDate()).padStart(2, '0')
+      return `${year}-${month}-${day}`
+    }
+    function parseYMD(ymd) {
+      if (!ymd) return null
+      const parts = ymd.split('-')
+      if (parts.length !== 3) return null
+      const [y, m, d] = parts
+      return new Date(Number(y), Number(m) - 1, Number(d))
+    }
+
+    function goBack() {
+      router.go(-1)
+    }
+
+    onMounted(async () => {
+      initGantt()
+      await loadTasks()
+      await loadSnapshotsList()
+      await fetchHolidays()
+      applyHolidaysToGantt()
+    })
+
+    onBeforeUnmount(() => {
+      if (ganttInited) {
+        gantt.clearAll()
+        gantt.detachAllEvents()
+        ganttInited = false
+      }
+    })
+
+    return {
+      projectId,
+
+      // snapshot
+      snapshots,
+      selectedSnapshot,
+      loadSnapshot,
+
+      // create snapshot modal
+      showSnapshotModal,
+      tempSnapDate,
+      createSnapshot,
+      closeSnapshotModal,
+      confirmSnapshotDate,
+
+      // holiday
+      showHolidayModal,
+      holidaySettings,
+      openHolidayModal,
+      closeHolidayModal,
+      addWorkdayWeekday,
+      removeWorkdayWeekday,
+      addHoliday,
+      removeHoliday,
+      addSpecialWorkday,
+      removeSpecialWorkday,
+      saveHolidays,
+      applyHolidaysToGantt,
+
+      // zoom
+      zoomConfigs,
+      activeZoomLevel,
+      applyZoomLevel,
+      shiftDate,
+      gotoDateStr,
+      jumpToDate,
+
+      // nav
+      goBack
+    }
   }
-  </script>
-  
-  <style scoped>
-  .container-fluid {
-    margin-top: 1rem;
-  }
-  .me-2 {
-    margin-right: 8px;
-  }
-  </style>
-  
+}
+</script>
+
+<style scoped>
+.weekend {
+  background-color: #f2dede !important;
+}
+
+/* modal backdrop */
+.modal-backdrop {
+  z-index: 1040;
+}
+.modal {
+  z-index: 1050;
+}
+</style>
+
 ================================================================================
 
 frontend/src/views/ProjectsView.vue

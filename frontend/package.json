@@ -11,7 +11,8 @@
   "dependencies": {
     "axios": "^1.7.9",
     "bootstrap": "^5.3.1",
-    "dhtmlx-gantt": "^9.0.3",
+    "dayjs": "^1.11.13",
+    "gantt-elastic-wrapvue3": "^0.0.18",
     "html2canvas": "^1.4.1",
     "jspdf": "^2.5.2",
     "sass": "^1.83.4",

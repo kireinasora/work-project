@@ -3,8 +3,7 @@
 ├── backend/
 │   ├── __init__.py
 │   ├── db.py # backend/db.py
-│   ├── main.py # backend/main.py
-│   └── server.py
+│   └── main.py # backend/main.py
 │   ├── gantt_management/
 │   │   ├── routes.py # backend/gantt_management/routes.py
 │   │   └── services.py # backend/gantt_management/services.py
@@ -14,11 +13,6 @@
 │   │   └── services.py # backend/material_management/services.py
 │   │   ├── static/
 │   │   │   └── logo.jpg
-│   ├── migrations/
-│   │   └── env.py
-│   │   ├── versions/
-│   │   │   ├── 0b5bdb10bee4_initial_schema_from_scratch.py
-│   │   │   └── 21bfa265addc_add_job_number_and_contractor_columns.py
 │   ├── project_management/
 │   │   └── routes.py # backend/project_management/routes.py
 │   ├── site_diary/
@@ -36,6 +30,7 @@
 │   │   └── style.css
 │   │   ├── assets/
 │   │   ├── components/
+│   │   │   ├── GanttTaskForm.vue
 │   │   │   ├── ProjectDetail.vue
 │   │   │   ├── ProjectForm.vue
 │   │   │   ├── ProjectList.vue
@@ -257,7 +252,7 @@ backend/gantt_management/routes.py
 # backend/gantt_management/routes.py
 
 import logging
-from datetime import datetime, date, timedelta
+from datetime import datetime, date
 from flask import Blueprint, request, jsonify, abort
 
 from backend.gantt_management.services import (
@@ -270,14 +265,16 @@ from backend.gantt_management.services import (
     get_specific_snapshot,
     get_holiday_settings,
     update_holiday_settings,
-    update_gantt_snapshot,       # ★ 新增
-    delete_gantt_snapshot,       # ★ 新增
+    update_gantt_snapshot,
+    delete_gantt_snapshot,
+    reassign_task_ids,
 )
-from backend.db import to_iso_datetime  # 轉 datetime -> 字串
+from backend.db import to_iso_datetime, mongo
 
 logger = logging.getLogger(__name__)
 
 gantt_bp = Blueprint("gantt_bp", __name__)
+
 
 # --------------------------------------------------------------------------------
 # Gantt 任務相關
@@ -285,24 +282,30 @@ gantt_bp = Blueprint("gantt_bp", __name__)
 
 @gantt_bp.route("/<int:project_id>/gantt/tasks", methods=["GET"])
 def list_gantt_tasks(project_id):
-    """
-    取得某專案當前最新(或指定日期版本) 的所有 Gantt Tasks。
-    可帶 query param ?snapshot_date=YYYY-MM-DD 取舊版。
-    """
+    logger.info("list_gantt_tasks called. project_id=%s", project_id)
     snapshot_date_str = request.args.get("snapshot_date", "").strip()
-    if snapshot_date_str:
-        # 取得舊版快照
-        snapshot_doc = get_specific_snapshot(project_id, snapshot_date_str)
-        if not snapshot_doc:
-            return jsonify({
-                "error": f"No snapshot found for {snapshot_date_str}"
-            }), 404
-        # 回傳該 snapshot 裡的 tasks
-        return jsonify(snapshot_doc["tasks"]), 200
-    else:
-        # 回傳當前最新
-        tasks = get_all_tasks_for_project(project_id)
-        return jsonify(tasks), 200
+
+    try:
+        if snapshot_date_str:
+            logger.debug("Fetching snapshot tasks for date=%s", snapshot_date_str)
+            # 取得舊版快照
+            snapshot_doc = get_specific_snapshot(project_id, snapshot_date_str)
+            if not snapshot_doc:
+                logger.warning("No snapshot found for %s (project_id=%s)", snapshot_date_str, project_id)
+                return jsonify({"error": f"No snapshot found for {snapshot_date_str}"}), 404
+
+            tasks_data = snapshot_doc.get("tasks", [])
+            logger.debug("Snapshot date=%s, tasks count=%d", snapshot_date_str, len(tasks_data))
+            return jsonify(tasks_data), 200
+        else:
+            logger.debug("Fetching latest tasks for project_id=%s", project_id)
+            tasks = get_all_tasks_for_project(project_id)
+            logger.debug("Fetched %d tasks for project_id=%s", len(tasks), project_id)
+            return jsonify(tasks), 200
+
+    except Exception as e:
+        logger.exception("list_gantt_tasks error:")
+        return jsonify({"error": str(e)}), 500
 
 
 @gantt_bp.route("/<int:project_id>/gantt/tasks", methods=["POST"])
@@ -315,21 +318,27 @@ def create_task(project_id):
       "end_date": "2025-01-20",  // 或傳 duration
       "duration": 5,            // 二擇一
       "progress": 0.3,
-      "parent_id": null,        // 可支援子任務
-      "depends": [ 2, 3 ],      // 依賴哪些任務(簡化)
+      "parent_id": null,
+      "depends": [2, 3],
+      "type": "project"|"milestone"|"task"  (可選, 預設 "task")
     }
     """
     data = request.json or {}
     data["project_id"] = project_id
 
+    snapshot_date_str = request.args.get("snapshot_date", "").strip()
     try:
-        task_id = create_gantt_task(data)
+        # 傳到 service 裡: create_gantt_task() 會自動寫入 DB 或更新 snapshot
+        task_id = create_gantt_task(data, snapshot_date_str)
         return jsonify({"message": "Task created", "task_id": task_id}), 201
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
+    except Exception as ex:
+        logger.exception("create_task error:")
+        return jsonify({"error": str(ex)}), 500
 
 
-@gantt_bp.route("/<int:project_id>/gantt/tasks/<string:task_id>", methods=["PUT"])
+@gantt_bp.route("/<int:project_id>/gantt/tasks/<int:task_id>", methods=["PUT"])
 def put_task(project_id, task_id):
     """
     更新某任務
@@ -339,25 +348,84 @@ def put_task(project_id, task_id):
     data["project_id"] = project_id
     data["task_id"] = task_id
 
+    snapshot_date_str = request.args.get("snapshot_date", "").strip()
     try:
-        update_gantt_task(task_id, data)
+        update_gantt_task(task_id, data, snapshot_date_str)
         return jsonify({"message": "Task updated"}), 200
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     except KeyError:
         abort(404, description="Task not found")
+    except Exception as ex:
+        logger.exception("put_task error:")
+        return jsonify({"error": str(ex)}), 500
 
 
-@gantt_bp.route("/<int:project_id>/gantt/tasks/<string:task_id>", methods=["DELETE"])
+@gantt_bp.route("/<int:project_id>/gantt/tasks/<int:task_id>", methods=["DELETE"])
 def remove_task(project_id, task_id):
     """
     刪除某任務
     """
+    snapshot_date_str = request.args.get("snapshot_date", "").strip()
     try:
-        delete_gantt_task(project_id, task_id)
+        delete_gantt_task(project_id, task_id, snapshot_date_str)
         return jsonify({"message": "Task deleted"}), 200
     except KeyError:
         abort(404, description="Task not found")
+    except Exception as ex:
+        logger.exception("remove_task error:")
+        return jsonify({"error": str(ex)}), 500
+
+
+# ★★★ 新增：清空所有任務 (可支援當前最新或指定snapshot) ★★★
+@gantt_bp.route("/<int:project_id>/gantt/tasks/clear", methods=["DELETE"])
+def clear_all_tasks(project_id):
+    """
+    query param: snapshot_date=xxxx-xx-xx (可選)
+      - 若有指定 snapshot_date => 清空該快照內 tasks
+      - 若沒指定 => 清空「當前最新」
+    """
+    snapshot_date_str = request.args.get("snapshot_date", "").strip()
+    try:
+        if snapshot_date_str:
+            snap_doc = get_specific_snapshot(project_id, snapshot_date_str)
+            if not snap_doc:
+                return jsonify({"error": f"Snapshot not found for {snapshot_date_str}"}), 404
+
+            updated = update_gantt_snapshot(project_id, snapshot_date_str, new_tasks=[])
+            if not updated:
+                return jsonify({"error": "Snapshot update failed"}), 400
+            return jsonify({"message": f"All tasks cleared in snapshot {snapshot_date_str}"}), 200
+        else:
+            result = mongo.db["gantt_tasks"].delete_many({"project_id": project_id})
+            return jsonify({
+                "message": "All current tasks cleared",
+                "deleted_count": result.deleted_count
+            }), 200
+
+    except Exception as e:
+        logger.exception("clear_all_tasks error:")
+        return jsonify({"error": str(e)}), 500
+
+
+# ★★★ 新增：重新分配任務ID => /<int:project_id>/gantt/tasks/reassign-ids ★★★
+@gantt_bp.route("/<int:project_id>/gantt/tasks/reassign-ids", methods=["POST"])
+def reassign_ids(project_id):
+    """
+    POST /api/projects/{project_id}/gantt/tasks/reassign-ids(?snapshot_date=xxxx-xx-xx)
+    重新分配所有 tasks 的 ID (從1開始依序下去)。同時必須考慮 parent_id, depends, 
+    以及可能存在的階層關係，確保重新分配後依賴關係仍然正確。
+
+    前端若有指定 query param snapshot_date => 操作該 snapshot
+    若無 => 操作當前最新 gantt_tasks
+    """
+    snapshot_date_str = request.args.get("snapshot_date", "").strip()
+    try:
+        reassign_task_ids(project_id, snapshot_date_str)
+        return jsonify({"message": "Task IDs have been reassigned"}), 200
+    except Exception as ex:
+        logger.exception("reassign_ids error:")
+        return jsonify({"error": str(ex)}), 500
 
 
 # --------------------------------------------------------------------------------
@@ -366,11 +434,7 @@ def remove_task(project_id, task_id):
 
 @gantt_bp.route("/<int:project_id>/gantt/snapshots", methods=["GET"])
 def list_snapshots(project_id):
-    """
-    取得某專案所有 Gantt 快照日期列表。
-    """
     snapshots = get_gantt_snapshots_for_project(project_id)
-    # 僅回傳日期 + created_at 字串
     out = []
     for snap in snapshots:
         out.append({
@@ -382,16 +446,12 @@ def list_snapshots(project_id):
 
 @gantt_bp.route("/<int:project_id>/gantt/snapshots", methods=["POST"])
 def make_snapshot(project_id):
-    """
-    手動建立當天(或指定日)的快照。
-    body JSON: { "snapshot_date": "2025-06-07" } (可不傳，預設今天)
-    """
     data = request.json or {}
     snap_date_str = data.get("snapshot_date")
     if snap_date_str:
         snap_date = datetime.strptime(snap_date_str, "%Y-%m-%d").date()
     else:
-        snap_date = date.today()  # ★ 預設就是今天
+        snap_date = date.today()
 
     try:
         snap_id = create_daily_snapshot(project_id, snap_date)
@@ -404,14 +464,8 @@ def make_snapshot(project_id):
         return jsonify({"error": str(e)}), 400
 
 
-# ★★★ 新增：修改 / 刪除舊快照 ★★★
-
 @gantt_bp.route("/<int:project_id>/gantt/snapshots/<snapshot_date_str>", methods=["PUT"])
 def put_snapshot(project_id, snapshot_date_str):
-    """
-    修改已存在的某個日期之 Gantt Snapshot 的 tasks 全量覆蓋，
-    body JSON: { "tasks": [...] }
-    """
     data = request.json or {}
     new_tasks = data.get("tasks", [])
     try:
@@ -425,9 +479,6 @@ def put_snapshot(project_id, snapshot_date_str):
 
 @gantt_bp.route("/<int:project_id>/gantt/snapshots/<snapshot_date_str>", methods=["DELETE"])
 def remove_snapshot(project_id, snapshot_date_str):
-    """
-    刪除某個日期之 Gantt Snapshot
-    """
     try:
         deleted = delete_gantt_snapshot(project_id, snapshot_date_str)
         if not deleted:
@@ -443,25 +494,13 @@ def remove_snapshot(project_id, snapshot_date_str):
 
 @gantt_bp.route("/<int:project_id>/gantt/holidays", methods=["GET"])
 def get_holidays(project_id):
-    """
-    取得該專案的假日設定 (或公司統一維度)
-    結構可包含: {
-       "project_id": int,
-       "holidays": ["2025-01-01", "2025-02-10" ],
-       "workdays_per_week": 5,
-       "workday_weekdays": [1,2,3,4,5],  # ★ 新增: 指定哪些星期幾是工作日 (0=周日,1=周一,...)
-       "special_workdays": [ "2025-02-11" ],
-       ...
-    }
-    """
     result = get_holiday_settings(project_id)
     if not result:
-        # 若查無, 回傳預設
         result = {
             "project_id": project_id,
             "holidays": [],
             "workdays_per_week": 5,
-            "workday_weekdays": [],   # ★ 新增欄位: 預設空陣列
+            "workday_weekdays": [],
             "special_workdays": []
         }
     return jsonify(result), 200
@@ -469,15 +508,6 @@ def get_holidays(project_id):
 
 @gantt_bp.route("/<int:project_id>/gantt/holidays", methods=["PUT"])
 def put_holidays(project_id):
-    """
-    更新該專案假日設定
-    body: {
-       "holidays": [ "2025-01-01", "2025-02-10" ],
-       "workdays_per_week": 6,
-       "workday_weekdays": [1,2,3,4,5,6],
-       ...
-    }
-    """
     data = request.json or {}
     data["project_id"] = project_id
     update_holiday_settings(project_id, data)
@@ -491,12 +521,15 @@ backend/gantt_management/services.py
 # backend/gantt_management/services.py
 
 import math
-import uuid
-from datetime import datetime, date
-from typing import Dict, Any, Optional
+import logging
+from datetime import datetime, date, timedelta
+from typing import Dict, Any, Optional, List
 from bson.objectid import ObjectId
 
-from backend.db import mongo
+from backend.db import mongo, get_next_sequence
+
+logger = logging.getLogger(__name__)
+
 
 # --------------------------------------------------------------------------
 # Gantt Tasks (當前最新資料，不屬於任何 snapshot)
@@ -509,13 +542,17 @@ def get_all_tasks_for_project(project_id: int):
     cursor = mongo.db["gantt_tasks"].find({"project_id": project_id})
     tasks = []
     for doc in cursor:
-        tasks.append(_format_task_doc(doc))
+        formatted = _format_task_doc(doc)
+        if formatted is not None:
+            tasks.append(formatted)
     return tasks
 
 
-def create_gantt_task(data: Dict[str, Any]) -> str:
+def create_gantt_task(data: Dict[str, Any], snapshot_date_str: str = "") -> int:
     """
-    新增一筆任務
+    新增一筆任務（至最新或指定 snapshot）。
+    - 若 snapshot_date_str 有值 => 直接操作該 snapshot 的 tasks (in-memory + update snapshot)
+    - 否則 => 建立於 gantt_tasks 集合中。
     """
     project_id = data["project_id"]
     text = data.get("text", "Unnamed Task")
@@ -525,126 +562,350 @@ def create_gantt_task(data: Dict[str, Any]) -> str:
     progress = data.get("progress", 0)
     parent_id = data.get("parent_id")
     depends = data.get("depends", [])
+    task_type = data.get("type", "task")  # "project"|"milestone"|"task"
 
     if not start_date_str and not end_date_str and not duration:
         raise ValueError("start_date + (end_date or duration) is required")
 
-    # 計算 end_date 或 duration
-    if start_date_str:
-        start_dt = datetime.strptime(start_date_str, "%Y-%m-%d")
-        if end_date_str:
-            end_dt = datetime.strptime(end_date_str, "%Y-%m-%d")
-            duration = (end_dt - start_dt).days + 1
-        else:
-            # end_date = start_date + duration - 1
-            end_dt = start_dt
-            if duration:
-                end_dt = start_dt + _days_timedelta(duration - 1)
-        start_date_iso = start_dt.date().isoformat()
-        end_date_iso = end_dt.date().isoformat()
-    else:
+    # 檢查 & 修正日期
+    if not start_date_str:
         raise ValueError("Must provide start_date")
 
-    task_doc = {
-        "project_id": project_id,
-        "text": text,
-        "start_date": start_date_iso,
-        "end_date": end_date_iso,
-        "progress": float(progress),
-        "parent_id": parent_id,
-        "depends": depends,
-        "created_at": datetime.now(),
-    }
-    # 產生 task_id (string)
-    task_doc["_id"] = str(uuid.uuid4())
+    start_dt = _parse_date_str(start_date_str, default_date_str="2025-01-01")
+    if end_date_str:
+        end_dt = _parse_date_str(end_date_str, default_date_str=None)  # None代表就用start+1
+        if end_dt is None:
+            end_dt = start_dt + timedelta(days=1)
+    else:
+        if duration:
+            end_dt = start_dt + timedelta(days=duration - 1)
+        else:
+            end_dt = start_dt + timedelta(days=1)
 
-    mongo.db["gantt_tasks"].insert_one(task_doc)
-    return task_doc["_id"]
+    # 若 end < start，則修正
+    if end_dt < start_dt:
+        logger.warning(f"[create_gantt_task] end_date < start_date => auto-fix. end={end_dt}, start={start_dt}")
+        end_dt = start_dt + timedelta(days=1)
+
+    # 若 type=milestone => force start_date == end_date
+    if task_type == "milestone":
+        end_dt = start_dt
+
+    # progress
+    progress_val = _normalize_progress(progress)
+
+    # 如果是 snapshot 模式 => 先讀出 tasks array，再 in-memory 新增
+    if snapshot_date_str:
+        snap_doc = mongo.db["gantt_snapshots"].find_one({
+            "project_id": project_id,
+            "snapshot_date": snapshot_date_str
+        })
+        if not snap_doc:
+            raise ValueError(f"Snapshot not found for {snapshot_date_str}")
+
+        tasks_list = snap_doc.get("tasks", [])
+
+        # 產生一個新的暫定 ID => 找當前 tasks_list 的 max id
+        max_id = 0
+        for t in tasks_list:
+            if t["id"] > max_id:
+                max_id = t["id"]
+        new_id = max_id + 1
+
+        new_task = {
+            "id": new_id,
+            "project_id": project_id,
+            "text": text,
+            "start_date": start_dt.date().isoformat(),
+            "end_date": end_dt.date().isoformat(),
+            "progress": progress_val,
+            "parent_id": parent_id,
+            "depends": depends,
+            "type": task_type,
+            "created_at": datetime.now(),
+        }
+        tasks_list.append(new_task)
+
+        # 接著更新 snapshot doc
+        # 先寫回 tasks_list (未計算父任務), 再進行父任務的自動更新
+        mongo.db["gantt_snapshots"].update_one(
+            {"_id": snap_doc["_id"]},
+            {"$set": {"tasks": tasks_list}}
+        )
+
+        # ★重新計算父任務
+        _recalc_parent_chain_in_snapshot(project_id, new_id, snapshot_date_str)
+
+        return new_id
+
+    else:
+        # 建立於 gantt_tasks 集合
+        new_task_id = get_next_sequence("gantt_tasks")
+        task_doc = {
+            "id": new_task_id,
+            "project_id": project_id,
+            "text": text,
+            "start_date": start_dt.date().isoformat(),
+            "end_date": end_dt.date().isoformat(),
+            "progress": progress_val,
+            "parent_id": parent_id,
+            "depends": depends,
+            "type": task_type,
+            "created_at": datetime.now(),
+        }
+        mongo.db["gantt_tasks"].insert_one(task_doc)
+
+        # 重新計算父任務
+        _recalc_parent_chain_in_db(project_id, new_task_id)
+
+        return new_task_id
 
 
-def update_gantt_task(task_id: str, data: Dict[str, Any]):
+def update_gantt_task(task_id: int, data: Dict[str, Any], snapshot_date_str: str = ""):
     """
-    更新任務
+    更新任務；若 snapshot_date_str 有值 => 更新 snapshot tasks
+              否則更新 gantt_tasks 集合
     """
-    doc = mongo.db["gantt_tasks"].find_one({"_id": task_id, "project_id": data["project_id"]})
-    if not doc:
-        raise KeyError("Task not found")
-
-    update_fields = {}
-    if "text" in data:
-        update_fields["text"] = data["text"]
-    if "progress" in data:
-        update_fields["progress"] = float(data["progress"])
-    if "parent_id" in data:
-        update_fields["parent_id"] = data["parent_id"]
-    if "depends" in data:
-        update_fields["depends"] = data["depends"]
+    project_id = data["project_id"]
 
     start_date_str = data.get("start_date")
     end_date_str = data.get("end_date")
     duration = data.get("duration")
+    progress = data.get("progress")
+    parent_id = data.get("parent_id") if "parent_id" in data else None
+    depends = data.get("depends") if "depends" in data else None
+    task_type = data.get("type", None)  # 可能是 "project"|"milestone"|"task"
 
-    if start_date_str:
-        start_dt = datetime.strptime(start_date_str, "%Y-%m-%d")
-        update_fields["start_date"] = start_dt.date().isoformat()
-        if end_date_str:
-            end_dt = datetime.strptime(end_date_str, "%Y-%m-%d")
+    if snapshot_date_str:
+        # 更新快照 in memory
+        snap = mongo.db["gantt_snapshots"].find_one({
+            "project_id": project_id,
+            "snapshot_date": snapshot_date_str
+        })
+        if not snap:
+            raise KeyError("Snapshot not found")
+
+        tasks_list = snap.get("tasks", [])
+        # 找到該task
+        found_index = -1
+        for i, t in enumerate(tasks_list):
+            if t["id"] == task_id:
+                found_index = i
+                break
+        if found_index < 0:
+            raise KeyError("Task not found in snapshot")
+
+        updated_doc = dict(tasks_list[found_index])  # copy
+
+        # 更新字段
+        if data.get("text") is not None:
+            updated_doc["text"] = data["text"]
+
+        if progress is not None:
+            updated_doc["progress"] = _normalize_progress(progress)
+
+        if parent_id is not None:
+            updated_doc["parent_id"] = parent_id
+
+        if depends is not None:
+            updated_doc["depends"] = depends
+
+        # start/end/duration
+        old_start = _parse_date_str(updated_doc.get("start_date", ""), "2025-01-01")
+        old_end = _parse_date_str(updated_doc.get("end_date", ""), None)
+        if start_date_str or end_date_str or duration is not None:
+            start_dt = old_start
+            end_dt = old_end if old_end else (old_start + timedelta(days=1))
+
+            if start_date_str:
+                start_dt = _parse_date_str(start_date_str, "2025-01-01")
+            if end_date_str:
+                end_dt = _parse_date_str(end_date_str, None)
+                if end_dt is None:
+                    end_dt = start_dt + timedelta(days=1)
+            elif duration is not None:
+                end_dt = start_dt + timedelta(days=duration - 1)
+
+            if end_dt < start_dt:
+                end_dt = start_dt + timedelta(days=1)
+
+            # 若 type=milestone => 令 start==end
+            the_type = task_type or updated_doc.get("type", "task")
+            if the_type == "milestone":
+                end_dt = start_dt
+
+            updated_doc["start_date"] = start_dt.date().isoformat()
+            updated_doc["end_date"] = end_dt.date().isoformat()
+
+        # type
+        if task_type:
+            updated_doc["type"] = task_type
+            # 如果是 milestone, 要強制同一天
+            if task_type == "milestone":
+                sdt = _parse_date_str(updated_doc["start_date"], "2025-01-01")
+                updated_doc["end_date"] = sdt.date().isoformat()
+
+        updated_doc["updated_at"] = datetime.now()
+
+        # 更新回 tasks_list
+        tasks_list[found_index] = updated_doc
+        # 先寫回
+        mongo.db["gantt_snapshots"].update_one(
+            {"_id": snap["_id"]},
+            {"$set": {"tasks": tasks_list}}
+        )
+
+        # 再重新計算父任務
+        _recalc_parent_chain_in_snapshot(project_id, task_id, snapshot_date_str)
+
+    else:
+        # 更新 DB
+        doc = mongo.db["gantt_tasks"].find_one({"id": task_id, "project_id": project_id})
+        if not doc:
+            raise KeyError("Task not found")
+
+        update_fields = {}
+
+        if data.get("text") is not None:
+            update_fields["text"] = data["text"]
+
+        if progress is not None:
+            update_fields["progress"] = _normalize_progress(progress)
+
+        if parent_id is not None:
+            update_fields["parent_id"] = parent_id
+        if depends is not None:
+            update_fields["depends"] = depends
+
+        old_start_str = doc.get("start_date", "")
+        old_end_str = doc.get("end_date", "")
+        old_start_dt = _parse_date_str(old_start_str, "2025-01-01")
+        old_end_dt = _parse_date_str(old_end_str, None)
+
+        if start_date_str or end_date_str or duration is not None:
+            start_dt = old_start_dt
+            end_dt = old_end_dt if old_end_dt else (old_start_dt + timedelta(days=1))
+
+            if start_date_str:
+                start_dt = _parse_date_str(start_date_str, "2025-01-01")
+            if end_date_str:
+                end_dt = _parse_date_str(end_date_str, None)
+                if end_dt is None:
+                    end_dt = start_dt + timedelta(days=1)
+            elif duration is not None:
+                end_dt = start_dt + timedelta(days=duration - 1)
+
+            if end_dt < start_dt:
+                end_dt = start_dt + timedelta(days=1)
+
+            # 若 type=milestone => 令 start==end
+            the_type = task_type or doc.get("type", "task")
+            if the_type == "milestone":
+                end_dt = start_dt
+
+            update_fields["start_date"] = start_dt.date().isoformat()
             update_fields["end_date"] = end_dt.date().isoformat()
-        elif duration:
-            end_dt = start_dt + _days_timedelta(duration - 1)
-            update_fields["end_date"] = end_dt.date().isoformat()
-    elif end_date_str:
-        old_start = doc["start_date"]
-        if not old_start:
-            raise ValueError("No existing start_date to compute from.")
-        start_dt = datetime.strptime(old_start, "%Y-%m-%d")
-        end_dt = datetime.strptime(end_date_str, "%Y-%m-%d")
-        update_fields["end_date"] = end_dt.date().isoformat()
 
-    update_fields["updated_at"] = datetime.now()
+        if task_type:
+            update_fields["type"] = task_type
+            if task_type == "milestone":
+                sdt = _parse_date_str(update_fields.get("start_date") or old_start_str, "2025-01-01")
+                update_fields["end_date"] = sdt.date().isoformat()
 
-    mongo.db["gantt_tasks"].update_one(
-        {"_id": task_id},
-        {"$set": update_fields}
-    )
+        update_fields["updated_at"] = datetime.now()
+
+        if update_fields:
+            mongo.db["gantt_tasks"].update_one(
+                {"id": task_id, "project_id": project_id},
+                {"$set": update_fields}
+            )
+
+        # 重新計算父任務
+        _recalc_parent_chain_in_db(project_id, task_id)
 
 
-def delete_gantt_task(project_id: int, task_id: str):
-    result = mongo.db["gantt_tasks"].delete_one({
-        "_id": task_id,
-        "project_id": project_id
-    })
-    if result.deleted_count == 0:
-        raise KeyError("Task not found")
+def delete_gantt_task(project_id: int, task_id: int, snapshot_date_str: str = ""):
+    """
+    刪除任務；若 snapshot_date_str 有值 => 在 snapshot 中刪
+             否則在 DB 中刪
+    """
+    if snapshot_date_str:
+        snap = mongo.db["gantt_snapshots"].find_one({
+            "project_id": project_id,
+            "snapshot_date": snapshot_date_str
+        })
+        if not snap:
+            raise KeyError("Snapshot not found")
+
+        tasks_list = snap.get("tasks", [])
+        new_tasks_list = []
+        deleted = False
+
+        for t in tasks_list:
+            if t["id"] == task_id:
+                deleted = True
+            else:
+                new_tasks_list.append(t)
+
+        if not deleted:
+            raise KeyError("Task not found")
+
+        # 寫回 snapshot
+        mongo.db["gantt_snapshots"].update_one(
+            {"_id": snap["_id"]},
+            {"$set": {"tasks": new_tasks_list}}
+        )
+
+        # 父任務重新計算
+        _recalc_parent_chain_in_snapshot(project_id, task_id, snapshot_date_str)
+
+    else:
+        result = mongo.db["gantt_tasks"].delete_one({
+            "id": task_id,
+            "project_id": project_id
+        })
+        if result.deleted_count == 0:
+            raise KeyError("Task not found")
+
+        # 父任務重新計算
+        _recalc_parent_chain_in_db(project_id, task_id)
 
 
 def _format_task_doc(doc):
+    """
+    將資料庫中的 task doc 格式化成前端需要的欄位結構。
+    """
+    if "id" not in doc:
+        return None  # 理論上已在 DB 內確定都有 id
     return {
-        "id": doc["_id"],
+        "id": doc["id"],
         "text": doc.get("text", ""),
         "start_date": doc.get("start_date", ""),
         "end_date": doc.get("end_date", ""),
         "progress": doc.get("progress", 0.0),
-        "parent": doc.get("parent_id"),
+        "parent_id": doc.get("parent_id"),
         "depends": doc.get("depends", []),
         "duration": _calc_duration(doc.get("start_date"), doc.get("end_date")),
+        "type": doc.get("type", "task"),  # 預設是 "task" 以相容舊資料
     }
 
 
 def _calc_duration(start_date_iso, end_date_iso):
     if not start_date_iso or not end_date_iso:
         return 1
-    sdt = datetime.strptime(start_date_iso, "%Y-%m-%d")
-    edt = datetime.strptime(end_date_iso, "%Y-%m-%d")
-    return (edt - sdt).days + 1
-
-
-def _days_timedelta(days: int):
-    return timedelta(days=days)
+    try:
+        sdt = datetime.strptime(start_date_iso, "%Y-%m-%d")
+        edt = datetime.strptime(end_date_iso, "%Y-%m-%d")
+    except ValueError:
+        return 1
+    diff = (edt - sdt).days + 1
+    if diff < 1:
+        return 1
+    return diff
 
 
 # --------------------------------------------------------------------------
-# 版本快照 (gantt_snapshots)
+# 版本快照 (gantt_snapshots) ...
 # --------------------------------------------------------------------------
 
 def get_gantt_snapshots_for_project(project_id: int):
@@ -665,14 +926,13 @@ def get_specific_snapshot(project_id: int, snapshot_date_str: str):
 
 def create_daily_snapshot(project_id: int, snap_date: date) -> str:
     """
-    建立該日期的快照(若已存在則擲錯或覆蓋)
+    建立該日期的快照(若已存在則擲錯)。
     """
     exists = mongo.db["gantt_snapshots"].find_one({
         "project_id": project_id,
         "snapshot_date": snap_date.isoformat()
     })
     if exists:
-        # 也可選擇直接覆蓋，但此處先擲錯
         raise ValueError(f"Snapshot already exists for {snap_date.isoformat()}")
 
     tasks = get_all_tasks_for_project(project_id)
@@ -686,13 +946,7 @@ def create_daily_snapshot(project_id: int, snap_date: date) -> str:
     return str(result.inserted_id)
 
 
-# ★★★ 新增: 修改 / 刪除 舊 snapshot ★★★
-
 def update_gantt_snapshot(project_id: int, snapshot_date_str: str, new_tasks: list) -> bool:
-    """
-    將某個日期的 snapshot 裡的 tasks 全量覆蓋。
-    若找不到該 snapshot，回傳 False。
-    """
     filter_ = {
         "project_id": project_id,
         "snapshot_date": snapshot_date_str
@@ -701,7 +955,6 @@ def update_gantt_snapshot(project_id: int, snapshot_date_str: str, new_tasks: li
     if not existing:
         return False
 
-    # 全量覆蓋 tasks
     update_data = {
         "tasks": new_tasks,
         "updated_at": datetime.now()
@@ -711,9 +964,6 @@ def update_gantt_snapshot(project_id: int, snapshot_date_str: str, new_tasks: li
 
 
 def delete_gantt_snapshot(project_id: int, snapshot_date_str: str) -> bool:
-    """
-    刪除某個日期的 snapshot，若找不到則回傳 False
-    """
     filter_ = {
         "project_id": project_id,
         "snapshot_date": snapshot_date_str
@@ -723,7 +973,7 @@ def delete_gantt_snapshot(project_id: int, snapshot_date_str: str) -> bool:
 
 
 # --------------------------------------------------------------------------
-# 假日 & 工作日設定 (gantt_holidays)
+# 假日 & 工作日設定 (gantt_holidays) ...
 # --------------------------------------------------------------------------
 
 def get_holiday_settings(project_id: int) -> Optional[dict]:
@@ -732,19 +982,12 @@ def get_holiday_settings(project_id: int) -> Optional[dict]:
 
 
 def update_holiday_settings(project_id: int, data: Dict[str, Any]):
-    """
-    可支援:
-    - holidays: [...],
-    - workdays_per_week: int,
-    - workday_weekdays: [...],  # <--- 新增
-    - special_workdays: [...]
-    """
     filter_ = {"project_id": project_id}
     update_data = {
         "project_id": project_id,
         "holidays": data.get("holidays", []),
         "workdays_per_week": data.get("workdays_per_week", 5),
-        "workday_weekdays": data.get("workday_weekdays", []),  # ★ 新增或預設空
+        "workday_weekdays": data.get("workday_weekdays", []),
         "special_workdays": data.get("special_workdays", []),
         "updated_at": datetime.now()
     }
@@ -753,6 +996,318 @@ def update_holiday_settings(project_id: int, data: Dict[str, Any]):
         {"$set": update_data},
         upsert=True
     )
+
+
+# --------------------------------------------------------------------------
+# 「父任務自動計算」的輔助函式
+# --------------------------------------------------------------------------
+
+def _recalc_parent_chain_in_db(project_id: int, changed_task_id: int):
+    """
+    從 changed_task_id 開始，向上遞歸更新父任務(start_date, end_date, progress)。
+    使用 gantt_tasks 集合。
+    """
+    coll = mongo.db["gantt_tasks"]
+
+    # 先找到該任務
+    changed_doc = coll.find_one({"project_id": project_id, "id": changed_task_id})
+    if not changed_doc:
+        # 可能是被刪除了
+        pass
+
+    # 逐層向上更新
+    # 例如 BFS: 先找 changed_doc 的 parent, 再找 parent 的 parent...
+    visited = set()
+    current_parent_id = changed_doc["parent_id"] if changed_doc else None
+
+    while current_parent_id:
+        if current_parent_id in visited:
+            # 避免環
+            break
+        visited.add(current_parent_id)
+
+        parent_doc = coll.find_one({"project_id": project_id, "id": current_parent_id})
+        if not parent_doc:
+            break
+
+        # 找出所有孩子
+        children = list(coll.find({"project_id": project_id, "parent_id": current_parent_id}))
+
+        new_start, new_end, new_progress = _calc_parent_fields(children, parent_doc.get("type", "task"))
+        coll.update_one(
+            {"_id": parent_doc["_id"]},
+            {"$set": {
+                "start_date": new_start.isoformat(),
+                "end_date": new_end.isoformat(),
+                "progress": new_progress,
+                "updated_at": datetime.now()
+            }}
+        )
+        current_parent_id = parent_doc.get("parent_id")
+
+
+def _recalc_parent_chain_in_snapshot(project_id: int, changed_task_id: int, snapshot_date: str):
+    """
+    與上面類似，但針對 snapshot 裡的 tasks array (in-memory)。
+    """
+    snap = mongo.db["gantt_snapshots"].find_one({
+        "project_id": project_id,
+        "snapshot_date": snapshot_date
+    })
+    if not snap:
+        return
+    tasks_list = snap.get("tasks", [])
+    # 先找 changed task
+    changed_doc = None
+    for t in tasks_list:
+        if t["id"] == changed_task_id:
+            changed_doc = t
+            break
+
+    visited = set()
+    current_parent_id = changed_doc["parent_id"] if changed_doc else None
+
+    while current_parent_id:
+        if current_parent_id in visited:
+            break
+        visited.add(current_parent_id)
+
+        parent_task = None
+        for t in tasks_list:
+            if t["id"] == current_parent_id:
+                parent_task = t
+                break
+
+        if not parent_task:
+            break
+
+        # 找出所有孩子
+        children = [c for c in tasks_list if c.get("parent_id") == current_parent_id]
+
+        new_start, new_end, new_progress = _calc_parent_fields(children, parent_task.get("type", "task"))
+        parent_task["start_date"] = new_start.isoformat()
+        parent_task["end_date"] = new_end.isoformat()
+        parent_task["progress"] = new_progress
+        parent_task["updated_at"] = datetime.now()
+
+        current_parent_id = parent_task.get("parent_id")
+
+    # 最後寫回 DB
+    mongo.db["gantt_snapshots"].update_one(
+        {"_id": snap["_id"]},
+        {"$set": {"tasks": tasks_list}}
+    )
+
+
+def _calc_parent_fields(child_tasks: List[dict], parent_type: str):
+    """
+    給定所有子任務 (child_tasks)，計算父任務的 start_date, end_date, progress.
+    - start_date = min( child.start )
+    - end_date = max( child.end )
+    - progress = ( 所有子任務 progress 的「平均」 ) (亦可改成加權平均)
+    - 若 parent_type == "milestone"，強制 start_date=end_date
+    """
+    if not child_tasks:
+        # 沒小孩 => 父任務可能是空殼 => 預設 progress=0, start/end=今日
+        today = datetime.today().date()
+        return (today, today, 0.0)
+
+    min_start = None
+    max_end = None
+    total_progress = 0.0
+    for c in child_tasks:
+        s = _parse_date_str(c.get("start_date", ""), "2025-01-01")
+        e = _parse_date_str(c.get("end_date", ""), "2025-01-02")
+        p = c.get("progress", 0.0)
+        if min_start is None or s < min_start:
+            min_start = s
+        if max_end is None or e > max_end:
+            max_end = e
+        total_progress += float(p)
+
+    avg_progress = total_progress / len(child_tasks)
+    if avg_progress < 0:
+        avg_progress = 0
+    if avg_progress > 1:
+        avg_progress = 1.0
+
+    if parent_type == "milestone":
+        # 強制同一天
+        if min_start and max_end:
+            # 就以min_start為準
+            return (min_start.date(), min_start.date(), avg_progress)
+        else:
+            today = datetime.today().date()
+            return (today, today, avg_progress)
+
+    # 一般( project / task )
+    if min_start is None:
+        min_start = datetime.today()
+    if max_end is None:
+        max_end = min_start
+    return (min_start.date(), max_end.date(), avg_progress)
+
+
+# --------------------------------------------------------------------------
+# 重新分配任務ID
+# --------------------------------------------------------------------------
+
+def reassign_task_ids(project_id: int, snapshot_date_str: str = ""):
+    """
+    將所有 (當前最新 or 指定snapshot) 之 tasks 重新分配 ID。
+    重新分配時，需要保持依賴關係與父子關係的結構不變。
+      - parent_id / depends 裡的 id 也要跟著改。
+    從1開始連號，建議依照「無 parent 的排在前面(可能有多個樹根)，再 BFS or DFS 排子」。
+    """
+    if snapshot_date_str:
+        snap = mongo.db["gantt_snapshots"].find_one({
+            "project_id": project_id,
+            "snapshot_date": snapshot_date_str
+        })
+        if not snap:
+            raise ValueError(f"Snapshot not found for {snapshot_date_str}")
+        tasks_list = snap.get("tasks", [])
+        new_tasks_list = _reassign_ids_in_memory(tasks_list)
+        # 寫回
+        mongo.db["gantt_snapshots"].update_one(
+            {"_id": snap["_id"]},
+            {"$set": {"tasks": new_tasks_list}}
+        )
+    else:
+        # 從 DB 讀取
+        tasks_cursor = mongo.db["gantt_tasks"].find({"project_id": project_id})
+        tasks_list = list(tasks_cursor)
+        if not tasks_list:
+            return  # no tasks, nothing to do
+
+        new_tasks_list = _reassign_ids_in_memory(tasks_list)
+        # 先清空後再插入? 或者update?
+        # 最完美方式：為避免刪除插入後 counters 出問題，
+        # 這裡直接一筆筆 update 也行。不過最簡單安全做法就是「整個 mapping」後逐筆 update。
+        # new_tasks_list只是「doc + new_id, new_depends, new_parent_id」。我們只更新 id/depends/parent_id。
+        # 其餘欄位不變。
+        id_map = {}  # old_id -> new_id
+        for d in new_tasks_list:
+            id_map[d["_original_id"]] = d["id"]
+
+        for new_doc in new_tasks_list:
+            # 依 new_doc["id"], new_doc["depends"], new_doc["parent_id"] 去 update
+            old_id = new_doc["_original_id"]
+            update_fields = {
+                "id": new_doc["id"],
+                "parent_id": new_doc.get("parent_id"),
+                "depends": new_doc.get("depends", [])
+            }
+            mongo.db["gantt_tasks"].update_one(
+                {"project_id": project_id, "id": old_id},
+                {"$set": update_fields}
+            )
+
+
+def _reassign_ids_in_memory(tasks_list: List[dict]) -> List[dict]:
+    """
+    將 tasks_list (array of dict) 重新分配 id, parent_id, depends 等。
+    1) 找出所有無 parent 的作為 root
+    2) BFS or DFS 順序依序分配新 ID
+    3) 需維護 old_id => new_id map，套用到 depends & parent_id
+    4) 回傳新的 tasks_list(帶有新的 id/depends/parent_id)
+       其餘欄位不變。
+    """
+    # 先複製
+    cloned = []
+    for t in tasks_list:
+        cloned.append(dict(t))  # shallow copy
+
+    # old_id => doc
+    doc_by_id = {doc["id"]: doc for doc in cloned}
+    # adjacency => parent -> list of children
+    children_map = {}
+    for d in cloned:
+        pid = d.get("parent_id")
+        if pid not in children_map:
+            children_map[pid] = []
+        children_map[pid].append(d)
+
+    # 找出 roots => parent_id 不存在或 None
+    roots = [d for d in cloned if not d.get("parent_id")]
+
+    queue = []
+    for r in roots:
+        queue.append(r)
+
+    old_to_new = {}
+    new_id_counter = 1
+
+    result_order = []
+
+    while queue:
+        current = queue.pop(0)
+        old_id = current["id"]
+
+        # 指派新 id
+        assigned_id = new_id_counter
+        new_id_counter += 1
+        old_to_new[old_id] = assigned_id
+
+        result_order.append(current)
+
+        # 把孩子放到 queue
+        cid_list = children_map.get(old_id, [])
+        # 這邊可根據自己想要的排序(例如按原本id排序)
+        cid_list = sorted(cid_list, key=lambda x: x["id"])
+        for cdoc in cid_list:
+            queue.append(cdoc)
+
+    # 套用到 cloned
+    for doc in result_order:
+        old_id = doc["id"]
+        doc["_original_id"] = old_id
+        doc["id"] = old_to_new[old_id]
+        # parent_id
+        if doc.get("parent_id"):
+            doc["parent_id"] = old_to_new[doc["parent_id"]]
+        # depends
+        new_depends = []
+        for dep in doc.get("depends", []):
+            if dep in old_to_new:
+                new_depends.append(old_to_new[dep])
+        doc["depends"] = new_depends
+
+    return result_order
+
+
+# --------------------------------------------------------------------------
+# 工具函式
+# --------------------------------------------------------------------------
+
+def _parse_date_str(date_str: str, default_date_str: Optional[str]) -> Optional[datetime]:
+    """
+    將 'YYYY-MM-DD' parse 成 datetime(YYYY,MM,DD) (無時間)
+    若失敗或空 => 若 default_date_str 不為 None 就用 default_date_str; 否則回傳 None
+    """
+    if not date_str:
+        if default_date_str is not None:
+            return datetime.strptime(default_date_str, "%Y-%m-%d")
+        return None
+    try:
+        return datetime.strptime(date_str, "%Y-%m-%d")
+    except ValueError:
+        if default_date_str is not None:
+            return datetime.strptime(default_date_str, "%Y-%m-%d")
+        return None
+
+
+def _normalize_progress(progress):
+    # 確保介於 0 ~ 1
+    try:
+        p = float(progress)
+    except:
+        p = 0.0
+    if math.isnan(p) or p < 0:
+        p = 0.0
+    if p > 1:
+        p = 1.0
+    return p
 
 ================================================================================
 
@@ -769,16 +1324,19 @@ from backend.project_management.routes import projects_bp
 from backend.material_management.routes import material_bp
 from backend.site_diary.routes import site_diary_bp
 from backend.staff_management.routes import staff_bp
-from backend.server import download_bp
 
-# ★ 新增：改用我們的 db.py 來初始化 Mongo
+# ★ 移除對 server.py 的 import
+# from backend.server import download_bp
+
+# ★ 引用並初始化 Mongo
 from backend.db import init_mongo_app
 
-# ★ 新增：SSE Blueprint
+# SSE Blueprint
 from backend.site_diary.progress_sse import progress_sse_bp
 
-# ★ 新增: 匯入 Gantt Management blueprint
+# Gantt Management blueprint
 from backend.gantt_management.routes import gantt_bp
+
 
 def create_app():
     app = Flask(__name__, static_folder="../frontend/dist", static_url_path="/")
@@ -791,16 +1349,17 @@ def create_app():
     app.register_blueprint(material_bp, url_prefix='/api')
     app.register_blueprint(site_diary_bp, url_prefix='/api/projects')
     app.register_blueprint(staff_bp, url_prefix='/api/staff')
-    app.register_blueprint(download_bp)
 
-    # ★ 新增：SSE blueprint
+    # ★ 移除 server.py blueprint
+    # app.register_blueprint(download_bp)
+
+    # SSE blueprint
     app.register_blueprint(progress_sse_bp, url_prefix='/api')
 
-    # ★ 新增：Gantt blueprint
-    # 提供 /api/projects/<int:project_id>/gantt/... 路徑
+    # Gantt blueprint
     app.register_blueprint(gantt_bp, url_prefix='/api/projects')
 
-    # 提供前端打包後檔案 (SPA)
+    # 提供前端打包後的 SPA 檔案
     @app.route('/', defaults={'path': ''})
     @app.route('/<path:path>')
     def serve_vue_app(path):
@@ -811,15 +1370,14 @@ def create_app():
         else:
             return send_from_directory(dist_dir, 'index.html')
 
-    # ===============★ 關鍵新增：處理 404 ★===============
-    # 如果路由未匹配到，而且不是 /api/... ，就回傳 index.html 讓前端接管
+    # ===============★ 處理 404 ★===============
+    # 如果路由未匹配到，而且是 /api/... ，就回傳 JSON 404。
+    # 否則一律回傳前端 index.html 讓前端路由處理 (SPA)。
     @app.errorhandler(NotFound)
     def handle_404(e):
-        # 如果是 API 開頭，則真的是 404
         if request.path.startswith('/api'):
             return jsonify({"error": "Not found"}), 404
 
-        # 否則一律回傳前端打包後的 index.html
         dist_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "frontend", "dist"))
         return send_from_directory(dist_dir, 'index.html')
 
@@ -1003,244 +1561,6 @@ backend/material_management/static/logo.jpg
 
 ================================================================================
 
-backend/migrations/env.py
-
-================================================================================
-import logging
-from logging.config import fileConfig
-
-from flask import current_app
-
-from alembic import context
-
-# this is the Alembic Config object, which provides
-# access to the values within the .ini file in use.
-config = context.config
-
-# Interpret the config file for Python logging.
-# This line sets up loggers basically.
-fileConfig(config.config_file_name)
-logger = logging.getLogger('alembic.env')
-
-
-def get_engine():
-    try:
-        # this works with Flask-SQLAlchemy<3 and Alchemical
-        return current_app.extensions['migrate'].db.get_engine()
-    except (TypeError, AttributeError):
-        # this works with Flask-SQLAlchemy>=3
-        return current_app.extensions['migrate'].db.engine
-
-
-def get_engine_url():
-    try:
-        return get_engine().url.render_as_string(hide_password=False).replace(
-            '%', '%%')
-    except AttributeError:
-        return str(get_engine().url).replace('%', '%%')
-
-
-# add your model's MetaData object here
-# for 'autogenerate' support
-# from myapp import mymodel
-# target_metadata = mymodel.Base.metadata
-config.set_main_option('sqlalchemy.url', get_engine_url())
-target_db = current_app.extensions['migrate'].db
-
-# other values from the config, defined by the needs of env.py,
-# can be acquired:
-# my_important_option = config.get_main_option("my_important_option")
-# ... etc.
-
-
-def get_metadata():
-    if hasattr(target_db, 'metadatas'):
-        return target_db.metadatas[None]
-    return target_db.metadata
-
-
-def run_migrations_offline():
-    """Run migrations in 'offline' mode.
-
-    This configures the context with just a URL
-    and not an Engine, though an Engine is acceptable
-    here as well.  By skipping the Engine creation
-    we don't even need a DBAPI to be available.
-
-    Calls to context.execute() here emit the given string to the
-    script output.
-
-    """
-    url = config.get_main_option("sqlalchemy.url")
-    context.configure(
-        url=url, target_metadata=get_metadata(), literal_binds=True
-    )
-
-    with context.begin_transaction():
-        context.run_migrations()
-
-
-def run_migrations_online():
-    """Run migrations in 'online' mode.
-
-    In this scenario we need to create an Engine
-    and associate a connection with the context.
-
-    """
-
-    # this callback is used to prevent an auto-migration from being generated
-    # when there are no changes to the schema
-    # reference: http://alembic.zzzcomputing.com/en/latest/cookbook.html
-    def process_revision_directives(context, revision, directives):
-        if getattr(config.cmd_opts, 'autogenerate', False):
-            script = directives[0]
-            if script.upgrade_ops.is_empty():
-                directives[:] = []
-                logger.info('No changes in schema detected.')
-
-    conf_args = current_app.extensions['migrate'].configure_args
-    if conf_args.get("process_revision_directives") is None:
-        conf_args["process_revision_directives"] = process_revision_directives
-
-    connectable = get_engine()
-
-    with connectable.connect() as connection:
-        context.configure(
-            connection=connection,
-            target_metadata=get_metadata(),
-            **conf_args
-        )
-
-        with context.begin_transaction():
-            context.run_migrations()
-
-
-if context.is_offline_mode():
-    run_migrations_offline()
-else:
-    run_migrations_online()
-
-================================================================================
-
-backend/migrations/versions/0b5bdb10bee4_initial_schema_from_scratch.py
-
-================================================================================
-"""Initial schema from scratch
-
-Revision ID: 0b5bdb10bee4
-Revises: 
-Create Date: 2025-02-04 17:10:58.507798
-
-"""
-from alembic import op
-import sqlalchemy as sa
-
-
-# revision identifiers, used by Alembic.
-revision = '0b5bdb10bee4'
-down_revision = None
-branch_labels = None
-depends_on = None
-
-
-def upgrade():
-    # ### commands auto generated by Alembic - please adjust! ###
-    op.create_table('projects',
-    sa.Column('id', sa.Integer(), nullable=False),
-    sa.Column('name', sa.String(length=200), nullable=False),
-    sa.Column('description', sa.Text(), nullable=True),
-    sa.Column('start_date', sa.Date(), nullable=True),
-    sa.Column('end_date', sa.Date(), nullable=True),
-    sa.Column('owner', sa.String(length=100), nullable=True),
-    sa.Column('objective', sa.Text(), nullable=True),
-    sa.Column('duration_type', sa.String(length=20), nullable=True),
-    sa.Column('duration_days', sa.Integer(), nullable=True),
-    sa.PrimaryKeyConstraint('id')
-    )
-    op.create_table('staff',
-    sa.Column('id', sa.Integer(), nullable=False),
-    sa.Column('name', sa.String(length=100), nullable=False),
-    sa.Column('role', sa.String(length=100), nullable=True),
-    sa.PrimaryKeyConstraint('id')
-    )
-    op.create_table('site_diaries',
-    sa.Column('id', sa.Integer(), nullable=False),
-    sa.Column('project_id', sa.Integer(), nullable=False),
-    sa.Column('report_date', sa.Date(), nullable=True),
-    sa.Column('weather_morning', sa.String(length=50), nullable=True),
-    sa.Column('weather_noon', sa.String(length=50), nullable=True),
-    sa.Column('day_count', sa.Integer(), nullable=True),
-    sa.Column('summary', sa.Text(), nullable=False),
-    sa.ForeignKeyConstraint(['project_id'], ['projects.id'], ),
-    sa.PrimaryKeyConstraint('id')
-    )
-    op.create_table('site_diary_machines',
-    sa.Column('id', sa.Integer(), nullable=False),
-    sa.Column('site_diary_id', sa.Integer(), nullable=False),
-    sa.Column('machine_type', sa.String(length=50), nullable=False),
-    sa.Column('quantity', sa.Integer(), nullable=False),
-    sa.ForeignKeyConstraint(['site_diary_id'], ['site_diaries.id'], ),
-    sa.PrimaryKeyConstraint('id')
-    )
-    op.create_table('site_diary_staff',
-    sa.Column('site_diary_id', sa.Integer(), nullable=False),
-    sa.Column('staff_id', sa.Integer(), nullable=False),
-    sa.ForeignKeyConstraint(['site_diary_id'], ['site_diaries.id'], ),
-    sa.ForeignKeyConstraint(['staff_id'], ['staff.id'], ),
-    sa.PrimaryKeyConstraint('site_diary_id', 'staff_id')
-    )
-    op.create_table('site_diary_workers',
-    sa.Column('id', sa.Integer(), nullable=False),
-    sa.Column('site_diary_id', sa.Integer(), nullable=False),
-    sa.Column('worker_type', sa.String(length=50), nullable=False),
-    sa.Column('quantity', sa.Integer(), nullable=False),
-    sa.ForeignKeyConstraint(['site_diary_id'], ['site_diaries.id'], ),
-    sa.PrimaryKeyConstraint('id')
-    )
-    # ### end Alembic commands ###
-
-
-def downgrade():
-    # ### commands auto generated by Alembic - please adjust! ###
-    op.drop_table('site_diary_workers')
-    op.drop_table('site_diary_staff')
-    op.drop_table('site_diary_machines')
-    op.drop_table('site_diaries')
-    op.drop_table('staff')
-    op.drop_table('projects')
-    # ### end Alembic commands ###
-
-================================================================================
-
-backend/migrations/versions/21bfa265addc_add_job_number_and_contractor_columns.py
-
-================================================================================
-"""Add job_number and contractor columns to projects
-
-Revision ID: 21bfa265addc
-Revises: 0b5bdb10bee4
-Create Date: 2025-02-05 10:00:00
-"""
-
-from alembic import op
-import sqlalchemy as sa
-
-# revision identifiers, used by Alembic.
-revision = '21bfa265addc'
-down_revision = '0b5bdb10bee4'
-branch_labels = None
-depends_on = None
-
-def upgrade():
-    op.add_column('projects', sa.Column('job_number', sa.String(length=50), nullable=True))
-    op.add_column('projects', sa.Column('contractor', sa.String(length=200), nullable=True))
-
-def downgrade():
-    op.drop_column('projects', 'contractor')
-    op.drop_column('projects', 'job_number')
-
-================================================================================
-
 backend/project_management/routes.py
 
 ================================================================================
@@ -1407,180 +1727,6 @@ def delete_project(project_id):
         abort(404, description="Project not found")
 
     return jsonify({"message": "Project deleted"}), 200
-
-================================================================================
-
-backend/server.py
-
-================================================================================
-import os
-from flask import Blueprint, send_file, jsonify
-
-download_bp = Blueprint('download_bp', __name__)
-
-def generate_tree(startpath, ignore_dirs=None, ignore_files=None, files_to_show=None):
-    if ignore_dirs is None:
-        ignore_dirs = {'.git', '__pycache__', '.pytest_cache', '.vscode', 'venv', 'env', 'node_modules'}
-    if ignore_files is None:
-        ignore_files = {'.gitignore', '.env', '*.pyc', '*.pyo', '*.pyd', '.DS_Store'}
-    
-    tree_str = []
-    
-    def should_ignore(path, name):
-        # 檢查是否應該忽略該目錄或檔案
-        if os.path.isdir(os.path.join(path, name)):
-            return name in ignore_dirs
-        # 檢查副檔名是否為允許的類型
-        allowed_extensions = {'.py', '.jpg', '.jpeg', '.html', '.css','.vue','ts','js','json','svg'}
-        file_ext = os.path.splitext(name)[1].lower()
-        if file_ext not in allowed_extensions:
-            return True
-        return any(name.endswith(f[1:]) if f.startswith('*') else name == f for f in ignore_files)
-    
-    def get_description(filepath):
-        # 讀取檔案前幾行來尋找註解描述
-        try:
-            with open(filepath, 'r', encoding='utf-8') as f:
-                first_lines = ''.join([next(f, '') for _ in range(5)])
-                desc = ''
-                for line in first_lines.split('\n'):
-                    if line.strip().startswith('#'):
-                        desc = line.strip('# ').strip()
-                        break
-                return f" # {desc}" if desc else ''
-        except:
-            return ''
-
-    def should_show(filepath):
-        if files_to_show is None:
-            return True
-        # 將檔案路徑標準化以進行比較
-        filepath = filepath.replace('\\', '/').replace('./', '')
-        return filepath in files_to_show
-
-    for root, dirs, files in os.walk(startpath):
-        # 過濾掉要忽略的目錄
-        dirs[:] = sorted([d for d in dirs if not should_ignore(root, d)])
-        
-        level = root.replace(startpath, '').count(os.sep)
-        indent = '│   ' * level
-        
-        # 檢查此目錄是否包含要顯示的文件
-        has_files_to_show = False
-        if files_to_show is not None:
-            for file in files:
-                if should_show(os.path.join(root, file)):
-                    has_files_to_show = True
-                    break
-        
-        # 只有當目錄包含要顯示的文件時才添加目錄名
-        if has_files_to_show or files_to_show is None:
-            if level > 0:
-                tree_str.append(f'{indent[:-4]}├── {os.path.basename(root)}/')
-            else:
-                tree_str.append(os.path.basename(root) + '/')
-        
-        # 添加檔案
-        files = sorted([f for f in files if not should_ignore(root, f) and should_show(os.path.join(root, f))])
-        for i, file in enumerate(files):
-            file_indent = indent + ('├── ' if i < len(files) - 1 else '└── ')
-            filepath = os.path.join(root, file)
-            description = get_description(filepath) if file.endswith('.py') else ''
-            tree_str.append(f'{file_indent}{file}{description}')
-    
-    return '\n'.join(tree_str)
-
-
-def combine_python_files():
-    """
-    執行後會在本地目錄下生成/覆蓋一份 combined_code.txt，
-    內容包含指定類型檔案的合併，以及專案的目錄結構。
-    """
-    # 指定要包含的日誌檔案（若有）
-    log_files = [
-        # 在此可加入如 logs/xxx.log 之類的路徑
-    ]
-    
-    # 自動搜尋所有指定類型的檔案
-    files_to_read = []
-    allowed_extensions = ('.py', '.jpg', '.jpeg', '.html', '.css','.vue','ts','js','json','svg')
-    for root, _, files in os.walk('.'):
-        for file in files:
-            if file.lower().endswith(allowed_extensions) and file != 'chaintext.py':
-                file_path = os.path.join(root, file)
-                file_path = file_path.replace('\\', '/')
-                if file_path.startswith('./'):
-                    file_path = file_path[2:]
-                skip = False
-                for ignore_dir in {'.git', '__pycache__', '.pytest_cache', '.vscode', 'venv', 'env', 'node_modules'}:
-                    if ignore_dir in file_path.split('/'):
-                        skip = True
-                        break
-                if not skip:
-                    files_to_read.append(file_path)
-    
-    # 排序檔案列表
-    files_to_read.sort()
-
-    # 分隔線
-    separator = "\n" + "="*80 + "\n"
-    
-    # 打開輸出文件
-    with open('combined_code.txt', 'w', encoding='utf-8') as output_file:
-        # 首先寫入日誌檔案
-        for log_file in log_files:
-            try:
-                with open(log_file, 'r', encoding='utf-8') as input_file:
-                    output_file.write(f"\n{log_file}\n")
-                    output_file.write(separator)
-                    output_file.write(input_file.read())
-                    output_file.write(separator)
-            except FileNotFoundError:
-                print(f"警告：找不到日誌檔案 {log_file}")
-            except Exception as e:
-                print(f"處理日誌檔案 {log_file} 時發生錯誤：{str(e)}")
-        
-        # 接著寫入專案檔案架構
-        project_structure = generate_tree('.', files_to_show=files_to_read)
-        output_file.write("專案檔案架構：\n")
-        output_file.write(project_structure)
-        output_file.write(separator)
-        
-        # 遍歷每個文件
-        for i, file_name in enumerate(files_to_read):
-            try:
-                with open(file_name, 'r', encoding='utf-8') as input_file:
-                    # 寫入文件名作為標題
-                    output_file.write(f"\n{file_name}\n")
-                    # 寫入分隔線
-                    output_file.write(separator)
-                    # 寫入文件內容
-                    output_file.write(input_file.read())
-                    # 如果不是最後一個文件，再加一個分隔線
-                    if i < len(files_to_read) - 1:
-                        output_file.write(separator)
-                        
-            except FileNotFoundError:
-                print(f"警告：找不到文件 {file_name}")
-            except Exception as e:
-                print(f"處理文件 {file_name} 時發生錯誤：{str(e)}")
-
-
-@download_bp.route('/download-diary', methods=['GET'])
-def download_diary():
-    """
-    產生(或更新) combined_code.txt 後，將其以檔案下載回傳給前端。
-    若下載失敗（程式發生問題），則回傳 JSON 錯誤訊息並帶有 500 狀態碼。
-    """
-    try:
-        combine_python_files()
-        return send_file(
-            'combined_code.txt',
-            as_attachment=True,
-            download_name='combined_code.txt'  # Flask 2.0+ 用參數 download_name
-        )
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
 
 ================================================================================
 
@@ -2672,2238 +2818,6 @@ frontend/index.html
 
 ================================================================================
 
-frontend/package-lock.json
-
-================================================================================
-{
-  "name": "frontend",
-  "version": "0.0.0",
-  "lockfileVersion": 3,
-  "requires": true,
-  "packages": {
-    "": {
-      "name": "frontend",
-      "version": "0.0.0",
-      "dependencies": {
-        "axios": "^1.7.9",
-        "bootstrap": "^5.3.1",
-        "dhtmlx-gantt": "^9.0.3",
-        "html2canvas": "^1.4.1",
-        "jspdf": "^2.5.2",
-        "sass": "^1.83.4",
-        "vue": "^3.5.13",
-        "vue-router": "^4.5.0"
-      },
-      "devDependencies": {
-        "@types/node": "^22.13.0",
-        "@vitejs/plugin-vue": "^5.2.1",
-        "@vue/tsconfig": "^0.7.0",
-        "typescript": "~5.6.2",
-        "vite": "^6.0.5",
-        "vue-tsc": "^2.2.0"
-      }
-    },
-    "node_modules/@babel/helper-string-parser": {
-      "version": "7.25.9",
-      "resolved": "https://registry.npmjs.org/@babel/helper-string-parser/-/helper-string-parser-7.25.9.tgz",
-      "integrity": "sha512-4A/SCr/2KLd5jrtOMFzaKjVtAei3+2r/NChoBNoZ3EyP/+GlhoaEGoWOZUmFmoITP7zOJyHIMm+DYRd8o3PvHA==",
-      "license": "MIT",
-      "engines": {
-        "node": ">=6.9.0"
-      }
-    },
-    "node_modules/@babel/helper-validator-identifier": {
-      "version": "7.25.9",
-      "resolved": "https://registry.npmjs.org/@babel/helper-validator-identifier/-/helper-validator-identifier-7.25.9.tgz",
-      "integrity": "sha512-Ed61U6XJc3CVRfkERJWDz4dJwKe7iLmmJsbOGu9wSloNSFttHV0I8g6UAgb7qnK5ly5bGLPd4oXZlxCdANBOWQ==",
-      "license": "MIT",
-      "engines": {
-        "node": ">=6.9.0"
-      }
-    },
-    "node_modules/@babel/parser": {
-      "version": "7.26.7",
-      "resolved": "https://registry.npmjs.org/@babel/parser/-/parser-7.26.7.tgz",
-      "integrity": "sha512-kEvgGGgEjRUutvdVvZhbn/BxVt+5VSpwXz1j3WYXQbXDo8KzFOPNG2GQbdAiNq8g6wn1yKk7C/qrke03a84V+w==",
-      "license": "MIT",
-      "dependencies": {
-        "@babel/types": "^7.26.7"
-      },
-      "bin": {
-        "parser": "bin/babel-parser.js"
-      },
-      "engines": {
-        "node": ">=6.0.0"
-      }
-    },
-    "node_modules/@babel/runtime": {
-      "version": "7.26.9",
-      "resolved": "https://registry.npmjs.org/@babel/runtime/-/runtime-7.26.9.tgz",
-      "integrity": "sha512-aA63XwOkcl4xxQa3HjPMqOP6LiK0ZDv3mUPYEFXkpHbaFjtGggE1A61FjFzJnB+p7/oy2gA8E+rcBNl/zC1tMg==",
-      "license": "MIT",
-      "dependencies": {
-        "regenerator-runtime": "^0.14.0"
-      },
-      "engines": {
-        "node": ">=6.9.0"
-      }
-    },
-    "node_modules/@babel/types": {
-      "version": "7.26.7",
-      "resolved": "https://registry.npmjs.org/@babel/types/-/types-7.26.7.tgz",
-      "integrity": "sha512-t8kDRGrKXyp6+tjUh7hw2RLyclsW4TRoRvRHtSyAX9Bb5ldlFh+90YAYY6awRXrlB4G5G2izNeGySpATlFzmOg==",
-      "license": "MIT",
-      "dependencies": {
-        "@babel/helper-string-parser": "^7.25.9",
-        "@babel/helper-validator-identifier": "^7.25.9"
-      },
-      "engines": {
-        "node": ">=6.9.0"
-      }
-    },
-    "node_modules/@esbuild/aix-ppc64": {
-      "version": "0.24.2",
-      "resolved": "https://registry.npmjs.org/@esbuild/aix-ppc64/-/aix-ppc64-0.24.2.tgz",
-      "integrity": "sha512-thpVCb/rhxE/BnMLQ7GReQLLN8q9qbHmI55F4489/ByVg2aQaQ6kbcLb6FHkocZzQhxc4gx0sCk0tJkKBFzDhA==",
-      "cpu": [
-        "ppc64"
-      ],
-      "dev": true,
-      "license": "MIT",
-      "optional": true,
-      "os": [
-        "aix"
-      ],
-      "engines": {
-        "node": ">=18"
-      }
-    },
-    "node_modules/@esbuild/android-arm": {
-      "version": "0.24.2",
-      "resolved": "https://registry.npmjs.org/@esbuild/android-arm/-/android-arm-0.24.2.tgz",
-      "integrity": "sha512-tmwl4hJkCfNHwFB3nBa8z1Uy3ypZpxqxfTQOcHX+xRByyYgunVbZ9MzUUfb0RxaHIMnbHagwAxuTL+tnNM+1/Q==",
-      "cpu": [
-        "arm"
-      ],
-      "dev": true,
-      "license": "MIT",
-      "optional": true,
-      "os": [
-        "android"
-      ],
-      "engines": {
-        "node": ">=18"
-      }
-    },
-    "node_modules/@esbuild/android-arm64": {
-      "version": "0.24.2",
-      "resolved": "https://registry.npmjs.org/@esbuild/android-arm64/-/android-arm64-0.24.2.tgz",
-      "integrity": "sha512-cNLgeqCqV8WxfcTIOeL4OAtSmL8JjcN6m09XIgro1Wi7cF4t/THaWEa7eL5CMoMBdjoHOTh/vwTO/o2TRXIyzg==",
-      "cpu": [
-        "arm64"
-      ],
-      "dev": true,
-      "license": "MIT",
-      "optional": true,
-      "os": [
-        "android"
-      ],
-      "engines": {
-        "node": ">=18"
-      }
-    },
-    "node_modules/@esbuild/android-x64": {
-      "version": "0.24.2",
-      "resolved": "https://registry.npmjs.org/@esbuild/android-x64/-/android-x64-0.24.2.tgz",
-      "integrity": "sha512-B6Q0YQDqMx9D7rvIcsXfmJfvUYLoP722bgfBlO5cGvNVb5V/+Y7nhBE3mHV9OpxBf4eAS2S68KZztiPaWq4XYw==",
-      "cpu": [
-        "x64"
-      ],
-      "dev": true,
-      "license": "MIT",
-      "optional": true,
-      "os": [
-        "android"
-      ],
-      "engines": {
-        "node": ">=18"
-      }
-    },
-    "node_modules/@esbuild/darwin-arm64": {
-      "version": "0.24.2",
-      "resolved": "https://registry.npmjs.org/@esbuild/darwin-arm64/-/darwin-arm64-0.24.2.tgz",
-      "integrity": "sha512-kj3AnYWc+CekmZnS5IPu9D+HWtUI49hbnyqk0FLEJDbzCIQt7hg7ucF1SQAilhtYpIujfaHr6O0UHlzzSPdOeA==",
-      "cpu": [
-        "arm64"
-      ],
-      "dev": true,
-      "license": "MIT",
-      "optional": true,
-      "os": [
-        "darwin"
-      ],
-      "engines": {
-        "node": ">=18"
-      }
-    },
-    "node_modules/@esbuild/darwin-x64": {
-      "version": "0.24.2",
-      "resolved": "https://registry.npmjs.org/@esbuild/darwin-x64/-/darwin-x64-0.24.2.tgz",
-      "integrity": "sha512-WeSrmwwHaPkNR5H3yYfowhZcbriGqooyu3zI/3GGpF8AyUdsrrP0X6KumITGA9WOyiJavnGZUwPGvxvwfWPHIA==",
-      "cpu": [
-        "x64"
-      ],
-      "dev": true,
-      "license": "MIT",
-      "optional": true,
-      "os": [
-        "darwin"
-      ],
-      "engines": {
-        "node": ">=18"
-      }
-    },
-    "node_modules/@esbuild/freebsd-arm64": {
-      "version": "0.24.2",
-      "resolved": "https://registry.npmjs.org/@esbuild/freebsd-arm64/-/freebsd-arm64-0.24.2.tgz",
-      "integrity": "sha512-UN8HXjtJ0k/Mj6a9+5u6+2eZ2ERD7Edt1Q9IZiB5UZAIdPnVKDoG7mdTVGhHJIeEml60JteamR3qhsr1r8gXvg==",
-      "cpu": [
-        "arm64"
-      ],
-      "dev": true,
-      "license": "MIT",
-      "optional": true,
-      "os": [
-        "freebsd"
-      ],
-      "engines": {
-        "node": ">=18"
-      }
-    },
-    "node_modules/@esbuild/freebsd-x64": {
-      "version": "0.24.2",
-      "resolved": "https://registry.npmjs.org/@esbuild/freebsd-x64/-/freebsd-x64-0.24.2.tgz",
-      "integrity": "sha512-TvW7wE/89PYW+IevEJXZ5sF6gJRDY/14hyIGFXdIucxCsbRmLUcjseQu1SyTko+2idmCw94TgyaEZi9HUSOe3Q==",
-      "cpu": [
-        "x64"
-      ],
-      "dev": true,
-      "license": "MIT",
-      "optional": true,
-      "os": [
-        "freebsd"
-      ],
-      "engines": {
-        "node": ">=18"
-      }
-    },
-    "node_modules/@esbuild/linux-arm": {
-      "version": "0.24.2",
-      "resolved": "https://registry.npmjs.org/@esbuild/linux-arm/-/linux-arm-0.24.2.tgz",
-      "integrity": "sha512-n0WRM/gWIdU29J57hJyUdIsk0WarGd6To0s+Y+LwvlC55wt+GT/OgkwoXCXvIue1i1sSNWblHEig00GBWiJgfA==",
-      "cpu": [
-        "arm"
-      ],
-      "dev": true,
-      "license": "MIT",
-      "optional": true,
-      "os": [
-        "linux"
-      ],
-      "engines": {
-        "node": ">=18"
-      }
-    },
-    "node_modules/@esbuild/linux-arm64": {
-      "version": "0.24.2",
-      "resolved": "https://registry.npmjs.org/@esbuild/linux-arm64/-/linux-arm64-0.24.2.tgz",
-      "integrity": "sha512-7HnAD6074BW43YvvUmE/35Id9/NB7BeX5EoNkK9obndmZBUk8xmJJeU7DwmUeN7tkysslb2eSl6CTrYz6oEMQg==",
-      "cpu": [
-        "arm64"
-      ],
-      "dev": true,
-      "license": "MIT",
-      "optional": true,
-      "os": [
-        "linux"
-      ],
-      "engines": {
-        "node": ">=18"
-      }
-    },
-    "node_modules/@esbuild/linux-ia32": {
-      "version": "0.24.2",
-      "resolved": "https://registry.npmjs.org/@esbuild/linux-ia32/-/linux-ia32-0.24.2.tgz",
-      "integrity": "sha512-sfv0tGPQhcZOgTKO3oBE9xpHuUqguHvSo4jl+wjnKwFpapx+vUDcawbwPNuBIAYdRAvIDBfZVvXprIj3HA+Ugw==",
-      "cpu": [
-        "ia32"
-      ],
-      "dev": true,
-      "license": "MIT",
-      "optional": true,
-      "os": [
-        "linux"
-      ],
-      "engines": {
-        "node": ">=18"
-      }
-    },
-    "node_modules/@esbuild/linux-loong64": {
-      "version": "0.24.2",
-      "resolved": "https://registry.npmjs.org/@esbuild/linux-loong64/-/linux-loong64-0.24.2.tgz",
-      "integrity": "sha512-CN9AZr8kEndGooS35ntToZLTQLHEjtVB5n7dl8ZcTZMonJ7CCfStrYhrzF97eAecqVbVJ7APOEe18RPI4KLhwQ==",
-      "cpu": [
-        "loong64"
-      ],
-      "dev": true,
-      "license": "MIT",
-      "optional": true,
-      "os": [
-        "linux"
-      ],
-      "engines": {
-        "node": ">=18"
-      }
-    },
-    "node_modules/@esbuild/linux-mips64el": {
-      "version": "0.24.2",
-      "resolved": "https://registry.npmjs.org/@esbuild/linux-mips64el/-/linux-mips64el-0.24.2.tgz",
-      "integrity": "sha512-iMkk7qr/wl3exJATwkISxI7kTcmHKE+BlymIAbHO8xanq/TjHaaVThFF6ipWzPHryoFsesNQJPE/3wFJw4+huw==",
-      "cpu": [
-        "mips64el"
-      ],
-      "dev": true,
-      "license": "MIT",
-      "optional": true,
-      "os": [
-        "linux"
-      ],
-      "engines": {
-        "node": ">=18"
-      }
-    },
-    "node_modules/@esbuild/linux-ppc64": {
-      "version": "0.24.2",
-      "resolved": "https://registry.npmjs.org/@esbuild/linux-ppc64/-/linux-ppc64-0.24.2.tgz",
-      "integrity": "sha512-shsVrgCZ57Vr2L8mm39kO5PPIb+843FStGt7sGGoqiiWYconSxwTiuswC1VJZLCjNiMLAMh34jg4VSEQb+iEbw==",
-      "cpu": [
-        "ppc64"
-      ],
-      "dev": true,
-      "license": "MIT",
-      "optional": true,
-      "os": [
-        "linux"
-      ],
-      "engines": {
-        "node": ">=18"
-      }
-    },
-    "node_modules/@esbuild/linux-riscv64": {
-      "version": "0.24.2",
-      "resolved": "https://registry.npmjs.org/@esbuild/linux-riscv64/-/linux-riscv64-0.24.2.tgz",
-      "integrity": "sha512-4eSFWnU9Hhd68fW16GD0TINewo1L6dRrB+oLNNbYyMUAeOD2yCK5KXGK1GH4qD/kT+bTEXjsyTCiJGHPZ3eM9Q==",
-      "cpu": [
-        "riscv64"
-      ],
-      "dev": true,
-      "license": "MIT",
-      "optional": true,
-      "os": [
-        "linux"
-      ],
-      "engines": {
-        "node": ">=18"
-      }
-    },
-    "node_modules/@esbuild/linux-s390x": {
-      "version": "0.24.2",
-      "resolved": "https://registry.npmjs.org/@esbuild/linux-s390x/-/linux-s390x-0.24.2.tgz",
-      "integrity": "sha512-S0Bh0A53b0YHL2XEXC20bHLuGMOhFDO6GN4b3YjRLK//Ep3ql3erpNcPlEFed93hsQAjAQDNsvcK+hV90FubSw==",
-      "cpu": [
-        "s390x"
-      ],
-      "dev": true,
-      "license": "MIT",
-      "optional": true,
-      "os": [
-        "linux"
-      ],
-      "engines": {
-        "node": ">=18"
-      }
-    },
-    "node_modules/@esbuild/linux-x64": {
-      "version": "0.24.2",
-      "resolved": "https://registry.npmjs.org/@esbuild/linux-x64/-/linux-x64-0.24.2.tgz",
-      "integrity": "sha512-8Qi4nQcCTbLnK9WoMjdC9NiTG6/E38RNICU6sUNqK0QFxCYgoARqVqxdFmWkdonVsvGqWhmm7MO0jyTqLqwj0Q==",
-      "cpu": [
-        "x64"
-      ],
-      "dev": true,
-      "license": "MIT",
-      "optional": true,
-      "os": [
-        "linux"
-      ],
-      "engines": {
-        "node": ">=18"
-      }
-    },
-    "node_modules/@esbuild/netbsd-arm64": {
-      "version": "0.24.2",
-      "resolved": "https://registry.npmjs.org/@esbuild/netbsd-arm64/-/netbsd-arm64-0.24.2.tgz",
-      "integrity": "sha512-wuLK/VztRRpMt9zyHSazyCVdCXlpHkKm34WUyinD2lzK07FAHTq0KQvZZlXikNWkDGoT6x3TD51jKQ7gMVpopw==",
-      "cpu": [
-        "arm64"
-      ],
-      "dev": true,
-      "license": "MIT",
-      "optional": true,
-      "os": [
-        "netbsd"
-      ],
-      "engines": {
-        "node": ">=18"
-      }
-    },
-    "node_modules/@esbuild/netbsd-x64": {
-      "version": "0.24.2",
-      "resolved": "https://registry.npmjs.org/@esbuild/netbsd-x64/-/netbsd-x64-0.24.2.tgz",
-      "integrity": "sha512-VefFaQUc4FMmJuAxmIHgUmfNiLXY438XrL4GDNV1Y1H/RW3qow68xTwjZKfj/+Plp9NANmzbH5R40Meudu8mmw==",
-      "cpu": [
-        "x64"
-      ],
-      "dev": true,
-      "license": "MIT",
-      "optional": true,
-      "os": [
-        "netbsd"
-      ],
-      "engines": {
-        "node": ">=18"
-      }
-    },
-    "node_modules/@esbuild/openbsd-arm64": {
-      "version": "0.24.2",
-      "resolved": "https://registry.npmjs.org/@esbuild/openbsd-arm64/-/openbsd-arm64-0.24.2.tgz",
-      "integrity": "sha512-YQbi46SBct6iKnszhSvdluqDmxCJA+Pu280Av9WICNwQmMxV7nLRHZfjQzwbPs3jeWnuAhE9Jy0NrnJ12Oz+0A==",
-      "cpu": [
-        "arm64"
-      ],
-      "dev": true,
-      "license": "MIT",
-      "optional": true,
-      "os": [
-        "openbsd"
-      ],
-      "engines": {
-        "node": ">=18"
-      }
-    },
-    "node_modules/@esbuild/openbsd-x64": {
-      "version": "0.24.2",
-      "resolved": "https://registry.npmjs.org/@esbuild/openbsd-x64/-/openbsd-x64-0.24.2.tgz",
-      "integrity": "sha512-+iDS6zpNM6EnJyWv0bMGLWSWeXGN/HTaF/LXHXHwejGsVi+ooqDfMCCTerNFxEkM3wYVcExkeGXNqshc9iMaOA==",
-      "cpu": [
-        "x64"
-      ],
-      "dev": true,
-      "license": "MIT",
-      "optional": true,
-      "os": [
-        "openbsd"
-      ],
-      "engines": {
-        "node": ">=18"
-      }
-    },
-    "node_modules/@esbuild/sunos-x64": {
-      "version": "0.24.2",
-      "resolved": "https://registry.npmjs.org/@esbuild/sunos-x64/-/sunos-x64-0.24.2.tgz",
-      "integrity": "sha512-hTdsW27jcktEvpwNHJU4ZwWFGkz2zRJUz8pvddmXPtXDzVKTTINmlmga3ZzwcuMpUvLw7JkLy9QLKyGpD2Yxig==",
-      "cpu": [
-        "x64"
-      ],
-      "dev": true,
-      "license": "MIT",
-      "optional": true,
-      "os": [
-        "sunos"
-      ],
-      "engines": {
-        "node": ">=18"
-      }
-    },
-    "node_modules/@esbuild/win32-arm64": {
-      "version": "0.24.2",
-      "resolved": "https://registry.npmjs.org/@esbuild/win32-arm64/-/win32-arm64-0.24.2.tgz",
-      "integrity": "sha512-LihEQ2BBKVFLOC9ZItT9iFprsE9tqjDjnbulhHoFxYQtQfai7qfluVODIYxt1PgdoyQkz23+01rzwNwYfutxUQ==",
-      "cpu": [
-        "arm64"
-      ],
-      "dev": true,
-      "license": "MIT",
-      "optional": true,
-      "os": [
-        "win32"
-      ],
-      "engines": {
-        "node": ">=18"
-      }
-    },
-    "node_modules/@esbuild/win32-ia32": {
-      "version": "0.24.2",
-      "resolved": "https://registry.npmjs.org/@esbuild/win32-ia32/-/win32-ia32-0.24.2.tgz",
-      "integrity": "sha512-q+iGUwfs8tncmFC9pcnD5IvRHAzmbwQ3GPS5/ceCyHdjXubwQWI12MKWSNSMYLJMq23/IUCvJMS76PDqXe1fxA==",
-      "cpu": [
-        "ia32"
-      ],
-      "dev": true,
-      "license": "MIT",
-      "optional": true,
-      "os": [
-        "win32"
-      ],
-      "engines": {
-        "node": ">=18"
-      }
-    },
-    "node_modules/@esbuild/win32-x64": {
-      "version": "0.24.2",
-      "resolved": "https://registry.npmjs.org/@esbuild/win32-x64/-/win32-x64-0.24.2.tgz",
-      "integrity": "sha512-7VTgWzgMGvup6aSqDPLiW5zHaxYJGTO4OokMjIlrCtf+VpEL+cXKtCvg723iguPYI5oaUNdS+/V7OU2gvXVWEg==",
-      "cpu": [
-        "x64"
-      ],
-      "dev": true,
-      "license": "MIT",
-      "optional": true,
-      "os": [
-        "win32"
-      ],
-      "engines": {
-        "node": ">=18"
-      }
-    },
-    "node_modules/@jridgewell/sourcemap-codec": {
-      "version": "1.5.0",
-      "resolved": "https://registry.npmjs.org/@jridgewell/sourcemap-codec/-/sourcemap-codec-1.5.0.tgz",
-      "integrity": "sha512-gv3ZRaISU3fjPAgNsriBRqGWQL6quFx04YMPW/zD8XMLsU32mhCCbfbO6KZFLjvYpCZ8zyDEgqsgf+PwPaM7GQ==",
-      "license": "MIT"
-    },
-    "node_modules/@parcel/watcher": {
-      "version": "2.5.1",
-      "resolved": "https://registry.npmjs.org/@parcel/watcher/-/watcher-2.5.1.tgz",
-      "integrity": "sha512-dfUnCxiN9H4ap84DvD2ubjw+3vUNpstxa0TneY/Paat8a3R4uQZDLSvWjmznAY/DoahqTHl9V46HF/Zs3F29pg==",
-      "hasInstallScript": true,
-      "license": "MIT",
-      "optional": true,
-      "dependencies": {
-        "detect-libc": "^1.0.3",
-        "is-glob": "^4.0.3",
-        "micromatch": "^4.0.5",
-        "node-addon-api": "^7.0.0"
-      },
-      "engines": {
-        "node": ">= 10.0.0"
-      },
-      "funding": {
-        "type": "opencollective",
-        "url": "https://opencollective.com/parcel"
-      },
-      "optionalDependencies": {
-        "@parcel/watcher-android-arm64": "2.5.1",
-        "@parcel/watcher-darwin-arm64": "2.5.1",
-        "@parcel/watcher-darwin-x64": "2.5.1",
-        "@parcel/watcher-freebsd-x64": "2.5.1",
-        "@parcel/watcher-linux-arm-glibc": "2.5.1",
-        "@parcel/watcher-linux-arm-musl": "2.5.1",
-        "@parcel/watcher-linux-arm64-glibc": "2.5.1",
-        "@parcel/watcher-linux-arm64-musl": "2.5.1",
-        "@parcel/watcher-linux-x64-glibc": "2.5.1",
-        "@parcel/watcher-linux-x64-musl": "2.5.1",
-        "@parcel/watcher-win32-arm64": "2.5.1",
-        "@parcel/watcher-win32-ia32": "2.5.1",
-        "@parcel/watcher-win32-x64": "2.5.1"
-      }
-    },
-    "node_modules/@parcel/watcher-android-arm64": {
-      "version": "2.5.1",
-      "resolved": "https://registry.npmjs.org/@parcel/watcher-android-arm64/-/watcher-android-arm64-2.5.1.tgz",
-      "integrity": "sha512-KF8+j9nNbUN8vzOFDpRMsaKBHZ/mcjEjMToVMJOhTozkDonQFFrRcfdLWn6yWKCmJKmdVxSgHiYvTCef4/qcBA==",
-      "cpu": [
-        "arm64"
-      ],
-      "license": "MIT",
-      "optional": true,
-      "os": [
-        "android"
-      ],
-      "engines": {
-        "node": ">= 10.0.0"
-      },
-      "funding": {
-        "type": "opencollective",
-        "url": "https://opencollective.com/parcel"
-      }
-    },
-    "node_modules/@parcel/watcher-darwin-arm64": {
-      "version": "2.5.1",
-      "resolved": "https://registry.npmjs.org/@parcel/watcher-darwin-arm64/-/watcher-darwin-arm64-2.5.1.tgz",
-      "integrity": "sha512-eAzPv5osDmZyBhou8PoF4i6RQXAfeKL9tjb3QzYuccXFMQU0ruIc/POh30ePnaOyD1UXdlKguHBmsTs53tVoPw==",
-      "cpu": [
-        "arm64"
-      ],
-      "license": "MIT",
-      "optional": true,
-      "os": [
-        "darwin"
-      ],
-      "engines": {
-        "node": ">= 10.0.0"
-      },
-      "funding": {
-        "type": "opencollective",
-        "url": "https://opencollective.com/parcel"
-      }
-    },
-    "node_modules/@parcel/watcher-darwin-x64": {
-      "version": "2.5.1",
-      "resolved": "https://registry.npmjs.org/@parcel/watcher-darwin-x64/-/watcher-darwin-x64-2.5.1.tgz",
-      "integrity": "sha512-1ZXDthrnNmwv10A0/3AJNZ9JGlzrF82i3gNQcWOzd7nJ8aj+ILyW1MTxVk35Db0u91oD5Nlk9MBiujMlwmeXZg==",
-      "cpu": [
-        "x64"
-      ],
-      "license": "MIT",
-      "optional": true,
-      "os": [
-        "darwin"
-      ],
-      "engines": {
-        "node": ">= 10.0.0"
-      },
-      "funding": {
-        "type": "opencollective",
-        "url": "https://opencollective.com/parcel"
-      }
-    },
-    "node_modules/@parcel/watcher-freebsd-x64": {
-      "version": "2.5.1",
-      "resolved": "https://registry.npmjs.org/@parcel/watcher-freebsd-x64/-/watcher-freebsd-x64-2.5.1.tgz",
-      "integrity": "sha512-SI4eljM7Flp9yPuKi8W0ird8TI/JK6CSxju3NojVI6BjHsTyK7zxA9urjVjEKJ5MBYC+bLmMcbAWlZ+rFkLpJQ==",
-      "cpu": [
-        "x64"
-      ],
-      "license": "MIT",
-      "optional": true,
-      "os": [
-        "freebsd"
-      ],
-      "engines": {
-        "node": ">= 10.0.0"
-      },
-      "funding": {
-        "type": "opencollective",
-        "url": "https://opencollective.com/parcel"
-      }
-    },
-    "node_modules/@parcel/watcher-linux-arm-glibc": {
-      "version": "2.5.1",
-      "resolved": "https://registry.npmjs.org/@parcel/watcher-linux-arm-glibc/-/watcher-linux-arm-glibc-2.5.1.tgz",
-      "integrity": "sha512-RCdZlEyTs8geyBkkcnPWvtXLY44BCeZKmGYRtSgtwwnHR4dxfHRG3gR99XdMEdQ7KeiDdasJwwvNSF5jKtDwdA==",
-      "cpu": [
-        "arm"
-      ],
-      "license": "MIT",
-      "optional": true,
-      "os": [
-        "linux"
-      ],
-      "engines": {
-        "node": ">= 10.0.0"
-      },
-      "funding": {
-        "type": "opencollective",
-        "url": "https://opencollective.com/parcel"
-      }
-    },
-    "node_modules/@parcel/watcher-linux-arm-musl": {
-      "version": "2.5.1",
-      "resolved": "https://registry.npmjs.org/@parcel/watcher-linux-arm-musl/-/watcher-linux-arm-musl-2.5.1.tgz",
-      "integrity": "sha512-6E+m/Mm1t1yhB8X412stiKFG3XykmgdIOqhjWj+VL8oHkKABfu/gjFj8DvLrYVHSBNC+/u5PeNrujiSQ1zwd1Q==",
-      "cpu": [
-        "arm"
-      ],
-      "license": "MIT",
-      "optional": true,
-      "os": [
-        "linux"
-      ],
-      "engines": {
-        "node": ">= 10.0.0"
-      },
-      "funding": {
-        "type": "opencollective",
-        "url": "https://opencollective.com/parcel"
-      }
-    },
-    "node_modules/@parcel/watcher-linux-arm64-glibc": {
-      "version": "2.5.1",
-      "resolved": "https://registry.npmjs.org/@parcel/watcher-linux-arm64-glibc/-/watcher-linux-arm64-glibc-2.5.1.tgz",
-      "integrity": "sha512-LrGp+f02yU3BN9A+DGuY3v3bmnFUggAITBGriZHUREfNEzZh/GO06FF5u2kx8x+GBEUYfyTGamol4j3m9ANe8w==",
-      "cpu": [
-        "arm64"
-      ],
-      "license": "MIT",
-      "optional": true,
-      "os": [
-        "linux"
-      ],
-      "engines": {
-        "node": ">= 10.0.0"
-      },
-      "funding": {
-        "type": "opencollective",
-        "url": "https://opencollective.com/parcel"
-      }
-    },
-    "node_modules/@parcel/watcher-linux-arm64-musl": {
-      "version": "2.5.1",
-      "resolved": "https://registry.npmjs.org/@parcel/watcher-linux-arm64-musl/-/watcher-linux-arm64-musl-2.5.1.tgz",
-      "integrity": "sha512-cFOjABi92pMYRXS7AcQv9/M1YuKRw8SZniCDw0ssQb/noPkRzA+HBDkwmyOJYp5wXcsTrhxO0zq1U11cK9jsFg==",
-      "cpu": [
-        "arm64"
-      ],
-      "license": "MIT",
-      "optional": true,
-      "os": [
-        "linux"
-      ],
-      "engines": {
-        "node": ">= 10.0.0"
-      },
-      "funding": {
-        "type": "opencollective",
-        "url": "https://opencollective.com/parcel"
-      }
-    },
-    "node_modules/@parcel/watcher-linux-x64-glibc": {
-      "version": "2.5.1",
-      "resolved": "https://registry.npmjs.org/@parcel/watcher-linux-x64-glibc/-/watcher-linux-x64-glibc-2.5.1.tgz",
-      "integrity": "sha512-GcESn8NZySmfwlTsIur+49yDqSny2IhPeZfXunQi48DMugKeZ7uy1FX83pO0X22sHntJ4Ub+9k34XQCX+oHt2A==",
-      "cpu": [
-        "x64"
-      ],
-      "license": "MIT",
-      "optional": true,
-      "os": [
-        "linux"
-      ],
-      "engines": {
-        "node": ">= 10.0.0"
-      },
-      "funding": {
-        "type": "opencollective",
-        "url": "https://opencollective.com/parcel"
-      }
-    },
-    "node_modules/@parcel/watcher-linux-x64-musl": {
-      "version": "2.5.1",
-      "resolved": "https://registry.npmjs.org/@parcel/watcher-linux-x64-musl/-/watcher-linux-x64-musl-2.5.1.tgz",
-      "integrity": "sha512-n0E2EQbatQ3bXhcH2D1XIAANAcTZkQICBPVaxMeaCVBtOpBZpWJuf7LwyWPSBDITb7In8mqQgJ7gH8CILCURXg==",
-      "cpu": [
-        "x64"
-      ],
-      "license": "MIT",
-      "optional": true,
-      "os": [
-        "linux"
-      ],
-      "engines": {
-        "node": ">= 10.0.0"
-      },
-      "funding": {
-        "type": "opencollective",
-        "url": "https://opencollective.com/parcel"
-      }
-    },
-    "node_modules/@parcel/watcher-win32-arm64": {
-      "version": "2.5.1",
-      "resolved": "https://registry.npmjs.org/@parcel/watcher-win32-arm64/-/watcher-win32-arm64-2.5.1.tgz",
-      "integrity": "sha512-RFzklRvmc3PkjKjry3hLF9wD7ppR4AKcWNzH7kXR7GUe0Igb3Nz8fyPwtZCSquGrhU5HhUNDr/mKBqj7tqA2Vw==",
-      "cpu": [
-        "arm64"
-      ],
-      "license": "MIT",
-      "optional": true,
-      "os": [
-        "win32"
-      ],
-      "engines": {
-        "node": ">= 10.0.0"
-      },
-      "funding": {
-        "type": "opencollective",
-        "url": "https://opencollective.com/parcel"
-      }
-    },
-    "node_modules/@parcel/watcher-win32-ia32": {
-      "version": "2.5.1",
-      "resolved": "https://registry.npmjs.org/@parcel/watcher-win32-ia32/-/watcher-win32-ia32-2.5.1.tgz",
-      "integrity": "sha512-c2KkcVN+NJmuA7CGlaGD1qJh1cLfDnQsHjE89E60vUEMlqduHGCdCLJCID5geFVM0dOtA3ZiIO8BoEQmzQVfpQ==",
-      "cpu": [
-        "ia32"
-      ],
-      "license": "MIT",
-      "optional": true,
-      "os": [
-        "win32"
-      ],
-      "engines": {
-        "node": ">= 10.0.0"
-      },
-      "funding": {
-        "type": "opencollective",
-        "url": "https://opencollective.com/parcel"
-      }
-    },
-    "node_modules/@parcel/watcher-win32-x64": {
-      "version": "2.5.1",
-      "resolved": "https://registry.npmjs.org/@parcel/watcher-win32-x64/-/watcher-win32-x64-2.5.1.tgz",
-      "integrity": "sha512-9lHBdJITeNR++EvSQVUcaZoWupyHfXe1jZvGZ06O/5MflPcuPLtEphScIBL+AiCWBO46tDSHzWyD0uDmmZqsgA==",
-      "cpu": [
-        "x64"
-      ],
-      "license": "MIT",
-      "optional": true,
-      "os": [
-        "win32"
-      ],
-      "engines": {
-        "node": ">= 10.0.0"
-      },
-      "funding": {
-        "type": "opencollective",
-        "url": "https://opencollective.com/parcel"
-      }
-    },
-    "node_modules/@popperjs/core": {
-      "version": "2.11.8",
-      "resolved": "https://registry.npmjs.org/@popperjs/core/-/core-2.11.8.tgz",
-      "integrity": "sha512-P1st0aksCrn9sGZhp8GMYwBnQsbvAWsZAX44oXNNvLHGqAOcoVxmjZiohstwQ7SqKnbR47akdNi+uleWD8+g6A==",
-      "license": "MIT",
-      "peer": true,
-      "funding": {
-        "type": "opencollective",
-        "url": "https://opencollective.com/popperjs"
-      }
-    },
-    "node_modules/@rollup/rollup-android-arm-eabi": {
-      "version": "4.34.0",
-      "resolved": "https://registry.npmjs.org/@rollup/rollup-android-arm-eabi/-/rollup-android-arm-eabi-4.34.0.tgz",
-      "integrity": "sha512-Eeao7ewDq79jVEsrtWIj5RNqB8p2knlm9fhR6uJ2gqP7UfbLrTrxevudVrEPDM7Wkpn/HpRC2QfazH7MXLz3vQ==",
-      "cpu": [
-        "arm"
-      ],
-      "dev": true,
-      "license": "MIT",
-      "optional": true,
-      "os": [
-        "android"
-      ]
-    },
-    "node_modules/@rollup/rollup-android-arm64": {
-      "version": "4.34.0",
-      "resolved": "https://registry.npmjs.org/@rollup/rollup-android-arm64/-/rollup-android-arm64-4.34.0.tgz",
-      "integrity": "sha512-yVh0Kf1f0Fq4tWNf6mWcbQBCLDpDrDEl88lzPgKhrgTcDrTtlmun92ywEF9dCjmYO3EFiSuJeeo9cYRxl2FswA==",
-      "cpu": [
-        "arm64"
-      ],
-      "dev": true,
-      "license": "MIT",
-      "optional": true,
-      "os": [
-        "android"
-      ]
-    },
-    "node_modules/@rollup/rollup-darwin-arm64": {
-      "version": "4.34.0",
-      "resolved": "https://registry.npmjs.org/@rollup/rollup-darwin-arm64/-/rollup-darwin-arm64-4.34.0.tgz",
-      "integrity": "sha512-gCs0ErAZ9s0Osejpc3qahTsqIPUDjSKIyxK/0BGKvL+Tn0n3Kwvj8BrCv7Y5sR1Ypz1K2qz9Ny0VvkVyoXBVUQ==",
-      "cpu": [
-        "arm64"
-      ],
-      "dev": true,
-      "license": "MIT",
-      "optional": true,
-      "os": [
-        "darwin"
-      ]
-    },
-    "node_modules/@rollup/rollup-darwin-x64": {
-      "version": "4.34.0",
-      "resolved": "https://registry.npmjs.org/@rollup/rollup-darwin-x64/-/rollup-darwin-x64-4.34.0.tgz",
-      "integrity": "sha512-aIB5Anc8hngk15t3GUkiO4pv42ykXHfmpXGS+CzM9CTyiWyT8HIS5ygRAy7KcFb/wiw4Br+vh1byqcHRTfq2tQ==",
-      "cpu": [
-        "x64"
-      ],
-      "dev": true,
-      "license": "MIT",
-      "optional": true,
-      "os": [
-        "darwin"
-      ]
-    },
-    "node_modules/@rollup/rollup-freebsd-arm64": {
-      "version": "4.34.0",
-      "resolved": "https://registry.npmjs.org/@rollup/rollup-freebsd-arm64/-/rollup-freebsd-arm64-4.34.0.tgz",
-      "integrity": "sha512-kpdsUdMlVJMRMaOf/tIvxk8TQdzHhY47imwmASOuMajg/GXpw8GKNd8LNwIHE5Yd1onehNpcUB9jHY6wgw9nHQ==",
-      "cpu": [
-        "arm64"
-      ],
-      "dev": true,
-      "license": "MIT",
-      "optional": true,
-      "os": [
-        "freebsd"
-      ]
-    },
-    "node_modules/@rollup/rollup-freebsd-x64": {
-      "version": "4.34.0",
-      "resolved": "https://registry.npmjs.org/@rollup/rollup-freebsd-x64/-/rollup-freebsd-x64-4.34.0.tgz",
-      "integrity": "sha512-D0RDyHygOBCQiqookcPevrvgEarN0CttBecG4chOeIYCNtlKHmf5oi5kAVpXV7qs0Xh/WO2RnxeicZPtT50V0g==",
-      "cpu": [
-        "x64"
-      ],
-      "dev": true,
-      "license": "MIT",
-      "optional": true,
-      "os": [
-        "freebsd"
-      ]
-    },
-    "node_modules/@rollup/rollup-linux-arm-gnueabihf": {
-      "version": "4.34.0",
-      "resolved": "https://registry.npmjs.org/@rollup/rollup-linux-arm-gnueabihf/-/rollup-linux-arm-gnueabihf-4.34.0.tgz",
-      "integrity": "sha512-mCIw8j5LPDXmCOW8mfMZwT6F/Kza03EnSr4wGYEswrEfjTfVsFOxvgYfuRMxTuUF/XmRb9WSMD5GhCWDe2iNrg==",
-      "cpu": [
-        "arm"
-      ],
-      "dev": true,
-      "license": "MIT",
-      "optional": true,
-      "os": [
-        "linux"
-      ]
-    },
-    "node_modules/@rollup/rollup-linux-arm-musleabihf": {
-      "version": "4.34.0",
-      "resolved": "https://registry.npmjs.org/@rollup/rollup-linux-arm-musleabihf/-/rollup-linux-arm-musleabihf-4.34.0.tgz",
-      "integrity": "sha512-AwwldAu4aCJPob7zmjuDUMvvuatgs8B/QiVB0KwkUarAcPB3W+ToOT+18TQwY4z09Al7G0BvCcmLRop5zBLTag==",
-      "cpu": [
-        "arm"
-      ],
-      "dev": true,
-      "license": "MIT",
-      "optional": true,
-      "os": [
-        "linux"
-      ]
-    },
-    "node_modules/@rollup/rollup-linux-arm64-gnu": {
-      "version": "4.34.0",
-      "resolved": "https://registry.npmjs.org/@rollup/rollup-linux-arm64-gnu/-/rollup-linux-arm64-gnu-4.34.0.tgz",
-      "integrity": "sha512-e7kDUGVP+xw05pV65ZKb0zulRploU3gTu6qH1qL58PrULDGxULIS0OSDQJLH7WiFnpd3ZKUU4VM3u/Z7Zw+e7Q==",
-      "cpu": [
-        "arm64"
-      ],
-      "dev": true,
-      "license": "MIT",
-      "optional": true,
-      "os": [
-        "linux"
-      ]
-    },
-    "node_modules/@rollup/rollup-linux-arm64-musl": {
-      "version": "4.34.0",
-      "resolved": "https://registry.npmjs.org/@rollup/rollup-linux-arm64-musl/-/rollup-linux-arm64-musl-4.34.0.tgz",
-      "integrity": "sha512-SXYJw3zpwHgaBqTXeAZ31qfW/v50wq4HhNVvKFhRr5MnptRX2Af4KebLWR1wpxGJtLgfS2hEPuALRIY3LPAAcA==",
-      "cpu": [
-        "arm64"
-      ],
-      "dev": true,
-      "license": "MIT",
-      "optional": true,
-      "os": [
-        "linux"
-      ]
-    },
-    "node_modules/@rollup/rollup-linux-loongarch64-gnu": {
-      "version": "4.34.0",
-      "resolved": "https://registry.npmjs.org/@rollup/rollup-linux-loongarch64-gnu/-/rollup-linux-loongarch64-gnu-4.34.0.tgz",
-      "integrity": "sha512-e5XiCinINCI4RdyU3sFyBH4zzz7LiQRvHqDtRe9Dt8o/8hTBaYpdPimayF00eY2qy5j4PaaWK0azRgUench6WQ==",
-      "cpu": [
-        "loong64"
-      ],
-      "dev": true,
-      "license": "MIT",
-      "optional": true,
-      "os": [
-        "linux"
-      ]
-    },
-    "node_modules/@rollup/rollup-linux-powerpc64le-gnu": {
-      "version": "4.34.0",
-      "resolved": "https://registry.npmjs.org/@rollup/rollup-linux-powerpc64le-gnu/-/rollup-linux-powerpc64le-gnu-4.34.0.tgz",
-      "integrity": "sha512-3SWN3e0bAsm9ToprLFBSro8nJe6YN+5xmB11N4FfNf92wvLye/+Rh5JGQtKOpwLKt6e61R1RBc9g+luLJsc23A==",
-      "cpu": [
-        "ppc64"
-      ],
-      "dev": true,
-      "license": "MIT",
-      "optional": true,
-      "os": [
-        "linux"
-      ]
-    },
-    "node_modules/@rollup/rollup-linux-riscv64-gnu": {
-      "version": "4.34.0",
-      "resolved": "https://registry.npmjs.org/@rollup/rollup-linux-riscv64-gnu/-/rollup-linux-riscv64-gnu-4.34.0.tgz",
-      "integrity": "sha512-B1Oqt3GLh7qmhvfnc2WQla4NuHlcxAD5LyueUi5WtMc76ZWY+6qDtQYqnxARx9r+7mDGfamD+8kTJO0pKUJeJA==",
-      "cpu": [
-        "riscv64"
-      ],
-      "dev": true,
-      "license": "MIT",
-      "optional": true,
-      "os": [
-        "linux"
-      ]
-    },
-    "node_modules/@rollup/rollup-linux-s390x-gnu": {
-      "version": "4.34.0",
-      "resolved": "https://registry.npmjs.org/@rollup/rollup-linux-s390x-gnu/-/rollup-linux-s390x-gnu-4.34.0.tgz",
-      "integrity": "sha512-UfUCo0h/uj48Jq2lnhX0AOhZPSTAq3Eostas+XZ+GGk22pI+Op1Y6cxQ1JkUuKYu2iU+mXj1QjPrZm9nNWV9rg==",
-      "cpu": [
-        "s390x"
-      ],
-      "dev": true,
-      "license": "MIT",
-      "optional": true,
-      "os": [
-        "linux"
-      ]
-    },
-    "node_modules/@rollup/rollup-linux-x64-gnu": {
-      "version": "4.34.0",
-      "resolved": "https://registry.npmjs.org/@rollup/rollup-linux-x64-gnu/-/rollup-linux-x64-gnu-4.34.0.tgz",
-      "integrity": "sha512-chZLTUIPbgcpm+Z7ALmomXW8Zh+wE2icrG+K6nt/HenPLmtwCajhQC5flNSk1Xy5EDMt/QAOz2MhzfOfJOLSiA==",
-      "cpu": [
-        "x64"
-      ],
-      "dev": true,
-      "license": "MIT",
-      "optional": true,
-      "os": [
-        "linux"
-      ]
-    },
-    "node_modules/@rollup/rollup-linux-x64-musl": {
-      "version": "4.34.0",
-      "resolved": "https://registry.npmjs.org/@rollup/rollup-linux-x64-musl/-/rollup-linux-x64-musl-4.34.0.tgz",
-      "integrity": "sha512-jo0UolK70O28BifvEsFD/8r25shFezl0aUk2t0VJzREWHkq19e+pcLu4kX5HiVXNz5qqkD+aAq04Ct8rkxgbyQ==",
-      "cpu": [
-        "x64"
-      ],
-      "dev": true,
-      "license": "MIT",
-      "optional": true,
-      "os": [
-        "linux"
-      ]
-    },
-    "node_modules/@rollup/rollup-win32-arm64-msvc": {
-      "version": "4.34.0",
-      "resolved": "https://registry.npmjs.org/@rollup/rollup-win32-arm64-msvc/-/rollup-win32-arm64-msvc-4.34.0.tgz",
-      "integrity": "sha512-Vmg0NhAap2S54JojJchiu5An54qa6t/oKT7LmDaWggpIcaiL8WcWHEN6OQrfTdL6mQ2GFyH7j2T5/3YPEDOOGA==",
-      "cpu": [
-        "arm64"
-      ],
-      "dev": true,
-      "license": "MIT",
-      "optional": true,
-      "os": [
-        "win32"
-      ]
-    },
-    "node_modules/@rollup/rollup-win32-ia32-msvc": {
-      "version": "4.34.0",
-      "resolved": "https://registry.npmjs.org/@rollup/rollup-win32-ia32-msvc/-/rollup-win32-ia32-msvc-4.34.0.tgz",
-      "integrity": "sha512-CV2aqhDDOsABKHKhNcs1SZFryffQf8vK2XrxP6lxC99ELZAdvsDgPklIBfd65R8R+qvOm1SmLaZ/Fdq961+m7A==",
-      "cpu": [
-        "ia32"
-      ],
-      "dev": true,
-      "license": "MIT",
-      "optional": true,
-      "os": [
-        "win32"
-      ]
-    },
-    "node_modules/@rollup/rollup-win32-x64-msvc": {
-      "version": "4.34.0",
-      "resolved": "https://registry.npmjs.org/@rollup/rollup-win32-x64-msvc/-/rollup-win32-x64-msvc-4.34.0.tgz",
-      "integrity": "sha512-g2ASy1QwHP88y5KWvblUolJz9rN+i4ZOsYzkEwcNfaNooxNUXG+ON6F5xFo0NIItpHqxcdAyls05VXpBnludGw==",
-      "cpu": [
-        "x64"
-      ],
-      "dev": true,
-      "license": "MIT",
-      "optional": true,
-      "os": [
-        "win32"
-      ]
-    },
-    "node_modules/@types/estree": {
-      "version": "1.0.6",
-      "resolved": "https://registry.npmjs.org/@types/estree/-/estree-1.0.6.tgz",
-      "integrity": "sha512-AYnb1nQyY49te+VRAVgmzfcgjYS91mY5P0TKUDCLEM+gNnA+3T6rWITXRLYCpahpqSQbN5cE+gHpnPyXjHWxcw==",
-      "dev": true,
-      "license": "MIT"
-    },
-    "node_modules/@types/node": {
-      "version": "22.13.0",
-      "resolved": "https://registry.npmjs.org/@types/node/-/node-22.13.0.tgz",
-      "integrity": "sha512-ClIbNe36lawluuvq3+YYhnIN2CELi+6q8NpnM7PYp4hBn/TatfboPgVSm2rwKRfnV2M+Ty9GWDFI64KEe+kysA==",
-      "dev": true,
-      "license": "MIT",
-      "dependencies": {
-        "undici-types": "~6.20.0"
-      }
-    },
-    "node_modules/@types/raf": {
-      "version": "3.4.3",
-      "resolved": "https://registry.npmjs.org/@types/raf/-/raf-3.4.3.tgz",
-      "integrity": "sha512-c4YAvMedbPZ5tEyxzQdMoOhhJ4RD3rngZIdwC2/qDN3d7JpEhB6fiBRKVY1lg5B7Wk+uPBjn5f39j1/2MY1oOw==",
-      "license": "MIT",
-      "optional": true
-    },
-    "node_modules/@vitejs/plugin-vue": {
-      "version": "5.2.1",
-      "resolved": "https://registry.npmjs.org/@vitejs/plugin-vue/-/plugin-vue-5.2.1.tgz",
-      "integrity": "sha512-cxh314tzaWwOLqVes2gnnCtvBDcM1UMdn+iFR+UjAn411dPT3tOmqrJjbMd7koZpMAmBM/GqeV4n9ge7JSiJJQ==",
-      "dev": true,
-      "license": "MIT",
-      "engines": {
-        "node": "^18.0.0 || >=20.0.0"
-      },
-      "peerDependencies": {
-        "vite": "^5.0.0 || ^6.0.0",
-        "vue": "^3.2.25"
-      }
-    },
-    "node_modules/@volar/language-core": {
-      "version": "2.4.11",
-      "resolved": "https://registry.npmjs.org/@volar/language-core/-/language-core-2.4.11.tgz",
-      "integrity": "sha512-lN2C1+ByfW9/JRPpqScuZt/4OrUUse57GLI6TbLgTIqBVemdl1wNcZ1qYGEo2+Gw8coYLgCy7SuKqn6IrQcQgg==",
-      "dev": true,
-      "license": "MIT",
-      "dependencies": {
-        "@volar/source-map": "2.4.11"
-      }
-    },
-    "node_modules/@volar/source-map": {
-      "version": "2.4.11",
-      "resolved": "https://registry.npmjs.org/@volar/source-map/-/source-map-2.4.11.tgz",
-      "integrity": "sha512-ZQpmafIGvaZMn/8iuvCFGrW3smeqkq/IIh9F1SdSx9aUl0J4Iurzd6/FhmjNO5g2ejF3rT45dKskgXWiofqlZQ==",
-      "dev": true,
-      "license": "MIT"
-    },
-    "node_modules/@volar/typescript": {
-      "version": "2.4.11",
-      "resolved": "https://registry.npmjs.org/@volar/typescript/-/typescript-2.4.11.tgz",
-      "integrity": "sha512-2DT+Tdh88Spp5PyPbqhyoYavYCPDsqbHLFwcUI9K1NlY1YgUJvujGdrqUp0zWxnW7KWNTr3xSpMuv2WnaTKDAw==",
-      "dev": true,
-      "license": "MIT",
-      "dependencies": {
-        "@volar/language-core": "2.4.11",
-        "path-browserify": "^1.0.1",
-        "vscode-uri": "^3.0.8"
-      }
-    },
-    "node_modules/@vue/compiler-core": {
-      "version": "3.5.13",
-      "resolved": "https://registry.npmjs.org/@vue/compiler-core/-/compiler-core-3.5.13.tgz",
-      "integrity": "sha512-oOdAkwqUfW1WqpwSYJce06wvt6HljgY3fGeM9NcVA1HaYOij3mZG9Rkysn0OHuyUAGMbEbARIpsG+LPVlBJ5/Q==",
-      "license": "MIT",
-      "dependencies": {
-        "@babel/parser": "^7.25.3",
-        "@vue/shared": "3.5.13",
-        "entities": "^4.5.0",
-        "estree-walker": "^2.0.2",
-        "source-map-js": "^1.2.0"
-      }
-    },
-    "node_modules/@vue/compiler-dom": {
-      "version": "3.5.13",
-      "resolved": "https://registry.npmjs.org/@vue/compiler-dom/-/compiler-dom-3.5.13.tgz",
-      "integrity": "sha512-ZOJ46sMOKUjO3e94wPdCzQ6P1Lx/vhp2RSvfaab88Ajexs0AHeV0uasYhi99WPaogmBlRHNRuly8xV75cNTMDA==",
-      "license": "MIT",
-      "dependencies": {
-        "@vue/compiler-core": "3.5.13",
-        "@vue/shared": "3.5.13"
-      }
-    },
-    "node_modules/@vue/compiler-sfc": {
-      "version": "3.5.13",
-      "resolved": "https://registry.npmjs.org/@vue/compiler-sfc/-/compiler-sfc-3.5.13.tgz",
-      "integrity": "sha512-6VdaljMpD82w6c2749Zhf5T9u5uLBWKnVue6XWxprDobftnletJ8+oel7sexFfM3qIxNmVE7LSFGTpv6obNyaQ==",
-      "license": "MIT",
-      "dependencies": {
-        "@babel/parser": "^7.25.3",
-        "@vue/compiler-core": "3.5.13",
-        "@vue/compiler-dom": "3.5.13",
-        "@vue/compiler-ssr": "3.5.13",
-        "@vue/shared": "3.5.13",
-        "estree-walker": "^2.0.2",
-        "magic-string": "^0.30.11",
-        "postcss": "^8.4.48",
-        "source-map-js": "^1.2.0"
-      }
-    },
-    "node_modules/@vue/compiler-ssr": {
-      "version": "3.5.13",
-      "resolved": "https://registry.npmjs.org/@vue/compiler-ssr/-/compiler-ssr-3.5.13.tgz",
-      "integrity": "sha512-wMH6vrYHxQl/IybKJagqbquvxpWCuVYpoUJfCqFZwa/JY1GdATAQ+TgVtgrwwMZ0D07QhA99rs/EAAWfvG6KpA==",
-      "license": "MIT",
-      "dependencies": {
-        "@vue/compiler-dom": "3.5.13",
-        "@vue/shared": "3.5.13"
-      }
-    },
-    "node_modules/@vue/compiler-vue2": {
-      "version": "2.7.16",
-      "resolved": "https://registry.npmjs.org/@vue/compiler-vue2/-/compiler-vue2-2.7.16.tgz",
-      "integrity": "sha512-qYC3Psj9S/mfu9uVi5WvNZIzq+xnXMhOwbTFKKDD7b1lhpnn71jXSFdTQ+WsIEk0ONCd7VV2IMm7ONl6tbQ86A==",
-      "dev": true,
-      "license": "MIT",
-      "dependencies": {
-        "de-indent": "^1.0.2",
-        "he": "^1.2.0"
-      }
-    },
-    "node_modules/@vue/devtools-api": {
-      "version": "6.6.4",
-      "resolved": "https://registry.npmjs.org/@vue/devtools-api/-/devtools-api-6.6.4.tgz",
-      "integrity": "sha512-sGhTPMuXqZ1rVOk32RylztWkfXTRhuS7vgAKv0zjqk8gbsHkJ7xfFf+jbySxt7tWObEJwyKaHMikV/WGDiQm8g==",
-      "license": "MIT"
-    },
-    "node_modules/@vue/language-core": {
-      "version": "2.2.0",
-      "resolved": "https://registry.npmjs.org/@vue/language-core/-/language-core-2.2.0.tgz",
-      "integrity": "sha512-O1ZZFaaBGkKbsRfnVH1ifOK1/1BUkyK+3SQsfnh6PmMmD4qJcTU8godCeA96jjDRTL6zgnK7YzCHfaUlH2r0Mw==",
-      "dev": true,
-      "license": "MIT",
-      "dependencies": {
-        "@volar/language-core": "~2.4.11",
-        "@vue/compiler-dom": "^3.5.0",
-        "@vue/compiler-vue2": "^2.7.16",
-        "@vue/shared": "^3.5.0",
-        "alien-signals": "^0.4.9",
-        "minimatch": "^9.0.3",
-        "muggle-string": "^0.4.1",
-        "path-browserify": "^1.0.1"
-      },
-      "peerDependencies": {
-        "typescript": "*"
-      },
-      "peerDependenciesMeta": {
-        "typescript": {
-          "optional": true
-        }
-      }
-    },
-    "node_modules/@vue/reactivity": {
-      "version": "3.5.13",
-      "resolved": "https://registry.npmjs.org/@vue/reactivity/-/reactivity-3.5.13.tgz",
-      "integrity": "sha512-NaCwtw8o48B9I6L1zl2p41OHo/2Z4wqYGGIK1Khu5T7yxrn+ATOixn/Udn2m+6kZKB/J7cuT9DbWWhRxqixACg==",
-      "license": "MIT",
-      "dependencies": {
-        "@vue/shared": "3.5.13"
-      }
-    },
-    "node_modules/@vue/runtime-core": {
-      "version": "3.5.13",
-      "resolved": "https://registry.npmjs.org/@vue/runtime-core/-/runtime-core-3.5.13.tgz",
-      "integrity": "sha512-Fj4YRQ3Az0WTZw1sFe+QDb0aXCerigEpw418pw1HBUKFtnQHWzwojaukAs2X/c9DQz4MQ4bsXTGlcpGxU/RCIw==",
-      "license": "MIT",
-      "dependencies": {
-        "@vue/reactivity": "3.5.13",
-        "@vue/shared": "3.5.13"
-      }
-    },
-    "node_modules/@vue/runtime-dom": {
-      "version": "3.5.13",
-      "resolved": "https://registry.npmjs.org/@vue/runtime-dom/-/runtime-dom-3.5.13.tgz",
-      "integrity": "sha512-dLaj94s93NYLqjLiyFzVs9X6dWhTdAlEAciC3Moq7gzAc13VJUdCnjjRurNM6uTLFATRHexHCTu/Xp3eW6yoog==",
-      "license": "MIT",
-      "dependencies": {
-        "@vue/reactivity": "3.5.13",
-        "@vue/runtime-core": "3.5.13",
-        "@vue/shared": "3.5.13",
-        "csstype": "^3.1.3"
-      }
-    },
-    "node_modules/@vue/server-renderer": {
-      "version": "3.5.13",
-      "resolved": "https://registry.npmjs.org/@vue/server-renderer/-/server-renderer-3.5.13.tgz",
-      "integrity": "sha512-wAi4IRJV/2SAW3htkTlB+dHeRmpTiVIK1OGLWV1yeStVSebSQQOwGwIq0D3ZIoBj2C2qpgz5+vX9iEBkTdk5YA==",
-      "license": "MIT",
-      "dependencies": {
-        "@vue/compiler-ssr": "3.5.13",
-        "@vue/shared": "3.5.13"
-      },
-      "peerDependencies": {
-        "vue": "3.5.13"
-      }
-    },
-    "node_modules/@vue/shared": {
-      "version": "3.5.13",
-      "resolved": "https://registry.npmjs.org/@vue/shared/-/shared-3.5.13.tgz",
-      "integrity": "sha512-/hnE/qP5ZoGpol0a5mDi45bOd7t3tjYJBjsgCsivow7D48cJeV5l05RD82lPqi7gRiphZM37rnhW1l6ZoCNNnQ==",
-      "license": "MIT"
-    },
-    "node_modules/@vue/tsconfig": {
-      "version": "0.7.0",
-      "resolved": "https://registry.npmjs.org/@vue/tsconfig/-/tsconfig-0.7.0.tgz",
-      "integrity": "sha512-ku2uNz5MaZ9IerPPUyOHzyjhXoX2kVJaVf7hL315DC17vS6IiZRmmCPfggNbU16QTvM80+uYYy3eYJB59WCtvg==",
-      "dev": true,
-      "license": "MIT",
-      "peerDependencies": {
-        "typescript": "5.x",
-        "vue": "^3.4.0"
-      },
-      "peerDependenciesMeta": {
-        "typescript": {
-          "optional": true
-        },
-        "vue": {
-          "optional": true
-        }
-      }
-    },
-    "node_modules/alien-signals": {
-      "version": "0.4.14",
-      "resolved": "https://registry.npmjs.org/alien-signals/-/alien-signals-0.4.14.tgz",
-      "integrity": "sha512-itUAVzhczTmP2U5yX67xVpsbbOiquusbWVyA9N+sy6+r6YVbFkahXvNCeEPWEOMhwDYwbVbGHFkVL03N9I5g+Q==",
-      "dev": true,
-      "license": "MIT"
-    },
-    "node_modules/asynckit": {
-      "version": "0.4.0",
-      "resolved": "https://registry.npmjs.org/asynckit/-/asynckit-0.4.0.tgz",
-      "integrity": "sha512-Oei9OH4tRh0YqU3GxhX79dM/mwVgvbZJaSNaRk+bshkj0S5cfHcgYakreBjrHwatXKbz+IoIdYLxrKim2MjW0Q==",
-      "license": "MIT"
-    },
-    "node_modules/atob": {
-      "version": "2.1.2",
-      "resolved": "https://registry.npmjs.org/atob/-/atob-2.1.2.tgz",
-      "integrity": "sha512-Wm6ukoaOGJi/73p/cl2GvLjTI5JM1k/O14isD73YML8StrH/7/lRFgmg8nICZgD3bZZvjwCGxtMOD3wWNAu8cg==",
-      "license": "(MIT OR Apache-2.0)",
-      "bin": {
-        "atob": "bin/atob.js"
-      },
-      "engines": {
-        "node": ">= 4.5.0"
-      }
-    },
-    "node_modules/axios": {
-      "version": "1.7.9",
-      "resolved": "https://registry.npmjs.org/axios/-/axios-1.7.9.tgz",
-      "integrity": "sha512-LhLcE7Hbiryz8oMDdDptSrWowmB4Bl6RCt6sIJKpRB4XtVf0iEgewX3au/pJqm+Py1kCASkb/FFKjxQaLtxJvw==",
-      "license": "MIT",
-      "dependencies": {
-        "follow-redirects": "^1.15.6",
-        "form-data": "^4.0.0",
-        "proxy-from-env": "^1.1.0"
-      }
-    },
-    "node_modules/balanced-match": {
-      "version": "1.0.2",
-      "resolved": "https://registry.npmjs.org/balanced-match/-/balanced-match-1.0.2.tgz",
-      "integrity": "sha512-3oSeUO0TMV67hN1AmbXsK4yaqU7tjiHlbxRDZOpH0KW9+CeX4bRAaX0Anxt0tx2MrpRpWwQaPwIlISEJhYU5Pw==",
-      "dev": true,
-      "license": "MIT"
-    },
-    "node_modules/base64-arraybuffer": {
-      "version": "1.0.2",
-      "resolved": "https://registry.npmjs.org/base64-arraybuffer/-/base64-arraybuffer-1.0.2.tgz",
-      "integrity": "sha512-I3yl4r9QB5ZRY3XuJVEPfc2XhZO6YweFPI+UovAzn+8/hb3oJ6lnysaFcjVpkCPfVWFUDvoZ8kmVDP7WyRtYtQ==",
-      "license": "MIT",
-      "engines": {
-        "node": ">= 0.6.0"
-      }
-    },
-    "node_modules/bootstrap": {
-      "version": "5.3.3",
-      "resolved": "https://registry.npmjs.org/bootstrap/-/bootstrap-5.3.3.tgz",
-      "integrity": "sha512-8HLCdWgyoMguSO9o+aH+iuZ+aht+mzW0u3HIMzVu7Srrpv7EBBxTnrFlSCskwdY1+EOFQSm7uMJhNQHkdPcmjg==",
-      "funding": [
-        {
-          "type": "github",
-          "url": "https://github.com/sponsors/twbs"
-        },
-        {
-          "type": "opencollective",
-          "url": "https://opencollective.com/bootstrap"
-        }
-      ],
-      "license": "MIT",
-      "peerDependencies": {
-        "@popperjs/core": "^2.11.8"
-      }
-    },
-    "node_modules/brace-expansion": {
-      "version": "2.0.1",
-      "resolved": "https://registry.npmjs.org/brace-expansion/-/brace-expansion-2.0.1.tgz",
-      "integrity": "sha512-XnAIvQ8eM+kC6aULx6wuQiwVsnzsi9d3WxzV3FpWTGA19F621kwdbsAcFKXgKUHZWsy+mY6iL1sHTxWEFCytDA==",
-      "dev": true,
-      "license": "MIT",
-      "dependencies": {
-        "balanced-match": "^1.0.0"
-      }
-    },
-    "node_modules/braces": {
-      "version": "3.0.3",
-      "resolved": "https://registry.npmjs.org/braces/-/braces-3.0.3.tgz",
-      "integrity": "sha512-yQbXgO/OSZVD2IsiLlro+7Hf6Q18EJrKSEsdoMzKePKXct3gvD8oLcOQdIzGupr5Fj+EDe8gO/lxc1BzfMpxvA==",
-      "license": "MIT",
-      "optional": true,
-      "dependencies": {
-        "fill-range": "^7.1.1"
-      },
-      "engines": {
-        "node": ">=8"
-      }
-    },
-    "node_modules/btoa": {
-      "version": "1.2.1",
-      "resolved": "https://registry.npmjs.org/btoa/-/btoa-1.2.1.tgz",
-      "integrity": "sha512-SB4/MIGlsiVkMcHmT+pSmIPoNDoHg+7cMzmt3Uxt628MTz2487DKSqK/fuhFBrkuqrYv5UCEnACpF4dTFNKc/g==",
-      "license": "(MIT OR Apache-2.0)",
-      "bin": {
-        "btoa": "bin/btoa.js"
-      },
-      "engines": {
-        "node": ">= 0.4.0"
-      }
-    },
-    "node_modules/canvg": {
-      "version": "3.0.10",
-      "resolved": "https://registry.npmjs.org/canvg/-/canvg-3.0.10.tgz",
-      "integrity": "sha512-qwR2FRNO9NlzTeKIPIKpnTY6fqwuYSequ8Ru8c0YkYU7U0oW+hLUvWadLvAu1Rl72OMNiFhoLu4f8eUjQ7l/+Q==",
-      "license": "MIT",
-      "optional": true,
-      "dependencies": {
-        "@babel/runtime": "^7.12.5",
-        "@types/raf": "^3.4.0",
-        "core-js": "^3.8.3",
-        "raf": "^3.4.1",
-        "regenerator-runtime": "^0.13.7",
-        "rgbcolor": "^1.0.1",
-        "stackblur-canvas": "^2.0.0",
-        "svg-pathdata": "^6.0.3"
-      },
-      "engines": {
-        "node": ">=10.0.0"
-      }
-    },
-    "node_modules/canvg/node_modules/regenerator-runtime": {
-      "version": "0.13.11",
-      "resolved": "https://registry.npmjs.org/regenerator-runtime/-/regenerator-runtime-0.13.11.tgz",
-      "integrity": "sha512-kY1AZVr2Ra+t+piVaJ4gxaFaReZVH40AKNo7UCX6W+dEwBo/2oZJzqfuN1qLq1oL45o56cPaTXELwrTh8Fpggg==",
-      "license": "MIT",
-      "optional": true
-    },
-    "node_modules/chokidar": {
-      "version": "4.0.3",
-      "resolved": "https://registry.npmjs.org/chokidar/-/chokidar-4.0.3.tgz",
-      "integrity": "sha512-Qgzu8kfBvo+cA4962jnP1KkS6Dop5NS6g7R5LFYJr4b8Ub94PPQXUksCw9PvXoeXPRRddRNC5C1JQUR2SMGtnA==",
-      "license": "MIT",
-      "dependencies": {
-        "readdirp": "^4.0.1"
-      },
-      "engines": {
-        "node": ">= 14.16.0"
-      },
-      "funding": {
-        "url": "https://paulmillr.com/funding/"
-      }
-    },
-    "node_modules/combined-stream": {
-      "version": "1.0.8",
-      "resolved": "https://registry.npmjs.org/combined-stream/-/combined-stream-1.0.8.tgz",
-      "integrity": "sha512-FQN4MRfuJeHf7cBbBMJFXhKSDq+2kAArBlmRBvcvFE5BB1HZKXtSFASDhdlz9zOYwxh8lDdnvmMOe/+5cdoEdg==",
-      "license": "MIT",
-      "dependencies": {
-        "delayed-stream": "~1.0.0"
-      },
-      "engines": {
-        "node": ">= 0.8"
-      }
-    },
-    "node_modules/core-js": {
-      "version": "3.40.0",
-      "resolved": "https://registry.npmjs.org/core-js/-/core-js-3.40.0.tgz",
-      "integrity": "sha512-7vsMc/Lty6AGnn7uFpYT56QesI5D2Y/UkgKounk87OP9Z2H9Z8kj6jzcSGAxFmUtDOS0ntK6lbQz+Nsa0Jj6mQ==",
-      "hasInstallScript": true,
-      "license": "MIT",
-      "optional": true,
-      "funding": {
-        "type": "opencollective",
-        "url": "https://opencollective.com/core-js"
-      }
-    },
-    "node_modules/css-line-break": {
-      "version": "2.1.0",
-      "resolved": "https://registry.npmjs.org/css-line-break/-/css-line-break-2.1.0.tgz",
-      "integrity": "sha512-FHcKFCZcAha3LwfVBhCQbW2nCNbkZXn7KVUJcsT5/P8YmfsVja0FMPJr0B903j/E69HUphKiV9iQArX8SDYA4w==",
-      "license": "MIT",
-      "dependencies": {
-        "utrie": "^1.0.2"
-      }
-    },
-    "node_modules/csstype": {
-      "version": "3.1.3",
-      "resolved": "https://registry.npmjs.org/csstype/-/csstype-3.1.3.tgz",
-      "integrity": "sha512-M1uQkMl8rQK/szD0LNhtqxIPLpimGm8sOBwU7lLnCpSbTyY3yeU1Vc7l4KT5zT4s/yOxHH5O7tIuuLOCnLADRw==",
-      "license": "MIT"
-    },
-    "node_modules/de-indent": {
-      "version": "1.0.2",
-      "resolved": "https://registry.npmjs.org/de-indent/-/de-indent-1.0.2.tgz",
-      "integrity": "sha512-e/1zu3xH5MQryN2zdVaF0OrdNLUbvWxzMbi+iNA6Bky7l1RoP8a2fIbRocyHclXt/arDrrR6lL3TqFD9pMQTsg==",
-      "dev": true,
-      "license": "MIT"
-    },
-    "node_modules/delayed-stream": {
-      "version": "1.0.0",
-      "resolved": "https://registry.npmjs.org/delayed-stream/-/delayed-stream-1.0.0.tgz",
-      "integrity": "sha512-ZySD7Nf91aLB0RxL4KGrKHBXl7Eds1DAmEdcoVawXnLD7SDhpNgtuII2aAkg7a7QS41jxPSZ17p4VdGnMHk3MQ==",
-      "license": "MIT",
-      "engines": {
-        "node": ">=0.4.0"
-      }
-    },
-    "node_modules/detect-libc": {
-      "version": "1.0.3",
-      "resolved": "https://registry.npmjs.org/detect-libc/-/detect-libc-1.0.3.tgz",
-      "integrity": "sha512-pGjwhsmsp4kL2RTz08wcOlGN83otlqHeD/Z5T8GXZB+/YcpQ/dgo+lbU8ZsGxV0HIvqqxo9l7mqYwyYMD9bKDg==",
-      "license": "Apache-2.0",
-      "optional": true,
-      "bin": {
-        "detect-libc": "bin/detect-libc.js"
-      },
-      "engines": {
-        "node": ">=0.10"
-      }
-    },
-    "node_modules/dhtmlx-gantt": {
-      "version": "9.0.3",
-      "resolved": "https://registry.npmjs.org/dhtmlx-gantt/-/dhtmlx-gantt-9.0.3.tgz",
-      "integrity": "sha512-bc6ypBpp1XdE9s7iop5j+O41gLcfxg1nAerV1wHcmG11NxpYI5iOmSAAzdLfC8wqCnIOYQhRz7ca2t4KURFJhQ==",
-      "license": "GPL-2.0"
-    },
-    "node_modules/dompurify": {
-      "version": "2.5.8",
-      "resolved": "https://registry.npmjs.org/dompurify/-/dompurify-2.5.8.tgz",
-      "integrity": "sha512-o1vSNgrmYMQObbSSvF/1brBYEQPHhV1+gsmrusO7/GXtp1T9rCS8cXFqVxK/9crT1jA6Ccv+5MTSjBNqr7Sovw==",
-      "license": "(MPL-2.0 OR Apache-2.0)",
-      "optional": true
-    },
-    "node_modules/entities": {
-      "version": "4.5.0",
-      "resolved": "https://registry.npmjs.org/entities/-/entities-4.5.0.tgz",
-      "integrity": "sha512-V0hjH4dGPh9Ao5p0MoRY6BVqtwCjhz6vI5LT8AJ55H+4g9/4vbHx1I54fS0XuclLhDHArPQCiMjDxjaL8fPxhw==",
-      "license": "BSD-2-Clause",
-      "engines": {
-        "node": ">=0.12"
-      },
-      "funding": {
-        "url": "https://github.com/fb55/entities?sponsor=1"
-      }
-    },
-    "node_modules/esbuild": {
-      "version": "0.24.2",
-      "resolved": "https://registry.npmjs.org/esbuild/-/esbuild-0.24.2.tgz",
-      "integrity": "sha512-+9egpBW8I3CD5XPe0n6BfT5fxLzxrlDzqydF3aviG+9ni1lDC/OvMHcxqEFV0+LANZG5R1bFMWfUrjVsdwxJvA==",
-      "dev": true,
-      "hasInstallScript": true,
-      "license": "MIT",
-      "bin": {
-        "esbuild": "bin/esbuild"
-      },
-      "engines": {
-        "node": ">=18"
-      },
-      "optionalDependencies": {
-        "@esbuild/aix-ppc64": "0.24.2",
-        "@esbuild/android-arm": "0.24.2",
-        "@esbuild/android-arm64": "0.24.2",
-        "@esbuild/android-x64": "0.24.2",
-        "@esbuild/darwin-arm64": "0.24.2",
-        "@esbuild/darwin-x64": "0.24.2",
-        "@esbuild/freebsd-arm64": "0.24.2",
-        "@esbuild/freebsd-x64": "0.24.2",
-        "@esbuild/linux-arm": "0.24.2",
-        "@esbuild/linux-arm64": "0.24.2",
-        "@esbuild/linux-ia32": "0.24.2",
-        "@esbuild/linux-loong64": "0.24.2",
-        "@esbuild/linux-mips64el": "0.24.2",
-        "@esbuild/linux-ppc64": "0.24.2",
-        "@esbuild/linux-riscv64": "0.24.2",
-        "@esbuild/linux-s390x": "0.24.2",
-        "@esbuild/linux-x64": "0.24.2",
-        "@esbuild/netbsd-arm64": "0.24.2",
-        "@esbuild/netbsd-x64": "0.24.2",
-        "@esbuild/openbsd-arm64": "0.24.2",
-        "@esbuild/openbsd-x64": "0.24.2",
-        "@esbuild/sunos-x64": "0.24.2",
-        "@esbuild/win32-arm64": "0.24.2",
-        "@esbuild/win32-ia32": "0.24.2",
-        "@esbuild/win32-x64": "0.24.2"
-      }
-    },
-    "node_modules/estree-walker": {
-      "version": "2.0.2",
-      "resolved": "https://registry.npmjs.org/estree-walker/-/estree-walker-2.0.2.tgz",
-      "integrity": "sha512-Rfkk/Mp/DL7JVje3u18FxFujQlTNR2q6QfMSMB7AvCBx91NGj/ba3kCfza0f6dVDbw7YlRf/nDrn7pQrCCyQ/w==",
-      "license": "MIT"
-    },
-    "node_modules/fflate": {
-      "version": "0.8.2",
-      "resolved": "https://registry.npmjs.org/fflate/-/fflate-0.8.2.tgz",
-      "integrity": "sha512-cPJU47OaAoCbg0pBvzsgpTPhmhqI5eJjh/JIu8tPj5q+T7iLvW/JAYUqmE7KOB4R1ZyEhzBaIQpQpardBF5z8A==",
-      "license": "MIT"
-    },
-    "node_modules/fill-range": {
-      "version": "7.1.1",
-      "resolved": "https://registry.npmjs.org/fill-range/-/fill-range-7.1.1.tgz",
-      "integrity": "sha512-YsGpe3WHLK8ZYi4tWDg2Jy3ebRz2rXowDxnld4bkQB00cc/1Zw9AWnC0i9ztDJitivtQvaI9KaLyKrc+hBW0yg==",
-      "license": "MIT",
-      "optional": true,
-      "dependencies": {
-        "to-regex-range": "^5.0.1"
-      },
-      "engines": {
-        "node": ">=8"
-      }
-    },
-    "node_modules/follow-redirects": {
-      "version": "1.15.9",
-      "resolved": "https://registry.npmjs.org/follow-redirects/-/follow-redirects-1.15.9.tgz",
-      "integrity": "sha512-gew4GsXizNgdoRyqmyfMHyAmXsZDk6mHkSxZFCzW9gwlbtOW44CDtYavM+y+72qD/Vq2l550kMF52DT8fOLJqQ==",
-      "funding": [
-        {
-          "type": "individual",
-          "url": "https://github.com/sponsors/RubenVerborgh"
-        }
-      ],
-      "license": "MIT",
-      "engines": {
-        "node": ">=4.0"
-      },
-      "peerDependenciesMeta": {
-        "debug": {
-          "optional": true
-        }
-      }
-    },
-    "node_modules/form-data": {
-      "version": "4.0.1",
-      "resolved": "https://registry.npmjs.org/form-data/-/form-data-4.0.1.tgz",
-      "integrity": "sha512-tzN8e4TX8+kkxGPK8D5u0FNmjPUjw3lwC9lSLxxoB/+GtsJG91CO8bSWy73APlgAZzZbXEYZJuxjkHH2w+Ezhw==",
-      "license": "MIT",
-      "dependencies": {
-        "asynckit": "^0.4.0",
-        "combined-stream": "^1.0.8",
-        "mime-types": "^2.1.12"
-      },
-      "engines": {
-        "node": ">= 6"
-      }
-    },
-    "node_modules/fsevents": {
-      "version": "2.3.3",
-      "resolved": "https://registry.npmjs.org/fsevents/-/fsevents-2.3.3.tgz",
-      "integrity": "sha512-5xoDfX+fL7faATnagmWPpbFtwh/R77WmMMqqHGS65C3vvB0YHrgF+B1YmZ3441tMj5n63k0212XNoJwzlhffQw==",
-      "dev": true,
-      "hasInstallScript": true,
-      "license": "MIT",
-      "optional": true,
-      "os": [
-        "darwin"
-      ],
-      "engines": {
-        "node": "^8.16.0 || ^10.6.0 || >=11.0.0"
-      }
-    },
-    "node_modules/he": {
-      "version": "1.2.0",
-      "resolved": "https://registry.npmjs.org/he/-/he-1.2.0.tgz",
-      "integrity": "sha512-F/1DnUGPopORZi0ni+CvrCgHQ5FyEAHRLSApuYWMmrbSwoN2Mn/7k+Gl38gJnR7yyDZk6WLXwiGod1JOWNDKGw==",
-      "dev": true,
-      "license": "MIT",
-      "bin": {
-        "he": "bin/he"
-      }
-    },
-    "node_modules/html2canvas": {
-      "version": "1.4.1",
-      "resolved": "https://registry.npmjs.org/html2canvas/-/html2canvas-1.4.1.tgz",
-      "integrity": "sha512-fPU6BHNpsyIhr8yyMpTLLxAbkaK8ArIBcmZIRiBLiDhjeqvXolaEmDGmELFuX9I4xDcaKKcJl+TKZLqruBbmWA==",
-      "license": "MIT",
-      "dependencies": {
-        "css-line-break": "^2.1.0",
-        "text-segmentation": "^1.0.3"
-      },
-      "engines": {
-        "node": ">=8.0.0"
-      }
-    },
-    "node_modules/immutable": {
-      "version": "5.0.3",
-      "resolved": "https://registry.npmjs.org/immutable/-/immutable-5.0.3.tgz",
-      "integrity": "sha512-P8IdPQHq3lA1xVeBRi5VPqUm5HDgKnx0Ru51wZz5mjxHr5n3RWhjIpOFU7ybkUxfB+5IToy+OLaHYDBIWsv+uw==",
-      "license": "MIT"
-    },
-    "node_modules/is-extglob": {
-      "version": "2.1.1",
-      "resolved": "https://registry.npmjs.org/is-extglob/-/is-extglob-2.1.1.tgz",
-      "integrity": "sha512-SbKbANkN603Vi4jEZv49LeVJMn4yGwsbzZworEoyEiutsN3nJYdbO36zfhGJ6QEDpOZIFkDtnq5JRxmvl3jsoQ==",
-      "license": "MIT",
-      "optional": true,
-      "engines": {
-        "node": ">=0.10.0"
-      }
-    },
-    "node_modules/is-glob": {
-      "version": "4.0.3",
-      "resolved": "https://registry.npmjs.org/is-glob/-/is-glob-4.0.3.tgz",
-      "integrity": "sha512-xelSayHH36ZgE7ZWhli7pW34hNbNl8Ojv5KVmkJD4hBdD3th8Tfk9vYasLM+mXWOZhFkgZfxhLSnrwRr4elSSg==",
-      "license": "MIT",
-      "optional": true,
-      "dependencies": {
-        "is-extglob": "^2.1.1"
-      },
-      "engines": {
-        "node": ">=0.10.0"
-      }
-    },
-    "node_modules/is-number": {
-      "version": "7.0.0",
-      "resolved": "https://registry.npmjs.org/is-number/-/is-number-7.0.0.tgz",
-      "integrity": "sha512-41Cifkg6e8TylSpdtTpeLVMqvSBEVzTttHvERD741+pnZ8ANv0004MRL43QKPDlK9cGvNp6NZWZUBlbGXYxxng==",
-      "license": "MIT",
-      "optional": true,
-      "engines": {
-        "node": ">=0.12.0"
-      }
-    },
-    "node_modules/jspdf": {
-      "version": "2.5.2",
-      "resolved": "https://registry.npmjs.org/jspdf/-/jspdf-2.5.2.tgz",
-      "integrity": "sha512-myeX9c+p7znDWPk0eTrujCzNjT+CXdXyk7YmJq5nD5V7uLLKmSXnlQ/Jn/kuo3X09Op70Apm0rQSnFWyGK8uEQ==",
-      "license": "MIT",
-      "dependencies": {
-        "@babel/runtime": "^7.23.2",
-        "atob": "^2.1.2",
-        "btoa": "^1.2.1",
-        "fflate": "^0.8.1"
-      },
-      "optionalDependencies": {
-        "canvg": "^3.0.6",
-        "core-js": "^3.6.0",
-        "dompurify": "^2.5.4",
-        "html2canvas": "^1.0.0-rc.5"
-      }
-    },
-    "node_modules/magic-string": {
-      "version": "0.30.17",
-      "resolved": "https://registry.npmjs.org/magic-string/-/magic-string-0.30.17.tgz",
-      "integrity": "sha512-sNPKHvyjVf7gyjwS4xGTaW/mCnF8wnjtifKBEhxfZ7E/S8tQ0rssrwGNn6q8JH/ohItJfSQp9mBtQYuTlH5QnA==",
-      "license": "MIT",
-      "dependencies": {
-        "@jridgewell/sourcemap-codec": "^1.5.0"
-      }
-    },
-    "node_modules/micromatch": {
-      "version": "4.0.8",
-      "resolved": "https://registry.npmjs.org/micromatch/-/micromatch-4.0.8.tgz",
-      "integrity": "sha512-PXwfBhYu0hBCPw8Dn0E+WDYb7af3dSLVWKi3HGv84IdF4TyFoC0ysxFd0Goxw7nSv4T/PzEJQxsYsEiFCKo2BA==",
-      "license": "MIT",
-      "optional": true,
-      "dependencies": {
-        "braces": "^3.0.3",
-        "picomatch": "^2.3.1"
-      },
-      "engines": {
-        "node": ">=8.6"
-      }
-    },
-    "node_modules/mime-db": {
-      "version": "1.52.0",
-      "resolved": "https://registry.npmjs.org/mime-db/-/mime-db-1.52.0.tgz",
-      "integrity": "sha512-sPU4uV7dYlvtWJxwwxHD0PuihVNiE7TyAbQ5SWxDCB9mUYvOgroQOwYQQOKPJ8CIbE+1ETVlOoK1UC2nU3gYvg==",
-      "license": "MIT",
-      "engines": {
-        "node": ">= 0.6"
-      }
-    },
-    "node_modules/mime-types": {
-      "version": "2.1.35",
-      "resolved": "https://registry.npmjs.org/mime-types/-/mime-types-2.1.35.tgz",
-      "integrity": "sha512-ZDY+bPm5zTTF+YpCrAU9nK0UgICYPT0QtT1NZWFv4s++TNkcgVaT0g6+4R2uI4MjQjzysHB1zxuWL50hzaeXiw==",
-      "license": "MIT",
-      "dependencies": {
-        "mime-db": "1.52.0"
-      },
-      "engines": {
-        "node": ">= 0.6"
-      }
-    },
-    "node_modules/minimatch": {
-      "version": "9.0.5",
-      "resolved": "https://registry.npmjs.org/minimatch/-/minimatch-9.0.5.tgz",
-      "integrity": "sha512-G6T0ZX48xgozx7587koeX9Ys2NYy6Gmv//P89sEte9V9whIapMNF4idKxnW2QtCcLiTWlb/wfCabAtAFWhhBow==",
-      "dev": true,
-      "license": "ISC",
-      "dependencies": {
-        "brace-expansion": "^2.0.1"
-      },
-      "engines": {
-        "node": ">=16 || 14 >=14.17"
-      },
-      "funding": {
-        "url": "https://github.com/sponsors/isaacs"
-      }
-    },
-    "node_modules/muggle-string": {
-      "version": "0.4.1",
-      "resolved": "https://registry.npmjs.org/muggle-string/-/muggle-string-0.4.1.tgz",
-      "integrity": "sha512-VNTrAak/KhO2i8dqqnqnAHOa3cYBwXEZe9h+D5h/1ZqFSTEFHdM65lR7RoIqq3tBBYavsOXV84NoHXZ0AkPyqQ==",
-      "dev": true,
-      "license": "MIT"
-    },
-    "node_modules/nanoid": {
-      "version": "3.3.8",
-      "resolved": "https://registry.npmjs.org/nanoid/-/nanoid-3.3.8.tgz",
-      "integrity": "sha512-WNLf5Sd8oZxOm+TzppcYk8gVOgP+l58xNy58D0nbUnOxOWRWvlcCV4kUF7ltmI6PsrLl/BgKEyS4mqsGChFN0w==",
-      "funding": [
-        {
-          "type": "github",
-          "url": "https://github.com/sponsors/ai"
-        }
-      ],
-      "license": "MIT",
-      "bin": {
-        "nanoid": "bin/nanoid.cjs"
-      },
-      "engines": {
-        "node": "^10 || ^12 || ^13.7 || ^14 || >=15.0.1"
-      }
-    },
-    "node_modules/node-addon-api": {
-      "version": "7.1.1",
-      "resolved": "https://registry.npmjs.org/node-addon-api/-/node-addon-api-7.1.1.tgz",
-      "integrity": "sha512-5m3bsyrjFWE1xf7nz7YXdN4udnVtXK6/Yfgn5qnahL6bCkf2yKt4k3nuTKAtT4r3IG8JNR2ncsIMdZuAzJjHQQ==",
-      "license": "MIT",
-      "optional": true
-    },
-    "node_modules/path-browserify": {
-      "version": "1.0.1",
-      "resolved": "https://registry.npmjs.org/path-browserify/-/path-browserify-1.0.1.tgz",
-      "integrity": "sha512-b7uo2UCUOYZcnF/3ID0lulOJi/bafxa1xPe7ZPsammBSpjSWQkjNxlt635YGS2MiR9GjvuXCtz2emr3jbsz98g==",
-      "dev": true,
-      "license": "MIT"
-    },
-    "node_modules/performance-now": {
-      "version": "2.1.0",
-      "resolved": "https://registry.npmjs.org/performance-now/-/performance-now-2.1.0.tgz",
-      "integrity": "sha512-7EAHlyLHI56VEIdK57uwHdHKIaAGbnXPiw0yWbarQZOKaKpvUIgW0jWRVLiatnM+XXlSwsanIBH/hzGMJulMow==",
-      "license": "MIT",
-      "optional": true
-    },
-    "node_modules/picocolors": {
-      "version": "1.1.1",
-      "resolved": "https://registry.npmjs.org/picocolors/-/picocolors-1.1.1.tgz",
-      "integrity": "sha512-xceH2snhtb5M9liqDsmEw56le376mTZkEX/jEb/RxNFyegNul7eNslCXP9FDj/Lcu0X8KEyMceP2ntpaHrDEVA==",
-      "license": "ISC"
-    },
-    "node_modules/picomatch": {
-      "version": "2.3.1",
-      "resolved": "https://registry.npmjs.org/picomatch/-/picomatch-2.3.1.tgz",
-      "integrity": "sha512-JU3teHTNjmE2VCGFzuY8EXzCDVwEqB2a8fsIvwaStHhAWJEeVd1o1QD80CU6+ZdEXXSLbSsuLwJjkCBWqRQUVA==",
-      "license": "MIT",
-      "optional": true,
-      "engines": {
-        "node": ">=8.6"
-      },
-      "funding": {
-        "url": "https://github.com/sponsors/jonschlinkert"
-      }
-    },
-    "node_modules/postcss": {
-      "version": "8.5.1",
-      "resolved": "https://registry.npmjs.org/postcss/-/postcss-8.5.1.tgz",
-      "integrity": "sha512-6oz2beyjc5VMn/KV1pPw8fliQkhBXrVn1Z3TVyqZxU8kZpzEKhBdmCFqI6ZbmGtamQvQGuU1sgPTk8ZrXDD7jQ==",
-      "funding": [
-        {
-          "type": "opencollective",
-          "url": "https://opencollective.com/postcss/"
-        },
-        {
-          "type": "tidelift",
-          "url": "https://tidelift.com/funding/github/npm/postcss"
-        },
-        {
-          "type": "github",
-          "url": "https://github.com/sponsors/ai"
-        }
-      ],
-      "license": "MIT",
-      "dependencies": {
-        "nanoid": "^3.3.8",
-        "picocolors": "^1.1.1",
-        "source-map-js": "^1.2.1"
-      },
-      "engines": {
-        "node": "^10 || ^12 || >=14"
-      }
-    },
-    "node_modules/proxy-from-env": {
-      "version": "1.1.0",
-      "resolved": "https://registry.npmjs.org/proxy-from-env/-/proxy-from-env-1.1.0.tgz",
-      "integrity": "sha512-D+zkORCbA9f1tdWRK0RaCR3GPv50cMxcrz4X8k5LTSUD1Dkw47mKJEZQNunItRTkWwgtaUSo1RVFRIG9ZXiFYg==",
-      "license": "MIT"
-    },
-    "node_modules/raf": {
-      "version": "3.4.1",
-      "resolved": "https://registry.npmjs.org/raf/-/raf-3.4.1.tgz",
-      "integrity": "sha512-Sq4CW4QhwOHE8ucn6J34MqtZCeWFP2aQSmrlroYgqAV1PjStIhJXxYuTgUIfkEk7zTLjmIjLmU5q+fbD1NnOJA==",
-      "license": "MIT",
-      "optional": true,
-      "dependencies": {
-        "performance-now": "^2.1.0"
-      }
-    },
-    "node_modules/readdirp": {
-      "version": "4.1.1",
-      "resolved": "https://registry.npmjs.org/readdirp/-/readdirp-4.1.1.tgz",
-      "integrity": "sha512-h80JrZu/MHUZCyHu5ciuoI0+WxsCxzxJTILn6Fs8rxSnFPh+UVHYfeIxK1nVGugMqkfC4vJcBOYbkfkwYK0+gw==",
-      "license": "MIT",
-      "engines": {
-        "node": ">= 14.18.0"
-      },
-      "funding": {
-        "type": "individual",
-        "url": "https://paulmillr.com/funding/"
-      }
-    },
-    "node_modules/regenerator-runtime": {
-      "version": "0.14.1",
-      "resolved": "https://registry.npmjs.org/regenerator-runtime/-/regenerator-runtime-0.14.1.tgz",
-      "integrity": "sha512-dYnhHh0nJoMfnkZs6GmmhFknAGRrLznOu5nc9ML+EJxGvrx6H7teuevqVqCuPcPK//3eDrrjQhehXVx9cnkGdw==",
-      "license": "MIT"
-    },
-    "node_modules/rgbcolor": {
-      "version": "1.0.1",
-      "resolved": "https://registry.npmjs.org/rgbcolor/-/rgbcolor-1.0.1.tgz",
-      "integrity": "sha512-9aZLIrhRaD97sgVhtJOW6ckOEh6/GnvQtdVNfdZ6s67+3/XwLS9lBcQYzEEhYVeUowN7pRzMLsyGhK2i/xvWbw==",
-      "license": "MIT OR SEE LICENSE IN FEEL-FREE.md",
-      "optional": true,
-      "engines": {
-        "node": ">= 0.8.15"
-      }
-    },
-    "node_modules/rollup": {
-      "version": "4.34.0",
-      "resolved": "https://registry.npmjs.org/rollup/-/rollup-4.34.0.tgz",
-      "integrity": "sha512-+4C/cgJ9w6sudisA0nZz0+O7lTP9a3CzNLsoDwaRumM8QHwghUsu6tqHXiTmNUp/rqNiM14++7dkzHDyCRs0Jg==",
-      "dev": true,
-      "license": "MIT",
-      "dependencies": {
-        "@types/estree": "1.0.6"
-      },
-      "bin": {
-        "rollup": "dist/bin/rollup"
-      },
-      "engines": {
-        "node": ">=18.0.0",
-        "npm": ">=8.0.0"
-      },
-      "optionalDependencies": {
-        "@rollup/rollup-android-arm-eabi": "4.34.0",
-        "@rollup/rollup-android-arm64": "4.34.0",
-        "@rollup/rollup-darwin-arm64": "4.34.0",
-        "@rollup/rollup-darwin-x64": "4.34.0",
-        "@rollup/rollup-freebsd-arm64": "4.34.0",
-        "@rollup/rollup-freebsd-x64": "4.34.0",
-        "@rollup/rollup-linux-arm-gnueabihf": "4.34.0",
-        "@rollup/rollup-linux-arm-musleabihf": "4.34.0",
-        "@rollup/rollup-linux-arm64-gnu": "4.34.0",
-        "@rollup/rollup-linux-arm64-musl": "4.34.0",
-        "@rollup/rollup-linux-loongarch64-gnu": "4.34.0",
-        "@rollup/rollup-linux-powerpc64le-gnu": "4.34.0",
-        "@rollup/rollup-linux-riscv64-gnu": "4.34.0",
-        "@rollup/rollup-linux-s390x-gnu": "4.34.0",
-        "@rollup/rollup-linux-x64-gnu": "4.34.0",
-        "@rollup/rollup-linux-x64-musl": "4.34.0",
-        "@rollup/rollup-win32-arm64-msvc": "4.34.0",
-        "@rollup/rollup-win32-ia32-msvc": "4.34.0",
-        "@rollup/rollup-win32-x64-msvc": "4.34.0",
-        "fsevents": "~2.3.2"
-      }
-    },
-    "node_modules/sass": {
-      "version": "1.83.4",
-      "resolved": "https://registry.npmjs.org/sass/-/sass-1.83.4.tgz",
-      "integrity": "sha512-B1bozCeNQiOgDcLd33e2Cs2U60wZwjUUXzh900ZyQF5qUasvMdDZYbQ566LJu7cqR+sAHlAfO6RMkaID5s6qpA==",
-      "license": "MIT",
-      "dependencies": {
-        "chokidar": "^4.0.0",
-        "immutable": "^5.0.2",
-        "source-map-js": ">=0.6.2 <2.0.0"
-      },
-      "bin": {
-        "sass": "sass.js"
-      },
-      "engines": {
-        "node": ">=14.0.0"
-      },
-      "optionalDependencies": {
-        "@parcel/watcher": "^2.4.1"
-      }
-    },
-    "node_modules/source-map-js": {
-      "version": "1.2.1",
-      "resolved": "https://registry.npmjs.org/source-map-js/-/source-map-js-1.2.1.tgz",
-      "integrity": "sha512-UXWMKhLOwVKb728IUtQPXxfYU+usdybtUrK/8uGE8CQMvrhOpwvzDBwj0QhSL7MQc7vIsISBG8VQ8+IDQxpfQA==",
-      "license": "BSD-3-Clause",
-      "engines": {
-        "node": ">=0.10.0"
-      }
-    },
-    "node_modules/stackblur-canvas": {
-      "version": "2.7.0",
-      "resolved": "https://registry.npmjs.org/stackblur-canvas/-/stackblur-canvas-2.7.0.tgz",
-      "integrity": "sha512-yf7OENo23AGJhBriGx0QivY5JP6Y1HbrrDI6WLt6C5auYZXlQrheoY8hD4ibekFKz1HOfE48Ww8kMWMnJD/zcQ==",
-      "license": "MIT",
-      "optional": true,
-      "engines": {
-        "node": ">=0.1.14"
-      }
-    },
-    "node_modules/svg-pathdata": {
-      "version": "6.0.3",
-      "resolved": "https://registry.npmjs.org/svg-pathdata/-/svg-pathdata-6.0.3.tgz",
-      "integrity": "sha512-qsjeeq5YjBZ5eMdFuUa4ZosMLxgr5RZ+F+Y1OrDhuOCEInRMA3x74XdBtggJcj9kOeInz0WE+LgCPDkZFlBYJw==",
-      "license": "MIT",
-      "optional": true,
-      "engines": {
-        "node": ">=12.0.0"
-      }
-    },
-    "node_modules/text-segmentation": {
-      "version": "1.0.3",
-      "resolved": "https://registry.npmjs.org/text-segmentation/-/text-segmentation-1.0.3.tgz",
-      "integrity": "sha512-iOiPUo/BGnZ6+54OsWxZidGCsdU8YbE4PSpdPinp7DeMtUJNJBoJ/ouUSTJjHkh1KntHaltHl/gDs2FC4i5+Nw==",
-      "license": "MIT",
-      "dependencies": {
-        "utrie": "^1.0.2"
-      }
-    },
-    "node_modules/to-regex-range": {
-      "version": "5.0.1",
-      "resolved": "https://registry.npmjs.org/to-regex-range/-/to-regex-range-5.0.1.tgz",
-      "integrity": "sha512-65P7iz6X5yEr1cwcgvQxbbIw7Uk3gOy5dIdtZ4rDveLqhrdJP+Li/Hx6tyK0NEb+2GCyneCMJiGqrADCSNk8sQ==",
-      "license": "MIT",
-      "optional": true,
-      "dependencies": {
-        "is-number": "^7.0.0"
-      },
-      "engines": {
-        "node": ">=8.0"
-      }
-    },
-    "node_modules/typescript": {
-      "version": "5.6.3",
-      "resolved": "https://registry.npmjs.org/typescript/-/typescript-5.6.3.tgz",
-      "integrity": "sha512-hjcS1mhfuyi4WW8IWtjP7brDrG2cuDZukyrYrSauoXGNgx0S7zceP07adYkJycEr56BOUTNPzbInooiN3fn1qw==",
-      "devOptional": true,
-      "license": "Apache-2.0",
-      "bin": {
-        "tsc": "bin/tsc",
-        "tsserver": "bin/tsserver"
-      },
-      "engines": {
-        "node": ">=14.17"
-      }
-    },
-    "node_modules/undici-types": {
-      "version": "6.20.0",
-      "resolved": "https://registry.npmjs.org/undici-types/-/undici-types-6.20.0.tgz",
-      "integrity": "sha512-Ny6QZ2Nju20vw1SRHe3d9jVu6gJ+4e3+MMpqu7pqE5HT6WsTSlce++GQmK5UXS8mzV8DSYHrQH+Xrf2jVcuKNg==",
-      "dev": true,
-      "license": "MIT"
-    },
-    "node_modules/utrie": {
-      "version": "1.0.2",
-      "resolved": "https://registry.npmjs.org/utrie/-/utrie-1.0.2.tgz",
-      "integrity": "sha512-1MLa5ouZiOmQzUbjbu9VmjLzn1QLXBhwpUa7kdLUQK+KQ5KA9I1vk5U4YHe/X2Ch7PYnJfWuWT+VbuxbGwljhw==",
-      "license": "MIT",
-      "dependencies": {
-        "base64-arraybuffer": "^1.0.2"
-      }
-    },
-    "node_modules/vite": {
-      "version": "6.0.11",
-      "resolved": "https://registry.npmjs.org/vite/-/vite-6.0.11.tgz",
-      "integrity": "sha512-4VL9mQPKoHy4+FE0NnRE/kbY51TOfaknxAjt3fJbGJxhIpBZiqVzlZDEesWWsuREXHwNdAoOFZ9MkPEVXczHwg==",
-      "dev": true,
-      "license": "MIT",
-      "dependencies": {
-        "esbuild": "^0.24.2",
-        "postcss": "^8.4.49",
-        "rollup": "^4.23.0"
-      },
-      "bin": {
-        "vite": "bin/vite.js"
-      },
-      "engines": {
-        "node": "^18.0.0 || ^20.0.0 || >=22.0.0"
-      },
-      "funding": {
-        "url": "https://github.com/vitejs/vite?sponsor=1"
-      },
-      "optionalDependencies": {
-        "fsevents": "~2.3.3"
-      },
-      "peerDependencies": {
-        "@types/node": "^18.0.0 || ^20.0.0 || >=22.0.0",
-        "jiti": ">=1.21.0",
-        "less": "*",
-        "lightningcss": "^1.21.0",
-        "sass": "*",
-        "sass-embedded": "*",
-        "stylus": "*",
-        "sugarss": "*",
-        "terser": "^5.16.0",
-        "tsx": "^4.8.1",
-        "yaml": "^2.4.2"
-      },
-      "peerDependenciesMeta": {
-        "@types/node": {
-          "optional": true
-        },
-        "jiti": {
-          "optional": true
-        },
-        "less": {
-          "optional": true
-        },
-        "lightningcss": {
-          "optional": true
-        },
-        "sass": {
-          "optional": true
-        },
-        "sass-embedded": {
-          "optional": true
-        },
-        "stylus": {
-          "optional": true
-        },
-        "sugarss": {
-          "optional": true
-        },
-        "terser": {
-          "optional": true
-        },
-        "tsx": {
-          "optional": true
-        },
-        "yaml": {
-          "optional": true
-        }
-      }
-    },
-    "node_modules/vscode-uri": {
-      "version": "3.0.8",
-      "resolved": "https://registry.npmjs.org/vscode-uri/-/vscode-uri-3.0.8.tgz",
-      "integrity": "sha512-AyFQ0EVmsOZOlAnxoFOGOq1SQDWAB7C6aqMGS23svWAllfOaxbuFvcT8D1i8z3Gyn8fraVeZNNmN6e9bxxXkKw==",
-      "dev": true,
-      "license": "MIT"
-    },
-    "node_modules/vue": {
-      "version": "3.5.13",
-      "resolved": "https://registry.npmjs.org/vue/-/vue-3.5.13.tgz",
-      "integrity": "sha512-wmeiSMxkZCSc+PM2w2VRsOYAZC8GdipNFRTsLSfodVqI9mbejKeXEGr8SckuLnrQPGe3oJN5c3K0vpoU9q/wCQ==",
-      "license": "MIT",
-      "dependencies": {
-        "@vue/compiler-dom": "3.5.13",
-        "@vue/compiler-sfc": "3.5.13",
-        "@vue/runtime-dom": "3.5.13",
-        "@vue/server-renderer": "3.5.13",
-        "@vue/shared": "3.5.13"
-      },
-      "peerDependencies": {
-        "typescript": "*"
-      },
-      "peerDependenciesMeta": {
-        "typescript": {
-          "optional": true
-        }
-      }
-    },
-    "node_modules/vue-router": {
-      "version": "4.5.0",
-      "resolved": "https://registry.npmjs.org/vue-router/-/vue-router-4.5.0.tgz",
-      "integrity": "sha512-HDuk+PuH5monfNuY+ct49mNmkCRK4xJAV9Ts4z9UFc4rzdDnxQLyCMGGc8pKhZhHTVzfanpNwB/lwqevcBwI4w==",
-      "license": "MIT",
-      "dependencies": {
-        "@vue/devtools-api": "^6.6.4"
-      },
-      "funding": {
-        "url": "https://github.com/sponsors/posva"
-      },
-      "peerDependencies": {
-        "vue": "^3.2.0"
-      }
-    },
-    "node_modules/vue-tsc": {
-      "version": "2.2.0",
-      "resolved": "https://registry.npmjs.org/vue-tsc/-/vue-tsc-2.2.0.tgz",
-      "integrity": "sha512-gtmM1sUuJ8aSb0KoAFmK9yMxb8TxjewmxqTJ1aKphD5Cbu0rULFY6+UQT51zW7SpUcenfPUuflKyVwyx9Qdnxg==",
-      "dev": true,
-      "license": "MIT",
-      "dependencies": {
-        "@volar/typescript": "~2.4.11",
-        "@vue/language-core": "2.2.0"
-      },
-      "bin": {
-        "vue-tsc": "bin/vue-tsc.js"
-      },
-      "peerDependencies": {
-        "typescript": ">=5.0.0"
-      }
-    }
-  }
-}
-
-================================================================================
-
 frontend/package.json
 
 ================================================================================
@@ -4920,7 +2834,8 @@ frontend/package.json
   "dependencies": {
     "axios": "^1.7.9",
     "bootstrap": "^5.3.1",
-    "dhtmlx-gantt": "^9.0.3",
+    "dayjs": "^1.11.13",
+    "gantt-elastic-wrapvue3": "^0.0.18",
     "html2canvas": "^1.4.1",
     "jspdf": "^2.5.2",
     "sass": "^1.83.4",
@@ -5037,6 +2952,348 @@ frontend/src/assets/vue.svg
 
 ================================================================================
 <svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" aria-hidden="true" role="img" class="iconify iconify--logos" width="37.07" height="36" preserveAspectRatio="xMidYMid meet" viewBox="0 0 256 198"><path fill="#41B883" d="M204.8 0H256L128 220.8L0 0h97.92L128 51.2L157.44 0h47.36Z"></path><path fill="#41B883" d="m0 0l128 220.8L256 0h-51.2L128 132.48L50.56 0H0Z"></path><path fill="#35495E" d="M50.56 0L128 133.12L204.8 0h-47.36L128 51.2L97.92 0H50.56Z"></path></svg>
+================================================================================
+
+frontend/src/components/GanttTaskForm.vue
+
+================================================================================
+<template>
+  <div class="gantt-task-form">
+    <h5 class="mb-3">
+      {{ isNewTask ? '新增任務' : '編輯任務' }}
+    </h5>
+
+    <form @submit.prevent="handleSubmit">
+      <!-- 任務名稱 -->
+      <div class="mb-3">
+        <label class="form-label">任務名稱</label>
+        <input
+          type="text"
+          v-model="taskData.label"
+          class="form-control form-control-sm"
+        />
+      </div>
+
+      <!-- 任務類型 -->
+      <div class="mb-3">
+        <label class="form-label">任務類型</label>
+        <select
+          v-model="taskData.type"
+          class="form-select form-select-sm"
+        >
+          <option value="task">一般任務 (task)</option>
+          <option value="milestone">里程碑 (milestone)</option>
+          <option value="project">專案 (project)</option>
+        </select>
+      </div>
+
+      <!-- 開始 / 結束日期 / 工期 -->
+      <div class="row mb-3">
+        <div class="col-sm-6">
+          <label class="form-label">開始日期</label>
+          <input
+            type="date"
+            v-model="taskData.start_date_str"
+            class="form-control form-control-sm"
+          />
+        </div>
+        <div class="col-sm-6">
+          <label class="form-label">結束日期</label>
+          <input
+            type="date"
+            v-model="taskData.end_date_str"
+            class="form-control form-control-sm"
+            placeholder="若未填，則改用工期"
+          />
+        </div>
+      </div>
+
+      <div class="row mb-3">
+        <div class="col-sm-6">
+          <label class="form-label">工期 (天)</label>
+          <input
+            type="number"
+            v-model.number="taskData.durationDays"
+            class="form-control form-control-sm"
+            placeholder="若未填結束日期，可輸入工期"
+          />
+        </div>
+
+        <div class="col-sm-6">
+          <label class="form-label">進度 (0 ~ 100%)</label>
+          <input
+            type="number"
+            step="1"
+            min="0"
+            max="100"
+            v-model.number="taskData.progressPercent"
+            class="form-control form-control-sm"
+          />
+        </div>
+      </div>
+
+      <!-- 依賴 (depends) -->
+      <div class="mb-3">
+        <label class="form-label">依賴 (逗號分隔)</label>
+        <input
+          type="text"
+          v-model="taskData.dependsStr"
+          class="form-control form-control-sm"
+          placeholder="例如：2,3"
+        />
+      </div>
+
+      <!-- 父任務ID (parent_id) -->
+      <div class="mb-3">
+        <label class="form-label">父任務ID</label>
+        <input
+          type="text"
+          v-model="taskData.parentIdStr"
+          class="form-control form-control-sm"
+          placeholder="若無父任務可留空"
+        />
+      </div>
+
+      <!-- 任務ID（唯讀顯示） -->
+      <div v-if="!isNewTask" class="mb-3">
+        <label class="form-label">任務 ID (唯讀)</label>
+        <input
+          type="text"
+          :value="String(taskData.id)"
+          class="form-control form-control-sm"
+          disabled
+        />
+      </div>
+
+      <!-- 按鈕區 -->
+      <div class="d-flex justify-content-end mt-4">
+        <!-- 刪除任務按鈕 (若是新增模式就不顯示) -->
+        <button
+          v-if="!isNewTask"
+          type="button"
+          class="btn btn-danger me-3"
+          @click="handleDelete"
+        >
+          刪除任務
+        </button>
+
+        <button
+          type="button"
+          class="btn btn-secondary me-3"
+          @click="$emit('cancel')"
+        >
+          取消
+        </button>
+
+        <button
+          type="submit"
+          class="btn btn-primary"
+        >
+          {{ isNewTask ? '新增' : '儲存' }}
+        </button>
+      </div>
+    </form>
+  </div>
+</template>
+
+<script>
+import axios from 'axios'
+import { ref, watch, computed } from 'vue'
+
+export default {
+  name: 'GanttTaskForm',
+  props: {
+    projectId: {
+      type: Number,
+      required: true
+    },
+    snapshotDate: {
+      type: String,
+      default: '' // 若為空，表示操作當前最新
+    },
+    task: {
+      type: Object,
+      default: null
+    }
+  },
+  setup(props, { emit }) {
+    const taskData = ref({
+      id: null,
+      label: '',
+      type: 'task',
+      start_date_str: '',
+      end_date_str: '',
+      durationDays: 0,
+      progressPercent: 0,
+      dependsStr: '',
+      parentIdStr: ''
+    })
+
+    const isSnapshotMode = computed(() => !!props.snapshotDate)
+    const isNewTask = computed(() => !props.task || !props.task.id)
+
+    watch(
+      () => props.task,
+      (val) => {
+        if (!val) {
+          resetFormForCreate()
+        } else {
+          fillForm(val)
+        }
+      },
+      { immediate: true }
+    )
+
+    function resetFormForCreate() {
+      taskData.value = {
+        id: null,
+        label: '',
+        type: 'task',
+        start_date_str: '',
+        end_date_str: '',
+        durationDays: 0,
+        progressPercent: 0,
+        dependsStr: '',
+        parentIdStr: ''
+      }
+    }
+
+    function fillForm(task) {
+      let startDateStr = ''
+      if (task.start) {
+        const d = new Date(task.start)
+        startDateStr = formatDate(d)
+      }
+      let endDateStr = ''
+      if (task.end) {
+        const d2 = new Date(task.end)
+        endDateStr = formatDate(d2)
+      }
+      const parsedId = typeof task.id === 'number' ? task.id : parseInt(task.id, 10) || null
+      const progressVal = task.progress != null ? parseInt(task.progress, 10) : 0
+      const dependsArr = task.dependentOn || task.depends || []
+      const dependsStr = dependsArr.join(', ')
+      const parentIdVal = task.parentId || task.parent || null
+      const parentIdStr = parentIdVal ? String(parentIdVal) : ''
+
+      // 預設 type: 'task'
+      const tType = task.type || 'task'
+
+      taskData.value = {
+        id: parsedId,
+        label: task.label || '',
+        type: tType,
+        start_date_str: startDateStr,
+        end_date_str: endDateStr,
+        durationDays: 0,
+        progressPercent: progressVal * 1, // 0~100
+        dependsStr,
+        parentIdStr
+      }
+    }
+
+    function formatDate(d) {
+      const year = d.getFullYear()
+      const month = String(d.getMonth() + 1).padStart(2, '0')
+      const day = String(d.getDate()).padStart(2, '0')
+      return `${year}-${month}-${day}`
+    }
+
+    async function handleSubmit() {
+      try {
+        const putOrPostData = {
+          text: taskData.value.label,
+          progress: (taskData.value.progressPercent || 0) / 100,
+          depends: parseDepends(taskData.value.dependsStr),
+          start_date: taskData.value.start_date_str || null,
+          type: taskData.value.type || 'task',
+        }
+        if (taskData.value.end_date_str) {
+          putOrPostData.end_date = taskData.value.end_date_str
+        } else if (taskData.value.durationDays > 0) {
+          putOrPostData.duration = taskData.value.durationDays
+        }
+
+        const parentIdParsed = parseInt(taskData.value.parentIdStr.trim(), 10)
+        if (!isNaN(parentIdParsed)) {
+          putOrPostData.parent_id = parentIdParsed
+        } else {
+          putOrPostData.parent_id = null
+        }
+
+        const baseUrl = `/api/projects/${props.projectId}/gantt/tasks`
+        if (isSnapshotMode.value) {
+          // snapshot 模式 => 以 query param 傳給後端
+          if (isNewTask.value) {
+            await axios.post(`${baseUrl}?snapshot_date=${props.snapshotDate}`, putOrPostData)
+          } else {
+            await axios.put(`${baseUrl}/${taskData.value.id}?snapshot_date=${props.snapshotDate}`, putOrPostData)
+          }
+        } else {
+          // 非 snapshot
+          if (isNewTask.value) {
+            await axios.post(baseUrl, putOrPostData)
+          } else {
+            await axios.put(`${baseUrl}/${taskData.value.id}`, putOrPostData)
+          }
+        }
+
+        alert(isNewTask.value ? '任務已新增！' : '任務已更新！')
+        emit('saved')
+      } catch (err) {
+        console.error(err)
+        alert(`操作失敗：${err}`)
+      }
+    }
+
+    async function handleDelete() {
+      if (!taskData.value.id) return
+      if (!confirm('確定要刪除此任務嗎？')) return
+      try {
+        const baseUrl = `/api/projects/${props.projectId}/gantt/tasks/${taskData.value.id}`
+        if (isSnapshotMode.value) {
+          await axios.delete(`${baseUrl}?snapshot_date=${props.snapshotDate}`)
+        } else {
+          await axios.delete(baseUrl)
+        }
+        alert('任務已刪除。')
+        emit('saved')
+      } catch (err) {
+        console.error(err)
+        alert(`刪除失敗：${err}`)
+      }
+    }
+
+    function parseDepends(str) {
+      if (!str) return []
+      return str
+        .split(',')
+        .map(s => parseInt(s.trim(), 10))
+        .filter(n => !isNaN(n))
+    }
+
+    return {
+      taskData,
+      isSnapshotMode,
+      isNewTask,
+      handleSubmit,
+      handleDelete
+    }
+  }
+}
+</script>
+
+<style scoped>
+.gantt-task-form {
+  font-size: 0.9rem;
+  max-height: 80vh;
+  overflow-y: auto;
+}
+.me-3 {
+  margin-right: 1rem !important;
+}
+</style>
+
 ================================================================================
 
 frontend/src/components/ProjectDetail.vue
@@ -6343,750 +4600,616 @@ frontend/src/views/ProjectsGanttView.vue
 
 ================================================================================
 <template>
-  <!-- 
-    為達到「全螢幕」與「高度自定」，此處用 style="height:100vh; width:100vw; margin:0; padding:0; overflow: hidden;"
-    同時支援 Zoom、假日管理、snapshot 功能等。
-  -->
-  <div
-    class="full-gantt d-flex flex-column"
-    style="height: 100vh; width: 100vw; margin:0; padding:0; overflow: hidden;"
-  >
-    <!-- 工具列 (固定高度) -->
-    <div
-      class="bg-light border-bottom d-flex align-items-center flex-wrap"
-      style="padding: 0.5rem; gap: 1rem; flex: 0 0 auto;"
-    >
-      <button class="btn btn-secondary" @click="goBack">
-        ← Back
+  <div class="projects-gantt-view container-fluid py-3">
+    <!-- 頁面標題 & 專案資訊 -->
+    <div class="row mb-3">
+      <div class="col-12 col-md-6 mb-3">
+        <div class="card">
+          <div class="card-body">
+            <h4 class="card-title mb-3">
+              專案 #{{ projectId }} - 甘特圖
+            </h4>
+            <div v-if="projectInfo">
+              <p class="mb-1">名稱：<strong>{{ projectInfo.name }}</strong></p>
+              <p class="mb-1">承建商：{{ projectInfo.contractor || '(未填)' }}</p>
+              <p class="mb-1">期間：{{ projectInfo.start_date || 'N/A' }} ~ {{ projectInfo.end_date || 'N/A' }}</p>
+            </div>
+            <div v-else>
+              <p class="text-muted">載入專案資訊中...</p>
+            </div>
+          </div>
+        </div>
+      </div>
+      <!-- Snapshot 快照管理卡片 -->
+      <div class="col-12 col-md-6 mb-3">
+        <div class="card h-100">
+          <div class="card-body d-flex flex-column">
+            <h5 class="card-title">甘特圖快照管理</h5>
+            <div class="row g-2 mb-2 align-items-end">
+              <div class="col-auto">
+                <label class="form-label mb-0" style="font-size:0.9rem;">載入快照</label>
+                <select
+                  v-model="selectedSnapshotDate"
+                  class="form-select form-select-sm"
+                  style="width:auto;"
+                >
+                  <option value="">(當前最新)</option>
+                  <option
+                    v-for="snap in snapshots"
+                    :key="snap.date"
+                    :value="snap.date"
+                  >
+                    {{ snap.date }} ({{ snap.created_at || 'unknown' }})
+                  </option>
+                </select>
+              </div>
+              <div class="col-auto">
+                <button
+                  class="btn btn-sm btn-primary"
+                  @click="loadSnapshot"
+                >
+                  載入
+                </button>
+              </div>
+            </div>
+
+            <div class="d-flex flex-wrap gap-2 mt-auto">
+              <button
+                class="btn btn-sm btn-success"
+                @click="createSnapshot"
+              >
+                建立今日快照
+              </button>
+              <button
+                class="btn btn-sm btn-danger"
+                v-if="selectedSnapshotDate"
+                @click="deleteSnapshot"
+              >
+                刪除此快照
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 工具列：假日設定、新增任務、清空任務、重新分配ID -->
+    <div class="toolbar-section d-flex flex-wrap gap-2 mb-3">
+      <button
+        class="btn btn-secondary btn-sm"
+        @click="showHolidaysModal = true"
+      >
+        管理假日設定
       </button>
 
-      <!-- 版本快照 下拉 / 新增 -->
-      <div class="d-flex align-items-center" style="gap: 0.5rem;">
-        <label>Snapshot:</label>
-        <select
-          v-model="selectedSnapshot"
-          @change="loadSnapshot"
-          class="form-select form-select-sm"
-          style="width:auto;"
-        >
-          <option value="">(Latest)</option>
-          <option
-            v-for="(snap, idx) in snapshots"
-            :key="idx"
-            :value="snap.date"
-          >
-            {{ snap.date }} (created {{ snap.created_at ? snap.created_at.substring(0,16) : '' }})
-          </option>
-        </select>
-      </div>
-
-      <button class="btn btn-info btn-sm" @click="createSnapshot">
-        Save Snapshot
+      <button
+        class="btn btn-primary btn-sm"
+        @click="onAddTask"
+      >
+        新增任務
       </button>
 
-      <!-- Zoom 選擇 -->
-      <div class="d-flex align-items-center" style="gap: 0.5rem;">
-        <label>Zoom:</label>
-        <select
-          v-model="activeZoomLevel"
-          @change="applyZoomLevel"
-          class="form-select form-select-sm"
-          style="width:auto;"
-        >
-          <option
-            v-for="z in zoomConfigs"
-            :key="z.name"
-            :value="z.name"
-          >
-            {{ z.name }}
-          </option>
-        </select>
-      </div>
+      <button
+        class="btn btn-danger btn-sm"
+        @click="clearAllTasks"
+      >
+        清空所有任務
+      </button>
 
-      <!-- Prev / Next Day -->
-      <div class="btn-group">
-        <button class="btn btn-outline-secondary btn-sm" @click="shiftDate(-1)">Prev Day</button>
-        <button class="btn btn-outline-secondary btn-sm" @click="shiftDate(1)">Next Day</button>
-      </div>
-
-      <!-- Go to Date -->
-      <div class="d-flex align-items-center">
-        <label for="gotoDate" class="me-1">Go to:</label>
-        <input
-          type="date"
-          id="gotoDate"
-          v-model="gotoDateStr"
-          class="form-control form-control-sm"
-          style="width:auto;"
-          @change="jumpToDate"
-        />
-      </div>
-
-      <!-- 假日管理 -->
-      <button class="btn btn-warning btn-sm" @click="openHolidayModal">
-        Manage Holidays
+      <!-- ★ 新增重新分配 ID 按鈕 -->
+      <button
+        class="btn btn-warning btn-sm"
+        @click="reassignAllTaskIds"
+      >
+        重新分配任務ID
       </button>
     </div>
 
-    <!-- Gantt 容器，撐滿剩餘空間 -->
-    <div id="gantt_here" style="flex:1; width:100%;"></div>
+    <!-- 甘特圖本體 -->
+    <div
+      class="gantt-container border rounded"
+      style="height: calc(100vh - 320px); overflow: hidden;"
+      v-if="tasksLoaded"
+    >
+      <template v-if="tasks.length > 0">
+        <GanttElastic
+          :tasks="tasks"
+          :options="ganttOptions"
+          @chart-task-click="onTaskClick"
+          style="width: 100%; height: 100%;"
+        >
+          <template #header>
+            <GanttElasticHeader2 />
+          </template>
+        </GanttElastic>
+      </template>
+      <template v-else>
+        <div class="p-3 text-center text-muted">
+          目前沒有任何任務。
+        </div>
+      </template>
+    </div>
+    <div v-else class="text-center p-5 text-muted">
+      載入任務資料中...
+    </div>
 
-    <!-- 建立每日快照手動輸入日期 Modal -->
+    <!-- [Modal] 任務編輯/新增 -->
     <div
       class="modal"
-      :class="{ fade: true, show: showSnapshotModal }"
-      :style="{ display: showSnapshotModal ? 'block' : 'none' }"
+      :class="{ fade: true, show: showEditTaskModal }"
+      :style="{ display: showEditTaskModal ? 'block' : 'none' }"
       tabindex="-1"
       role="dialog"
       aria-modal="true"
-      @click.self="closeSnapshotModal"
+      v-if="showEditTaskModal"
     >
-      <div class="modal-dialog" role="document">
+      <div class="modal-dialog modal-lg" role="document">
         <div class="modal-content p-3">
-          <h5>建立每日快照</h5>
-          <label for="snapDate">Snapshot Date:</label>
-          <input
-            type="date"
-            id="snapDate"
-            v-model="tempSnapDate"
-            class="form-control"
+          <GanttTaskForm
+            :projectId="projectIdNum"
+            :snapshotDate="selectedSnapshotDate"
+            :task="currentEditTask"
+            @cancel="closeEditTaskModal"
+            @saved="onTaskSaved"
           />
-          <div class="mt-3 d-flex justify-content-end">
-            <button class="btn btn-secondary me-2" @click="closeSnapshotModal">
-              Cancel
-            </button>
-            <button class="btn btn-primary" @click="confirmSnapshotDate">
-              OK
-            </button>
-          </div>
         </div>
       </div>
     </div>
-    <div v-if="showSnapshotModal" class="modal-backdrop fade show"></div>
+    <div
+      v-if="showEditTaskModal"
+      class="modal-backdrop fade show"
+    ></div>
 
-    <!-- 假日管理 Modal -->
+    <!-- [Modal] 假日設定 -->
     <div
       class="modal"
-      :class="{ fade: true, show: showHolidayModal }"
-      :style="{ display: showHolidayModal ? 'block' : 'none' }"
+      :class="{ fade: true, show: showHolidaysModal }"
+      :style="{ display: showHolidaysModal ? 'block' : 'none' }"
       tabindex="-1"
       role="dialog"
       aria-modal="true"
-      @click.self="closeHolidayModal"
+      v-if="showHolidaysModal"
+      @click.self="showHolidaysModal = false"
     >
       <div class="modal-dialog" role="document">
-        <div class="modal-content p-3">
-          <h5>Holidays &amp; Workday Settings</h5>
-          <div class="mb-3">
-            <label class="form-label">Workdays / week:</label>
-            <input
-              type="number"
-              v-model.number="holidaySettings.workdays_per_week"
-              class="form-control"
-              min="1"
-              max="7"
-            />
+        <div class="modal-content">
+          <div class="modal-header">
+            <h5 class="modal-title">假日 / 工作日設定</h5>
+            <button
+              type="button"
+              class="btn-close"
+              @click="showHolidaysModal = false"
+            ></button>
           </div>
-          <div class="mb-3">
-            <label class="form-label">
-              指定哪幾天是工作日 (0=Sun,1=Mon,...6=Sat)：
-            </label>
-            <p class="small text-muted">
-              如空陣列則改用上方 workdays_per_week 的舊機制；
-              若這裡有填任何數字，則優先以此為準。
-            </p>
-            <div
-              v-for="(dw, idx) in holidaySettings.workday_weekdays"
-              :key="'dw_'+idx"
-              class="d-flex align-items-center mb-1"
-            >
-              <input
-                type="number"
-                class="form-control form-control-sm me-2"
-                v-model.number="holidaySettings.workday_weekdays[idx]"
-                min="0"
-                max="6"
-              />
-              <button class="btn btn-danger btn-sm" @click="removeWorkdayWeekday(idx)">X</button>
+          <div class="modal-body">
+            <div v-if="holidayData">
+              <div class="mb-3">
+                <label class="form-label">專案假日 (以逗號分隔)</label>
+                <textarea
+                  rows="2"
+                  class="form-control form-control-sm"
+                  v-model="holidayData.holidaysStr"
+                  placeholder="e.g. 2025-01-01,2025-02-10"
+                ></textarea>
+              </div>
+              <div class="mb-3">
+                <label class="form-label">特別工作日</label>
+                <textarea
+                  rows="2"
+                  class="form-control form-control-sm"
+                  v-model="holidayData.specialWorkdaysStr"
+                  placeholder="e.g. 2025-02-11"
+                ></textarea>
+              </div>
+              <div class="mb-3">
+                <label class="form-label">每週工作天數 (1-7)</label>
+                <input
+                  type="number"
+                  min="1"
+                  max="7"
+                  class="form-control form-control-sm"
+                  v-model.number="holidayData.workdays_per_week"
+                />
+              </div>
+              <div class="mb-3">
+                <label class="form-label">工作日對應星期幾 (0=日,1=一,...)</label>
+                <input
+                  type="text"
+                  class="form-control form-control-sm"
+                  v-model="holidayData.workday_weekdaysStr"
+                  placeholder="e.g. 1,2,3,4,5"
+                />
+              </div>
             </div>
-            <button class="btn btn-secondary btn-sm" @click="addWorkdayWeekday">+ Add Day</button>
+            <div v-else class="text-muted">
+              載入中...
+            </div>
           </div>
-
-          <div class="mb-3">
-            <label class="form-label">Holidays (YYYY-MM-DD):</label>
-            <div
-              v-for="(h, idx) in holidaySettings.holidays"
-              :key="'hol_'+idx"
-              class="d-flex align-items-center mb-1"
+          <div class="modal-footer">
+            <button
+              class="btn btn-secondary btn-sm"
+              @click="showHolidaysModal = false"
             >
-              <input
-                type="text"
-                v-model="holidaySettings.holidays[idx]"
-                class="form-control form-control-sm me-2"
-              />
-              <button class="btn btn-danger btn-sm" @click="removeHoliday(idx)">X</button>
-            </div>
-            <button class="btn btn-secondary btn-sm" @click="addHoliday">+ Add Holiday</button>
-          </div>
-
-          <div class="mb-3">
-            <label class="form-label">Special Workdays:</label>
-            <p class="small text-muted">(若週末或假日也算工作日，可在此輸入特例日期)</p>
-            <div
-              v-for="(sw, idx) in holidaySettings.special_workdays"
-              :key="'sw_'+idx"
-              class="d-flex align-items-center mb-1"
-            >
-              <input
-                type="text"
-                v-model="holidaySettings.special_workdays[idx]"
-                class="form-control form-control-sm me-2"
-              />
-              <button class="btn btn-danger btn-sm" @click="removeSpecialWorkday(idx)">X</button>
-            </div>
-            <button class="btn btn-secondary btn-sm" @click="addSpecialWorkday">
-              + Add Special Workday
+              取消
             </button>
-          </div>
-
-          <div class="mt-3 d-flex justify-content-end">
-            <button class="btn btn-secondary me-2" @click="closeHolidayModal">
-              Cancel
-            </button>
-            <button class="btn btn-primary" @click="saveHolidays">
-              Save
+            <button
+              class="btn btn-primary btn-sm"
+              @click="updateHolidays"
+            >
+              儲存設定
             </button>
           </div>
         </div>
       </div>
     </div>
-    <div v-if="showHolidayModal" class="modal-backdrop fade show"></div>
+    <div
+      v-if="showHolidaysModal"
+      class="modal-backdrop fade show"
+    ></div>
   </div>
 </template>
 
 <script>
-import { onMounted, onBeforeUnmount, ref, computed } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
+import { ref, onMounted } from 'vue'
+import { useRoute } from 'vue-router'
 import axios from 'axios'
-// dhtmlx-gantt
-import { gantt } from 'dhtmlx-gantt'
-import 'dhtmlx-gantt/codebase/dhtmlxgantt.css'
+import { GanttElastic, GanttElasticHeader2 } from 'gantt-elastic-wrapvue3'
+import GanttTaskForm from '@/components/GanttTaskForm.vue'
+import 'gantt-elastic-wrapvue3/dist/style.css'
 
 export default {
   name: 'ProjectsGanttView',
+  components: {
+    GanttElastic,
+    GanttElasticHeader2,
+    GanttTaskForm
+  },
   setup() {
     const route = useRoute()
-    const router = useRouter()
-    const projectId = computed(() => Number(route.params.projectId))
+    const projectId = route.params.projectId || ''
+    const projectIdNum = Number(projectId)
 
-    // 假日管理
-    const showHolidayModal = ref(false)
-    const holidaySettings = ref({
-      project_id: projectId.value,
-      holidays: [],
-      workdays_per_week: 5,
-      workday_weekdays: [],       // 新增欄位
-      special_workdays: []
+    const projectInfo = ref(null)
+
+    const tasks = ref([])
+    const tasksLoaded = ref(false)
+
+    const snapshots = ref([])
+    const selectedSnapshotDate = ref('')
+
+    const holidayData = ref(null)
+    const showHolidaysModal = ref(false)
+
+    const showEditTaskModal = ref(false)
+    const currentEditTask = ref(null)
+
+    onMounted(() => {
+      fetchProjectInfo()
+      fetchTasks()
+      fetchSnapshots()
+      fetchHolidays()
     })
 
-    // 版本快照
-    const snapshots = ref([])
-    const selectedSnapshot = ref('') // 空 = 最新
-
-    // Modal: 建立 snapshot
-    const showSnapshotModal = ref(false)
-    const tempSnapDate = ref('')
-
-    // Gantt 是否已初始化
-    let ganttInited = false
-
-    // Zoom configs
-    const zoomConfigs = [
-      {
-        name: 'hour',
-        scale_height: 60,
-        min_column_width: 50,
-        scales: [
-          { unit: 'day', step: 1, format: '%Y-%m-%d' },
-          { unit: 'hour', step: 1, format: '%H:%i' }
-        ]
-      },
-      {
-        name: 'day',
-        scale_height: 60,
-        min_column_width: 70,
-        scales: [
-          { unit: 'day', step: 1, format: '%Y-%m-%d' }
-        ]
-      },
-      {
-        name: 'week',
-        scale_height: 50,
-        min_column_width: 50,
-        scales: [
-          { unit: 'week', step: 1, format: 'Week %W, %Y' },
-          { unit: 'day', step: 1, format: '%D' }
-        ]
-      },
-      {
-        name: 'month',
-        scale_height: 50,
-        min_column_width: 70,
-        scales: [
-          { unit: 'month', step: 1, format: '%Y %M' },
-          { unit: 'week', step: 1, format: 'Week %W' }
-        ]
-      },
-      {
-        name: 'quarter',
-        scale_height: 50,
-        min_column_width: 90,
-        scales: [
-          { unit: 'month', step: 1, format: '%M' },
-          { unit: 'quarter', step: 1, format: 'Q%q' }
-        ]
-      },
-      {
-        name: 'year',
-        scale_height: 50,
-        min_column_width: 80,
-        scales: [
-          { unit: 'year', step: 1, format: '%Y' }
-        ]
-      }
-    ]
-    const activeZoomLevel = ref('month')  // 預設
-
-    // Go to date
-    const gotoDateStr = ref('')
-
-    function initGantt() {
-      if (ganttInited) return
-      ganttInited = true
-
-      // 讓欄位可用滑鼠 resize
-      gantt.config.layout = {
-        css: "gantt_container",
-        rows: [
-          {
-            cols: [
-              {
-                view: "grid",
-                scrollX: "gridScroll",
-                scrollY: "scrollVer",
-                scrollable: true,
-                config: {
-                  columns: [
-                    {
-                      name: "text",
-                      label: "Task Name",
-                      tree: true,
-                      width: 250,    // 預設寬度大一些
-                      resize: true   // 可用滑鼠拖曳調整
-                    },
-                    {
-                      name: "start_date",
-                      label: "Start",
-                      align: "center",
-                      width: 120,
-                      resize: true
-                    },
-                    {
-                      name: "end_date",
-                      label: "End",
-                      align: "center",
-                      width: 120,
-                      resize: true
-                    },
-                    {
-                      name: "duration",
-                      label: "Dur.",
-                      align: "center",
-                      width: 50,
-                      resize: true
-                    },
-                    { name: "add", label: "", width: 44 }
-                  ]
-                }
-              },
-              { view: "scrollbar", id: "gridScroll" },
-              {
-                view: "timeline",
-                scrollX: "scrollHor",
-                scrollY: "scrollVer"
-              },
-              { view: "scrollbar", id: "scrollVer" },
-              { view: "scrollbar", id: "scrollHor", height: 20 }
-            ]
-          }
-        ]
-      }
-
-      gantt.config.date_format = '%Y-%m-%d'
-      gantt.config.drag_move = true
-      gantt.config.drag_resize = true
-      gantt.config.drag_progress = true
-      gantt.config.prevent_default_scroll = true
-      // 使用 altKey 來水平捲動
-      gantt.config.horizontal_scroll_key = 'altKey'
-
-      // 自定 scale cell class
-      gantt.templates.scale_cell_class = (date) => {
-        const ymd = formatDateToYMD(date)
-        if (holidaySettings.value.holidays.includes(ymd)) {
-          return 'weekend'
-        }
-        return ''
-      }
-      gantt.templates.timeline_cell_class = (item, date) => {
-        const ymd = formatDateToYMD(date)
-        if (holidaySettings.value.holidays.includes(ymd)) {
-          return 'weekend'
-        }
-        return ''
-      }
-
-      // 綁定 CRUD 事件
-      gantt.attachEvent('onAfterTaskAdd', async (id, item) => {
-        if (selectedSnapshot.value) {
-          alert('Cannot modify a historical snapshot.')
-          gantt.deleteTask(id)
-          return
-        }
-        try {
-          const newId = await createTaskInServer(item)
-          if (newId) {
-            gantt.changeTaskId(id, newId)
-          }
-        } catch (err) {
-          console.error(err)
-          gantt.deleteTask(id)
-        }
-      })
-
-      gantt.attachEvent('onAfterTaskUpdate', async (id, item) => {
-        if (selectedSnapshot.value) {
-          alert('Cannot modify a historical snapshot.')
-          loadTasks()
-          return
-        }
-        try {
-          await updateTaskInServer(item)
-        } catch (err) {
-          console.error(err)
-          loadTasks()
-        }
-      })
-
-      gantt.attachEvent('onAfterTaskDelete', async (id, item) => {
-        if (selectedSnapshot.value) {
-          alert('Cannot modify a historical snapshot.')
-          loadTasks()
-          return
-        }
-        try {
-          await deleteTaskInServer(id)
-        } catch (err) {
-          console.error(err)
-          loadTasks()
-        }
-      })
-
-      gantt.init('gantt_here')
-      gantt.plugins({ zoom: true })
-      applyZoomLevel()
-    }
-
-    // 後端 CRUD
-    async function createTaskInServer(item) {
-      const startDateYMD = formatDateToYMD(item.start_date)
-      const endDateYMD = item.end_date ? formatDateToYMD(item.end_date) : null
-      const payload = {
-        text: item.text,
-        start_date: startDateYMD,
-        duration: item.duration || 1,
-        progress: item.progress || 0,
-        parent_id: item.parent || null
-      }
-      if (endDateYMD) {
-        payload.end_date = endDateYMD
-      }
-      const { data } = await axios.post(`/api/projects/${projectId.value}/gantt/tasks`, payload)
-      return data.task_id
-    }
-    async function updateTaskInServer(item) {
-      const startDateYMD = formatDateToYMD(item.start_date)
-      const endDateYMD = item.end_date ? formatDateToYMD(item.end_date) : null
-      const payload = {
-        text: item.text,
-        start_date: startDateYMD,
-        duration: item.duration,
-        progress: item.progress || 0,
-        parent_id: item.parent || null
-      }
-      if (endDateYMD) {
-        payload.end_date = endDateYMD
-      }
-      await axios.put(`/api/projects/${projectId.value}/gantt/tasks/${item.id}`, payload)
-    }
-    async function deleteTaskInServer(taskId) {
-      await axios.delete(`/api/projects/${projectId.value}/gantt/tasks/${taskId}`)
-    }
-
-    // 載入 Tasks
-    async function loadTasks() {
+    async function fetchProjectInfo() {
       try {
-        const params = {}
-        if (selectedSnapshot.value) {
-          params.snapshot_date = selectedSnapshot.value
-        }
-        const { data } = await axios.get(`/api/projects/${projectId.value}/gantt/tasks`, { params })
-        gantt.clearAll()
-        gantt.parse({ data })
+        const { data } = await axios.get(`/api/projects/${projectIdNum}`)
+        projectInfo.value = data
       } catch (err) {
-        console.error(err)
-        alert('Load tasks failed.')
+        console.error('fetchProjectInfo error:', err)
       }
     }
 
-    // Snapshot
-    async function loadSnapshotsList() {
+    async function fetchTasks(snapshotDate = '') {
+      tasksLoaded.value = false
       try {
-        const { data } = await axios.get(`/api/projects/${projectId.value}/gantt/snapshots`)
+        const url = snapshotDate
+          ? `/api/projects/${projectIdNum}/gantt/tasks?snapshot_date=${snapshotDate}`
+          : `/api/projects/${projectIdNum}/gantt/tasks`
+        const { data } = await axios.get(url)
+        tasks.value = convertTasks(data)
+      } catch (err) {
+        console.error('fetchTasks error:', err)
+        tasks.value = []
+      } finally {
+        tasksLoaded.value = true
+      }
+    }
+
+    async function fetchSnapshots() {
+      try {
+        const { data } = await axios.get(`/api/projects/${projectIdNum}/gantt/snapshots`)
         snapshots.value = data
       } catch (err) {
-        console.error(err)
-      }
-    }
-    function loadSnapshot() {
-      loadTasks()
-    }
-    function createSnapshot() {
-      showSnapshotModal.value = true
-      tempSnapDate.value = ''
-    }
-    function closeSnapshotModal() {
-      showSnapshotModal.value = false
-    }
-    async function confirmSnapshotDate() {
-      closeSnapshotModal()
-      const body = {}
-      if (tempSnapDate.value) {
-        body.snapshot_date = tempSnapDate.value
-      }
-      try {
-        const { data } = await axios.post(`/api/projects/${projectId.value}/gantt/snapshots`, body)
-        alert(`Snapshot created for ${data.snapshot_date}`)
-        loadSnapshotsList()
-      } catch (err) {
-        console.error(err)
-        alert('Create snapshot failed.')
+        console.error('fetchSnapshots error:', err)
       }
     }
 
-    // 假日
     async function fetchHolidays() {
       try {
-        const { data } = await axios.get(`/api/projects/${projectId.value}/gantt/holidays`)
-        holidaySettings.value = data
+        const { data } = await axios.get(`/api/projects/${projectIdNum}/gantt/holidays`)
+        holidayData.value = transformHolidayData(data)
       } catch (err) {
-        console.error(err)
+        console.error('fetchHolidays error:', err)
       }
     }
-    function openHolidayModal() {
-      showHolidayModal.value = true
+
+    function convertTasks(rawList) {
+      return rawList.map(item => {
+        const progressPercent = item.progress ? Math.round(item.progress * 100) : 0
+        return {
+          id: Number(item.id),
+          label: item.text || 'NoTitle',
+          start: parseDateStartOfDay(item.start_date),
+          end: parseDateEndOfDay(item.end_date),
+          progress: progressPercent,
+          parentId: item.parent_id || item.parent || null,
+          dependentOn: item.depends || [],
+          type: item.type || 'task'  // 新增對 type 的處理
+        }
+      })
     }
-    function closeHolidayModal() {
-      showHolidayModal.value = false
+
+    function parseDateStartOfDay(str) {
+      if (!str) {
+        const now = new Date()
+        now.setHours(0, 0, 0, 0)
+        return now.getTime()
+      }
+      const dateStr = `${str}T00:00:00`
+      const d = new Date(dateStr)
+      return isNaN(d.getTime()) ? new Date().setHours(0,0,0,0) : d.getTime()
     }
-    function addWorkdayWeekday() {
-      holidaySettings.value.workday_weekdays.push(1) // 預設 push 一個
+
+    function parseDateEndOfDay(str) {
+      if (!str) {
+        const now = new Date()
+        now.setHours(23, 59, 59, 999)
+        return now.getTime()
+      }
+      const dateStr = `${str}T23:59:59.999`
+      const d = new Date(dateStr)
+      return isNaN(d.getTime()) ? new Date().setHours(23,59,59,999) : d.getTime()
     }
-    function removeWorkdayWeekday(idx) {
-      holidaySettings.value.workday_weekdays.splice(idx, 1)
+
+    function transformHolidayData(raw) {
+      const cloned = { ...raw }
+      cloned.holidaysStr = (cloned.holidays || []).join(',')
+      cloned.specialWorkdaysStr = (cloned.special_workdays || []).join(',')
+      cloned.workday_weekdaysStr = (cloned.workday_weekdays || []).join(',')
+      return cloned
     }
-    function addHoliday() {
-      holidaySettings.value.holidays.push('')
+
+    function loadSnapshot() {
+      fetchTasks(selectedSnapshotDate.value)
     }
-    function removeHoliday(idx) {
-      holidaySettings.value.holidays.splice(idx, 1)
-    }
-    function addSpecialWorkday() {
-      holidaySettings.value.special_workdays.push('')
-    }
-    function removeSpecialWorkday(idx) {
-      holidaySettings.value.special_workdays.splice(idx, 1)
-    }
-    async function saveHolidays() {
+
+    async function createSnapshot() {
+      if (!confirm('確定要建立今天的 Gantt 快照嗎？')) return
       try {
-        await axios.put(`/api/projects/${projectId.value}/gantt/holidays`, holidaySettings.value)
-        alert('Holidays updated!')
-        closeHolidayModal()
-        applyHolidaysToGantt()
+        const { data } = await axios.post(
+          `/api/projects/${projectIdNum}/gantt/snapshots`,
+          {}
+        )
+        alert(`已建立快照：${data.snapshot_date}`)
+        fetchSnapshots()
       } catch (err) {
-        console.error(err)
-        alert('Save holiday failed.')
+        console.error('createSnapshot error:', err)
       }
     }
-    function applyHolidaysToGantt() {
-      // 先全部 unset
-      gantt.unsetWorkTime({ day: "fullweek" })
-      // ★ 若 workday_weekdays 有指定 => 以它為主
-      if (holidaySettings.value.workday_weekdays && holidaySettings.value.workday_weekdays.length) {
-        // 先全部關，再針對指定的 weekday 開放
-        holidaySettings.value.workday_weekdays.forEach(dw => {
-          gantt.setWorkTime({ day: dw, hours: "full" })
-        })
-      } else {
-        // 沒指定 => 用舊的 workdays_per_week 邏輯
-        // 先全開(0~6)
-        gantt.setWorkTime({ day: [0,1,2,3,4,5,6] })
-        // 如果 workdays_per_week=5 => 關 Sat(6), Sun(0)
-        // 如果=6 => 關 Sun(0)
-        // 依原本簡化寫法
-        if (holidaySettings.value.workdays_per_week === 5) {
-          gantt.setWorkTime({ day: 0, hours: false })
-          gantt.setWorkTime({ day: 6, hours: false })
-        } else if (holidaySettings.value.workdays_per_week === 6) {
-          gantt.setWorkTime({ day: 0, hours: false })
-        }
+
+    async function deleteSnapshot() {
+      if (!selectedSnapshotDate.value) return
+      if (!confirm(`確定要刪除 ${selectedSnapshotDate.value} 的快照？`)) return
+      try {
+        await axios.delete(
+          `/api/projects/${projectIdNum}/gantt/snapshots/${selectedSnapshotDate.value}`
+        )
+        alert('已刪除。')
+        selectedSnapshotDate.value = ''
+        fetchSnapshots()
+        fetchTasks('')
+      } catch (err) {
+        console.error('deleteSnapshot error:', err)
       }
-      // 逐一關 holidays
-      holidaySettings.value.holidays.forEach(h => {
-        const d = parseYMD(h)
-        if (d) {
-          gantt.setWorkTime({ date: d, hours: false })
+    }
+
+    async function updateHolidays() {
+      if (!holidayData.value) return
+      try {
+        const body = {
+          project_id: projectIdNum,
+          holidays: parseStringToArr(holidayData.value.holidaysStr),
+          special_workdays: parseStringToArr(holidayData.value.specialWorkdaysStr),
+          workdays_per_week: holidayData.value.workdays_per_week || 5,
+          workday_weekdays: parseNumArr(holidayData.value.workday_weekdaysStr)
         }
-      })
-      // special_workdays => 打開
-      holidaySettings.value.special_workdays.forEach(sw => {
-        const d = parseYMD(sw)
-        if (d) {
-          gantt.setWorkTime({ date: d, hours: "full" })
-        }
-      })
-      gantt.render()
-    }
-
-    // Zoom
-    function applyZoomLevel() {
-      gantt.ext.zoom.init({
-        levels: zoomConfigs,
-        useKey: 'shiftKey',
-        trigger: 'wheel'
-      })
-      gantt.ext.zoom.setLevel(activeZoomLevel.value)
-    }
-    function shiftDate(delta) {
-      const state = gantt.getState()
-      const shiftTime = 24 * 60 * 60 * 1000 * delta
-      const newMin = new Date(state.min_date.getTime() + shiftTime)
-      const newMax = new Date(state.max_date.getTime() + shiftTime)
-      gantt.ext.zoom.setDateRange(newMin, newMax)
-    }
-    function jumpToDate() {
-      if (!gotoDateStr.value) return
-      const d = parseYMD(gotoDateStr.value)
-      if (!d) return
-      const state = gantt.getState()
-      const range = state.max_date - state.min_date
-      const halfRange = range / 2
-      const newMin = new Date(d.getTime() - halfRange)
-      const newMax = new Date(d.getTime() + halfRange)
-      gantt.ext.zoom.setDateRange(newMin, newMax)
-    }
-
-    // 工具
-    function formatDateToYMD(dateVal) {
-      if (!(dateVal instanceof Date)) return ''
-      const year = dateVal.getFullYear()
-      const month = String(dateVal.getMonth() + 1).padStart(2, '0')
-      const day = String(dateVal.getDate()).padStart(2, '0')
-      return `${year}-${month}-${day}`
-    }
-    function parseYMD(ymd) {
-      if (!ymd) return null
-      const parts = ymd.split('-')
-      if (parts.length !== 3) return null
-      const [y, m, d] = parts
-      return new Date(Number(y), Number(m) - 1, Number(d))
-    }
-
-    function goBack() {
-      router.go(-1)
-    }
-
-    onMounted(async () => {
-      initGantt()
-      await loadTasks()
-      await loadSnapshotsList()
-      await fetchHolidays()
-      applyHolidaysToGantt()
-    })
-
-    onBeforeUnmount(() => {
-      if (ganttInited) {
-        gantt.clearAll()
-        gantt.detachAllEvents()
-        ganttInited = false
+        await axios.put(`/api/projects/${projectIdNum}/gantt/holidays`, body)
+        alert('假日設定已更新！')
+        showHolidaysModal.value = false
+      } catch (err) {
+        console.error('updateHolidays error:', err)
       }
-    })
+    }
+
+    function parseStringToArr(str) {
+      if (!str) return []
+      return str.split(',').map(s => s.trim()).filter(Boolean)
+    }
+    function parseNumArr(str) {
+      if (!str) return []
+      return str.split(',').map(x => parseInt(x.trim(), 10)).filter(n => !isNaN(n))
+    }
+
+    function onAddTask() {
+      currentEditTask.value = {}
+      showEditTaskModal.value = true
+    }
+
+    async function clearAllTasks() {
+      if (!confirm('確定要清空當前顯示的所有任務嗎？')) return
+      try {
+        let url = `/api/projects/${projectIdNum}/gantt/tasks/clear`
+        if (selectedSnapshotDate.value) {
+          url += `?snapshot_date=${selectedSnapshotDate.value}`
+        }
+        const res = await axios.delete(url)
+        alert(res.data.message || '已清空完成')
+        loadSnapshot()
+      } catch (err) {
+        console.error('clearAllTasks error:', err)
+        alert('清空失敗：請查看 console log')
+      }
+    }
+
+    // ★ 新增：重新分配ID
+    async function reassignAllTaskIds() {
+      if (!confirm('確定要重新分配任務ID？這將影響到所有任務的ID。')) return
+      try {
+        let url = `/api/projects/${projectIdNum}/gantt/tasks/reassign-ids`
+        if (selectedSnapshotDate.value) {
+          url += `?snapshot_date=${selectedSnapshotDate.value}`
+        }
+        await axios.post(url)
+        alert('重新分配ID完成!')
+        loadSnapshot()
+      } catch (err) {
+        console.error('reassignAllTaskIds error:', err)
+        alert('操作失敗')
+      }
+    }
+
+    function onTaskClick({ data }) {
+      currentEditTask.value = data
+      showEditTaskModal.value = true
+    }
+
+    function closeEditTaskModal() {
+      showEditTaskModal.value = false
+      currentEditTask.value = null
+    }
+
+    function onTaskSaved() {
+      showEditTaskModal.value = false
+      currentEditTask.value = null
+      loadSnapshot()
+    }
+
+    const ganttOptions = {
+      title: {
+        label: `Project #${projectIdNum} Gantt`,
+        html: false
+      },
+      taskList: {
+        columns: [
+          { id: 'col-id', label: 'ID', value: 'id', width: 40 },
+          {
+            id: 'col-label',
+            label: '任務',
+            value: 'label',
+            width: 180,
+            expander: true
+          },
+          {
+            id: 'col-type',
+            label: 'Type',
+            value: 'type',   // ★ 顯示 type
+            width: 80
+          },
+          {
+            id: 'col-start',
+            label: '開始',
+            value: task => formatDate(task.start),
+            width: 90
+          },
+          {
+            id: 'col-end',
+            label: '結束',
+            value: task => formatDate(task.end),
+            width: 90
+          },
+          {
+            id: 'col-progress',
+            label: '進度(%)',
+            value: 'progress',
+            width: 80
+          }
+        ]
+      },
+      chart: {
+        progress: { bar: true },
+        expander: { display: true }
+      },
+      scales: [
+        {
+          time: 'day',
+          step: 1,
+          name: 'Day',
+          format: 'YYYY-MM-DD'
+        }
+      ],
+      autoScale: false,
+      minScale: 'day',
+      maxScale: 'day',
+      defaultZoom: 'day'
+    }
+
+    function formatDate(ts) {
+      if (!ts) return ''
+      const d = new Date(ts)
+      const yyyy = d.getFullYear()
+      const mm = String(d.getMonth() + 1).padStart(2, '0')
+      const dd = String(d.getDate()).padStart(2, '0')
+      return `${yyyy}-${mm}-${dd}`
+    }
 
     return {
-      projectId,
-
-      // snapshot
+      projectInfo,
+      tasks,
+      tasksLoaded,
       snapshots,
-      selectedSnapshot,
+      selectedSnapshotDate,
+      holidayData,
+      showHolidaysModal,
+      showEditTaskModal,
+      currentEditTask,
+
+      projectId,
+      projectIdNum,
+
       loadSnapshot,
-
-      // create snapshot modal
-      showSnapshotModal,
-      tempSnapDate,
       createSnapshot,
-      closeSnapshotModal,
-      confirmSnapshotDate,
-
-      // holiday
-      showHolidayModal,
-      holidaySettings,
-      openHolidayModal,
-      closeHolidayModal,
-      addWorkdayWeekday,
-      removeWorkdayWeekday,
-      addHoliday,
-      removeHoliday,
-      addSpecialWorkday,
-      removeSpecialWorkday,
-      saveHolidays,
-      applyHolidaysToGantt,
-
-      // zoom
-      zoomConfigs,
-      activeZoomLevel,
-      applyZoomLevel,
-      shiftDate,
-      gotoDateStr,
-      jumpToDate,
-
-      // nav
-      goBack
+      deleteSnapshot,
+      updateHolidays,
+      onAddTask,
+      clearAllTasks,
+      reassignAllTaskIds,
+      onTaskClick,
+      closeEditTaskModal,
+      onTaskSaved,
+      ganttOptions
     }
   }
 }
 </script>
 
 <style scoped>
-.weekend {
-  background-color: #f2dede !important;
+.projects-gantt-view {
 }
 
-/* modal backdrop */
+.gantt-container {
+  background-color: #fff;
+}
+
+.modal {
+  z-index: 1050;
+}
 .modal-backdrop {
   z-index: 1040;
 }
-.modal {
-  z-index: 1050;
+
+.toolbar-section > * {
+  margin-right: 0.5rem;
+  margin-bottom: 0.5rem;
 }
 </style>
 
@@ -8049,10 +6172,5 @@ requirements.txt
 Flask==3.1.0
 Flask-PyMongo==3.0.1
 pymongo==4.11.0
-# 其他你可能需要的套件（openpyxl、gunicorn、requests 等）
 openpyxl==3.1.5
 gunicorn==23.0.0
-requests==2.32.3
-# ...依照專案實際需要增加
-
-# Vue前端的建置不在此列舉：Vite/node_modules 由 npm/yarn 管理

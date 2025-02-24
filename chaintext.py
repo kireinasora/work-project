@@ -89,7 +89,8 @@ def combine_python_files():
             if (file.lower().endswith(allowed_extensions) or 
                 file == 'Dockerfile') and (
                 file != 'chaintext.py' and 
-                file != 'combined_code.txt'):
+                file != 'combined_code.txt' and
+                file != 'package-lock.json'):
                 
                 file_path = os.path.join(root, file)
                 file_path = file_path.replace('\\', '/')

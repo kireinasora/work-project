@@ -6,7 +6,7 @@ from datetime import datetime, date, timedelta
 from typing import Dict, Any, Optional, List
 from bson.objectid import ObjectId
 
-from backend.db import mongo, get_next_sequence
+from backend.db import mongo, get_next_sequence, parse_date_str, normalize_progress, find_all_and_format, find_one_or_404
 
 logger = logging.getLogger(__name__)
 
@@ -19,13 +19,14 @@ def get_all_tasks_for_project(project_id: int):
     """
     查詢當前最新資料(不含版本快照)的 tasks。
     """
-    cursor = mongo.db["gantt_tasks"].find({"project_id": project_id})
-    tasks = []
-    for doc in cursor:
-        formatted = _format_task_doc(doc)
-        if formatted is not None:
-            tasks.append(formatted)
-    return tasks
+    def format_task(doc):
+        return _format_task_doc(doc)
+    
+    return find_all_and_format(
+        collection="gantt_tasks",
+        query={"project_id": project_id},
+        formatter=format_task
+    )
 
 
 def create_gantt_task(data: Dict[str, Any], snapshot_date_str: str = "") -> int:
@@ -51,9 +52,9 @@ def create_gantt_task(data: Dict[str, Any], snapshot_date_str: str = "") -> int:
     if not start_date_str:
         raise ValueError("Must provide start_date")
 
-    start_dt = _parse_date_str(start_date_str, default_date_str="2025-01-01")
+    start_dt = parse_date_str(start_date_str, default_date_str="2025-01-01")
     if end_date_str:
-        end_dt = _parse_date_str(end_date_str, default_date_str=None)  # None代表就用start+1
+        end_dt = parse_date_str(end_date_str, default_date_str=None)  # None代表就用start+1
         if end_dt is None:
             end_dt = start_dt + timedelta(days=1)
     else:
@@ -72,16 +73,19 @@ def create_gantt_task(data: Dict[str, Any], snapshot_date_str: str = "") -> int:
         end_dt = start_dt
 
     # progress
-    progress_val = _normalize_progress(progress)
+    progress_val = normalize_progress(progress)
 
     # 如果是 snapshot 模式 => 先讀出 tasks array，再 in-memory 新增
     if snapshot_date_str:
-        snap_doc = mongo.db["gantt_snapshots"].find_one({
-            "project_id": project_id,
-            "snapshot_date": snapshot_date_str
-        })
-        if not snap_doc:
-            raise ValueError(f"Snapshot not found for {snapshot_date_str}")
+        # 使用 find_one_or_404 函數查詢
+        snap_doc = find_one_or_404(
+            "gantt_snapshots",
+            {
+                "project_id": project_id,
+                "snapshot_date": snapshot_date_str
+            },
+            f"Snapshot not found for {snapshot_date_str}"
+        )
 
         tasks_list = snap_doc.get("tasks", [])
 
@@ -158,12 +162,14 @@ def update_gantt_task(task_id: int, data: Dict[str, Any], snapshot_date_str: str
 
     if snapshot_date_str:
         # 更新快照 in memory
-        snap = mongo.db["gantt_snapshots"].find_one({
-            "project_id": project_id,
-            "snapshot_date": snapshot_date_str
-        })
-        if not snap:
-            raise KeyError("Snapshot not found")
+        snap = find_one_or_404(
+            "gantt_snapshots",
+            {
+                "project_id": project_id,
+                "snapshot_date": snapshot_date_str
+            },
+            "Snapshot not found"
+        )
 
         tasks_list = snap.get("tasks", [])
         # 找到該task
@@ -182,7 +188,7 @@ def update_gantt_task(task_id: int, data: Dict[str, Any], snapshot_date_str: str
             updated_doc["text"] = data["text"]
 
         if progress is not None:
-            updated_doc["progress"] = _normalize_progress(progress)
+            updated_doc["progress"] = normalize_progress(progress)
 
         if parent_id is not None:
             updated_doc["parent_id"] = parent_id
@@ -191,16 +197,16 @@ def update_gantt_task(task_id: int, data: Dict[str, Any], snapshot_date_str: str
             updated_doc["depends"] = depends
 
         # start/end/duration
-        old_start = _parse_date_str(updated_doc.get("start_date", ""), "2025-01-01")
-        old_end = _parse_date_str(updated_doc.get("end_date", ""), None)
+        old_start = parse_date_str(updated_doc.get("start_date", ""), "2025-01-01")
+        old_end = parse_date_str(updated_doc.get("end_date", ""), None)
         if start_date_str or end_date_str or duration is not None:
             start_dt = old_start
             end_dt = old_end if old_end else (old_start + timedelta(days=1))
 
             if start_date_str:
-                start_dt = _parse_date_str(start_date_str, "2025-01-01")
+                start_dt = parse_date_str(start_date_str, "2025-01-01")
             if end_date_str:
-                end_dt = _parse_date_str(end_date_str, None)
+                end_dt = parse_date_str(end_date_str, None)
                 if end_dt is None:
                     end_dt = start_dt + timedelta(days=1)
             elif duration is not None:
@@ -222,7 +228,7 @@ def update_gantt_task(task_id: int, data: Dict[str, Any], snapshot_date_str: str
             updated_doc["type"] = task_type
             # 如果是 milestone, 要強制同一天
             if task_type == "milestone":
-                sdt = _parse_date_str(updated_doc["start_date"], "2025-01-01")
+                sdt = parse_date_str(updated_doc["start_date"], "2025-01-01")
                 updated_doc["end_date"] = sdt.date().isoformat()
 
         updated_doc["updated_at"] = datetime.now()
@@ -240,9 +246,12 @@ def update_gantt_task(task_id: int, data: Dict[str, Any], snapshot_date_str: str
 
     else:
         # 更新 DB
-        doc = mongo.db["gantt_tasks"].find_one({"id": task_id, "project_id": project_id})
-        if not doc:
-            raise KeyError("Task not found")
+        # 使用 find_one_or_404 函數查詢
+        doc = find_one_or_404(
+            "gantt_tasks", 
+            {"id": task_id, "project_id": project_id},
+            "Task not found"
+        )
 
         update_fields = {}
 
@@ -250,7 +259,7 @@ def update_gantt_task(task_id: int, data: Dict[str, Any], snapshot_date_str: str
             update_fields["text"] = data["text"]
 
         if progress is not None:
-            update_fields["progress"] = _normalize_progress(progress)
+            update_fields["progress"] = normalize_progress(progress)
 
         if parent_id is not None:
             update_fields["parent_id"] = parent_id
@@ -259,17 +268,17 @@ def update_gantt_task(task_id: int, data: Dict[str, Any], snapshot_date_str: str
 
         old_start_str = doc.get("start_date", "")
         old_end_str = doc.get("end_date", "")
-        old_start_dt = _parse_date_str(old_start_str, "2025-01-01")
-        old_end_dt = _parse_date_str(old_end_str, None)
+        old_start_dt = parse_date_str(old_start_str, "2025-01-01")
+        old_end_dt = parse_date_str(old_end_str, None)
 
         if start_date_str or end_date_str or duration is not None:
             start_dt = old_start_dt
             end_dt = old_end_dt if old_end_dt else (old_start_dt + timedelta(days=1))
 
             if start_date_str:
-                start_dt = _parse_date_str(start_date_str, "2025-01-01")
+                start_dt = parse_date_str(start_date_str, "2025-01-01")
             if end_date_str:
-                end_dt = _parse_date_str(end_date_str, None)
+                end_dt = parse_date_str(end_date_str, None)
                 if end_dt is None:
                     end_dt = start_dt + timedelta(days=1)
             elif duration is not None:
@@ -289,7 +298,7 @@ def update_gantt_task(task_id: int, data: Dict[str, Any], snapshot_date_str: str
         if task_type:
             update_fields["type"] = task_type
             if task_type == "milestone":
-                sdt = _parse_date_str(update_fields.get("start_date") or old_start_str, "2025-01-01")
+                sdt = parse_date_str(update_fields.get("start_date") or old_start_str, "2025-01-01")
                 update_fields["end_date"] = sdt.date().isoformat()
 
         update_fields["updated_at"] = datetime.now()
@@ -310,12 +319,14 @@ def delete_gantt_task(project_id: int, task_id: int, snapshot_date_str: str = ""
              否則在 DB 中刪
     """
     if snapshot_date_str:
-        snap = mongo.db["gantt_snapshots"].find_one({
-            "project_id": project_id,
-            "snapshot_date": snapshot_date_str
-        })
-        if not snap:
-            raise KeyError("Snapshot not found")
+        snap = find_one_or_404(
+            "gantt_snapshots",
+            {
+                "project_id": project_id,
+                "snapshot_date": snapshot_date_str
+            },
+            "Snapshot not found"
+        )
 
         tasks_list = snap.get("tasks", [])
         new_tasks_list = []
@@ -389,25 +400,30 @@ def _calc_duration(start_date_iso, end_date_iso):
 # --------------------------------------------------------------------------
 
 def get_gantt_snapshots_for_project(project_id: int):
-    cursor = mongo.db["gantt_snapshots"].find(
-        {"project_id": project_id},
-        sort=[("snapshot_date", 1)]
+    return find_all_and_format(
+        collection="gantt_snapshots",
+        query={"project_id": project_id},
+        sort_key="snapshot_date",
+        sort_order=1
     )
-    return list(cursor)
 
 
 def get_specific_snapshot(project_id: int, snapshot_date_str: str):
-    snap = mongo.db["gantt_snapshots"].find_one({
-        "project_id": project_id,
-        "snapshot_date": snapshot_date_str
-    })
-    return snap
+    return find_one_or_404(
+        "gantt_snapshots",
+        {
+            "project_id": project_id,
+            "snapshot_date": snapshot_date_str
+        },
+        f"Snapshot not found for date {snapshot_date_str}"
+    )
 
 
 def create_daily_snapshot(project_id: int, snap_date: date) -> str:
     """
     建立該日期的快照(若已存在則擲錯)。
     """
+    # 檢查是否已存在相同日期的快照
     exists = mongo.db["gantt_snapshots"].find_one({
         "project_id": project_id,
         "snapshot_date": snap_date.isoformat()
@@ -457,8 +473,7 @@ def delete_gantt_snapshot(project_id: int, snapshot_date_str: str) -> bool:
 # --------------------------------------------------------------------------
 
 def get_holiday_settings(project_id: int) -> Optional[dict]:
-    doc = mongo.db["gantt_holidays"].find_one({"project_id": project_id})
-    return doc
+    return mongo.db["gantt_holidays"].find_one({"project_id": project_id})
 
 
 def update_holiday_settings(project_id: int, data: Dict[str, Any]):
@@ -596,8 +611,8 @@ def _calc_parent_fields(child_tasks: List[dict], parent_type: str):
     max_end = None
     total_progress = 0.0
     for c in child_tasks:
-        s = _parse_date_str(c.get("start_date", ""), "2025-01-01")
-        e = _parse_date_str(c.get("end_date", ""), "2025-01-02")
+        s = parse_date_str(c.get("start_date", ""), "2025-01-01")
+        e = parse_date_str(c.get("end_date", ""), "2025-01-02")
         p = c.get("progress", 0.0)
         if min_start is None or s < min_start:
             min_start = s
@@ -640,12 +655,15 @@ def reassign_task_ids(project_id: int, snapshot_date_str: str = ""):
     從1開始連號，建議依照「無 parent 的排在前面(可能有多個樹根)，再 BFS or DFS 排子」。
     """
     if snapshot_date_str:
-        snap = mongo.db["gantt_snapshots"].find_one({
-            "project_id": project_id,
-            "snapshot_date": snapshot_date_str
-        })
-        if not snap:
-            raise ValueError(f"Snapshot not found for {snapshot_date_str}")
+        snap = find_one_or_404(
+            "gantt_snapshots",
+            {
+                "project_id": project_id,
+                "snapshot_date": snapshot_date_str
+            },
+            f"Snapshot not found for {snapshot_date_str}"
+        )
+        
         tasks_list = snap.get("tasks", [])
         new_tasks_list = _reassign_ids_in_memory(tasks_list)
         # 寫回
@@ -760,31 +778,5 @@ def _reassign_ids_in_memory(tasks_list: List[dict]) -> List[dict]:
 # 工具函式
 # --------------------------------------------------------------------------
 
-def _parse_date_str(date_str: str, default_date_str: Optional[str]) -> Optional[datetime]:
-    """
-    將 'YYYY-MM-DD' parse 成 datetime(YYYY,MM,DD) (無時間)
-    若失敗或空 => 若 default_date_str 不為 None 就用 default_date_str; 否則回傳 None
-    """
-    if not date_str:
-        if default_date_str is not None:
-            return datetime.strptime(default_date_str, "%Y-%m-%d")
-        return None
-    try:
-        return datetime.strptime(date_str, "%Y-%m-%d")
-    except ValueError:
-        if default_date_str is not None:
-            return datetime.strptime(default_date_str, "%Y-%m-%d")
-        return None
-
-
-def _normalize_progress(progress):
-    # 確保介於 0 ~ 1
-    try:
-        p = float(progress)
-    except:
-        p = 0.0
-    if math.isnan(p) or p < 0:
-        p = 0.0
-    if p > 1:
-        p = 1.0
-    return p
+# 已將 _parse_date_str 和 _normalize_progress 移至 backend/db.py 作為共用函數
+# 現在使用 db 模組中的 parse_date_str 和 normalize_progress

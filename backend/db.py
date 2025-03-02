@@ -6,6 +6,7 @@ from flask import Flask
 from flask_pymongo import PyMongo
 from bson.objectid import ObjectId
 from pymongo.errors import DuplicateKeyError, ConfigurationError, ConnectionFailure
+from datetime import datetime
 
 mongo = PyMongo()
 
@@ -103,3 +104,85 @@ def to_iso_datetime(dt):
     if not dt:
         return None
     return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def parse_date_str(date_str: str, default_date_str: str = None):
+    """
+    將 'YYYY-MM-DD' parse 成 datetime(YYYY,MM,DD) (無時間)
+    若失敗或空 => 若 default_date_str 不為 None 就用 default_date_str; 否則回傳 None
+    """
+    if not date_str:
+        if default_date_str is not None:
+            return datetime.strptime(default_date_str, "%Y-%m-%d")
+        return None
+    try:
+        return datetime.strptime(date_str, "%Y-%m-%d")
+    except ValueError:
+        if default_date_str is not None:
+            return datetime.strptime(default_date_str, "%Y-%m-%d")
+        return None
+
+
+def normalize_progress(progress):
+    """
+    將 progress 值正規化為 0.0 到 1.0 之間的浮點數。
+    """
+    # 確保介於 0 ~ 1
+    try:
+        p = float(progress)
+        import math
+        if math.isnan(p) or p < 0:
+            p = 0.0
+        if p > 1:
+            p = 1.0
+        return p
+    except:
+        return 0.0
+
+
+def find_all_and_format(collection, query=None, sort_key="id", sort_order=1, projection=None, formatter=None):
+    """
+    通用查詢函數，用於查詢集合並返回格式化結果。
+    
+    參數:
+        collection: 集合名稱，如 'projects', 'staff' 等
+        query: 查詢條件，默認為 {}
+        sort_key: 排序欄位，默認為 'id'
+        sort_order: 排序方向，1 為升序，-1 為降序
+        projection: 投影，指定要返回的欄位，默認為 None
+        formatter: 格式化函數，用於處理每個文檔，默認為 None
+    
+    返回:
+        格式化後的結果列表
+    """
+    query = query or {}
+    cursor = mongo.db[collection].find(query, projection).sort([(sort_key, sort_order)])
+    
+    results = []
+    for doc in cursor:
+        if formatter:
+            doc = formatter(doc)
+        results.append(doc)
+    
+    return results
+
+
+def find_one_or_404(collection, query, error_msg=None):
+    """
+    查詢單個文檔，如果不存在則拋出 404 錯誤。
+    
+    參數:
+        collection: 集合名稱，如 'projects', 'staff' 等
+        query: 查詢條件
+        error_msg: 當文檔不存在時的錯誤訊息
+    
+    返回:
+        文檔對象
+    """
+    from flask import abort
+    
+    doc = mongo.db[collection].find_one(query)
+    if not doc:
+        abort(404, description=error_msg or f"Document not found in {collection}")
+    
+    return doc

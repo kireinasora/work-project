@@ -1,301 +1,489 @@
 <template>
-    <div class="material-form-container">
-      <h1>Material Submission Form</h1>
-  
-      <div class="form-card">
-        <form @submit.prevent="handleSubmit">
-  
-          <!-- Special Fields (工程編號、工程名稱、文件編號) -->
-          <div
-            v-for="(info, fieldName) in specialFields"
-            :key="fieldName"
-            class="form-group"
-          >
-            <label :for="fieldName" class="form-label">
-              {{ fieldName }}:
-            </label>
+  <div class="container my-4">
+    <h2>Documents of Project #{{ projectId }}</h2>
+
+    <!-- ★ Tabs -->
+    <ul class="nav nav-tabs mb-3">
+      <li class="nav-item" v-for="tab in docTypeTabs" :key="tab.value">
+        <a
+          href="#"
+          class="nav-link"
+          :class="{ active: activeTab === tab.value }"
+          @click.prevent="activeTab = tab.value"
+        >
+          {{ tab.label }}
+        </a>
+      </li>
+    </ul>
+
+    <!-- 若為 DAILY_REPORT => 顯示日報 -->
+    <div v-if="activeTab === 'DAILY_REPORT'">
+      <h4>Daily Reports</h4>
+
+      <!-- 多選下載: XLSX / PDF(表1) / PDF(表2) -->
+      <div class="d-flex justify-content-between mb-2">
+        <div v-if="dailyReports.length > 0">
+          <div class="form-check form-check-inline">
             <input
-              type="text"
-              :id="fieldName"
-              v-model="formData[fieldName]"
-              class="form-input"
-            />
-          </div>
-  
-          <hr />
-  
-          <!-- Regular Fields (報批之材料、牌子(如有)、預算表之項目編號、型號、貨期、數量) -->
-          <div
-            v-for="(item, i) in regularFields"
-            :key="i"
-            class="form-group"
-          >
-            <label :for="item[0]" class="form-label">
-              {{ item[0] }}:
-            </label>
-            <input
-              type="text"
-              :id="item[0]"
-              v-model="formData[item[0]]"
-              class="form-input"
-            />
-          </div>
-  
-          <hr />
-  
-          <!-- Material Type Checkboxes -->
-          <h3>Material Type</h3>
-          <div
-            v-for="(box, i) in materialTypeCheckboxes"
-            :key="i"
-            class="checkbox-group"
-          >
-            <input
+              class="form-check-input"
               type="checkbox"
-              :id="box[0]"
-              v-model="formData[box[0]]"
+              id="selectAllDiaries"
+              :checked="isAllSelected"
+              @change="toggleSelectAll"
             />
-            <label :for="box[0]" class="checkbox-label">
-              {{ box[0] }}
-            </label>
+            <label class="form-check-label" for="selectAllDiaries">Select All</label>
           </div>
-  
-          <hr />
-  
-          <!-- Material Status Checkboxes -->
-          <h3>Material Status</h3>
-          <div
-            v-for="(box, i) in materialStatusCheckboxes"
-            :key="i"
-            class="checkbox-group"
+          <button
+            class="btn btn-primary btn-sm"
+            :disabled="selectedDiaryIds.length === 0"
+            @click="downloadMultiple('xlsx')"
           >
-            <input
-              type="checkbox"
-              :id="box[0]"
-              v-model="formData[box[0]]"
-            />
-            <label :for="box[0]" class="checkbox-label">
-              {{ box[0] }}
-            </label>
-          </div>
-  
-          <hr />
-  
-          <!-- Attachment Type -->
-          <h3>Attachment Type</h3>
-          <div class="form-group">
-            <label for="附件" class="form-label">附件:</label>
-            <input
-              type="text"
-              id="附件"
-              v-model="formData['附件']"
-              class="form-input"
-            />
-          </div>
-          <div
-            v-for="(box, i) in attachmentTypeCheckboxes"
-            :key="i"
-            class="checkbox-group"
+            XLSX
+          </button>
+          <button
+            class="btn btn-primary btn-sm ms-1"
+            :disabled="selectedDiaryIds.length === 0"
+            @click="downloadMultiple('sheet1')"
           >
-            <input
-              type="checkbox"
-              :id="box[0]"
-              v-model="formData[box[0]]"
+            PDF (Sheet1)
+          </button>
+          <button
+            class="btn btn-primary btn-sm ms-1"
+            :disabled="selectedDiaryIds.length === 0"
+            @click="downloadMultiple('sheet2')"
+          >
+            PDF (Sheet2)
+          </button>
+        </div>
+        <button
+          class="btn btn-success btn-sm"
+          @click="openCreateDiary"
+        >
+          + New Daily Report
+        </button>
+      </div>
+
+      <!-- Diary Table -->
+      <table class="table table-sm table-bordered">
+        <thead>
+          <tr>
+            <th style="width:40px;">
+              <input
+                type="checkbox"
+                :checked="isAllSelected"
+                @change="toggleSelectAll"
+                class="form-check-input"
+              />
+            </th>
+            <th>ID</th>
+            <th>Date</th>
+            <th>Weather(M)</th>
+            <th>Weather(N)</th>
+            <th>Day#</th>
+            <th>Updated</th>
+            <th>Edit</th>
+            <th>Del</th>
+            <th>Download</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr
+            v-for="dr in dailyReports"
+            :key="dr.id"
+            :class="rowClass(dr)"
+          >
+            <td>
+              <input
+                type="checkbox"
+                class="form-check-input"
+                :value="dr.id"
+                v-model="selectedDiaryIds"
+              />
+            </td>
+            <td>{{ dr.id }}</td>
+            <td>{{ dr.report_date }}</td>
+            <td>{{ dr.weather_morning }}</td>
+            <td>{{ dr.weather_noon }}</td>
+            <td>{{ dr.day_count }}</td>
+            <td>{{ dr.updated_at }}</td>
+            <td>
+              <button
+                class="btn btn-warning btn-sm"
+                @click="editDiary(dr.id)"
+              >
+                Edit
+              </button>
+            </td>
+            <td>
+              <button
+                class="btn btn-danger btn-sm"
+                @click="deleteDiary(dr.id)"
+              >
+                Del
+              </button>
+            </td>
+            <td>
+              <div class="btn-group btn-group-sm">
+                <button
+                  class="btn btn-outline-primary"
+                  @click="downloadSingle(dr.id, 'xlsx')"
+                >
+                  XLSX
+                </button>
+                <button
+                  class="btn btn-outline-primary"
+                  @click="downloadSingle(dr.id, 'sheet1')"
+                >
+                  PDF1
+                </button>
+                <button
+                  class="btn btn-outline-primary"
+                  @click="downloadSingle(dr.id, 'sheet2')"
+                >
+                  PDF2
+                </button>
+              </div>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- 其他 doc_type 省略... -->
+
+    <!-- (略) 新增文件 Modal ... -->
+
+    <!-- 日報用的 Modal (Create/Edit) -->
+    <div
+      class="modal"
+      :class="{ fade: true, show: showDiaryModal }"
+      :style="{ display: showDiaryModal ? 'block' : 'none' }"
+      tabindex="-1"
+      role="dialog"
+      aria-modal="true"
+      v-if="showDiaryModal"
+      @click.self="closeDiaryModal"
+    >
+      <div class="modal-dialog modal-xl" role="document">
+        <div class="modal-content">
+          <div class="modal-body">
+            <DailyReportForm
+              :projectId="Number(projectId)"
+              :editingId="editingDiaryId"
+              @saved="onDiarySaved"
+              @cancel="closeDiaryModal"
             />
-            <label :for="box[0]" class="checkbox-label">
-              {{ box[0] }}
-            </label>
           </div>
-  
-          <hr />
-  
-          <!-- 日期與檔案名稱 -->
-          <div class="form-group">
-            <label for="日期" class="form-label">日期:</label>
-            <input
-              type="date"
-              id="日期"
-              v-model="formData['日期']"
-              class="form-input"
-            />
-          </div>
-  
-          <div class="form-group">
-            <label for="檔案名稱" class="form-label">檔案名稱:</label>
-            <input
-              type="text"
-              id="檔案名稱"
-              v-model="formData['檔案名稱']"
-              class="form-input"
-            />
-          </div>
-  
-          <button type="submit" class="btn-submit">Generate Excel</button>
-        </form>
+        </div>
       </div>
     </div>
-  </template>
-  
-  <script>
-  import axios from 'axios'
-  
-  export default {
-    name: 'MaterialFormView',
-    data() {
-      return {
-        // 前端資料物件：包含所有要傳給後端的欄位
-        formData: {
-          '工程編號': '',
-          '工程名稱': '',
-          '文件編號': '',
-          '報批之材料': '',
-          '牌子(如有)': '',
-          '預算表之項目編號': '',
-          '型號': '',
-          '貨期': '',
-          '數量': '',
-          // Material Type
-          '結構': false,
-          '供水': false,
-          '建築': false,
-          '電氣': false,
-          '排水': false,
-          '其他': false,
-          // Material Status
-          '與設計相同': false,
-          '與標書相同': false,
-          '與後加工程建議書相同': false,
-          '同等質量': false,
-          '替換材料': false,
-          '原設計沒有指定': false,
-          // Attachment
-          '附件': '',
-          // Attachment Type
-          '樣板': false,
-          '目錄': false,
-          '來源證': false,
-          '其他(附件)': false, // 避免和 Material Type 的 '其他' 混淆，可稍微改個 key
-          // 日期、檔案名稱
-          '日期': new Date().toISOString().split('T')[0],
-          '檔案名稱': ''
-        },
-  
-        // specialFields: 與後端 constants.py 中的 special_fields 相對應
-        specialFields: {
-          '工程編號': [6,2,4,'37/2024/DVPS'],
-          '工程名稱': [7,2,4,'黑沙馬路行人道優化工程(第二期)'],
-          '文件編號': [6,8,8,'']
-        },
-  
-        // regularFields: 與後端 constants.py 中的 regular_fields 相對應
-        regularFields: [
-          ['報批之材料', 11, 3],
-          ['牌子(如有)', 12, 3],
-          ['預算表之項目編號', 11, 7],
-          ['型號', 12, 6],
-          ['貨期', 13, 6],
-          ['數量', 14, 6]
-        ],
-  
-        // materialTypeCheckboxes: 與後端 constants.py 中的 material_type_checkboxes 相對應
-        materialTypeCheckboxes: [
-          ['結構', 7, 6],
-          ['供水', 8, 6],
-          ['建築', 7, 8],
-          ['電氣', 8, 8],
-          ['排水', 7, 10],
-          ['其他', 8, 10]
-        ],
-  
-        // materialStatusCheckboxes: 與後端 constants.py 中的 material_status_checkboxes 相對應
-        materialStatusCheckboxes: [
-          ['與設計相同', 13, 1],
-          ['與標書相同', 14, 1],
-          ['與後加工程建議書相同', 15, 1],
-          ['同等質量', 16, 1],
-          ['替換材料', 17, 1],
-          ['原設計沒有指定', 18, 1]
-        ],
-  
-        // attachmentTypeCheckboxes: 與後端 constants.py 中的 attachment_type_checkboxes 相對應
-        attachmentTypeCheckboxes: [
-          ['樣板', 16, 5],
-          ['目錄', 17, 5],
-          ['來源證', 16, 7],
-          ['其他(附件)', 17, 7]
-        ]
-      }
-    },
-    methods: {
-      async handleSubmit() {
-        try {
-          // 將前端 formData 傳給後端 /api/material-submission
-          const response = await axios.post('/api/material-submission', this.formData, {
-            responseType: 'blob'
-          })
-          // 下載後端回傳的 Excel 檔
-          const fileURL = window.URL.createObjectURL(new Blob([response.data]))
-          const fileLink = document.createElement('a')
-          fileLink.href = fileURL
-          const filename = this.formData['檔案名稱'] || '材料報批表_filled.xlsx'
-          fileLink.setAttribute(
-            'download',
-            filename.endsWith('.xlsx') ? filename : filename + '.xlsx'
-          )
-          document.body.appendChild(fileLink)
-          fileLink.click()
-          fileLink.remove()
-        } catch (err) {
-          console.error('下載發生錯誤', err)
-        }
+    <div
+      v-if="showDiaryModal"
+      class="modal-backdrop fade show"
+    ></div>
+
+    <!-- SSE 下載進度 (自動下載) -->
+    <div
+      class="modal"
+      :class="{ fade: true, show: showProgress }"
+      :style="{ display: showProgress ? 'block' : 'none' }"
+      tabindex="-1"
+      role="dialog"
+      aria-modal="true"
+      v-if="showProgress"
+    >
+      <div class="modal-dialog" role="document">
+        <div class="modal-content">
+          <div class="modal-header">
+            <h5>Export Progress</h5>
+            <button
+              type="button"
+              class="btn-close"
+              @click="closeProgressModal"
+            ></button>
+          </div>
+          <div class="modal-body">
+            <div v-if="exportError" class="alert alert-danger">
+              {{ exportError }}
+            </div>
+            <div v-else-if="exportDone" class="alert alert-success">
+              Done! (Auto-Download triggered)
+            </div>
+            <p v-else>Processing... {{ exportProgress }}%</p>
+            <div class="progress mb-2">
+              <div
+                class="progress-bar"
+                role="progressbar"
+                :style="{ width: exportProgress + '%' }"
+                aria-valuemin="0"
+                aria-valuemax="100"
+              >
+                {{ exportProgress }}%
+              </div>
+            </div>
+          </div>
+          <div
+            class="modal-footer"
+            v-if="exportDone || exportError"
+          >
+            <button
+              class="btn btn-secondary"
+              @click="closeProgressModal"
+            >
+              Close
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div
+      v-if="showProgress"
+      class="modal-backdrop fade show"
+    ></div>
+
+    <!-- ★ 用於自動點擊下載的隱藏連結 -->
+    <a ref="hiddenDownloadLink" style="display:none;"></a>
+  </div>
+</template>
+
+<script>
+import axios from 'axios'
+import { ref, computed, onMounted } from 'vue'
+import { useRoute } from 'vue-router'
+import DailyReportForm from '@/components/SiteDiaryForm.vue'
+
+export default {
+  name: 'MaterialFormView',
+  components: {
+    DailyReportForm
+  },
+  setup() {
+    const route = useRoute()
+    const projectId = route.params.projectId
+
+    const docTypeTabs = [
+      { label: 'DRAWING', value: 'DRAWING' },
+      { label: 'MAT', value: 'MAT' },
+      { label: 'LETTER', value: 'LETTER' },
+      { label: 'DAILY_REPORT', value: 'DAILY_REPORT' }
+    ]
+    const activeTab = ref('DAILY_REPORT')
+
+    const dailyReports = ref([])
+    const selectedDiaryIds = ref([])
+    const editingDiaryId = ref(0)
+    const showDiaryModal = ref(false)
+
+    const showProgress = ref(false)
+    const exportProgress = ref(0)
+    const exportDone = ref(false)
+    const exportError = ref('')
+    const exportDownloadUrl = ref('')
+
+    // ★ 用於自動下載
+    const hiddenDownloadLink = ref(null)
+
+    let evtSrc = null
+
+    function fetchDailyReports() {
+      axios
+        .get('/api/documents/daily-reports', {
+          params: { project_id: projectId }
+        })
+        .then(res => {
+          dailyReports.value = res.data
+          selectedDiaryIds.value = []
+        })
+        .catch(err => console.error(err))
+    }
+
+    function openCreateDiary() {
+      editingDiaryId.value = 0
+      showDiaryModal.value = true
+    }
+    function editDiary(id) {
+      editingDiaryId.value = id
+      showDiaryModal.value = true
+    }
+    function deleteDiary(id) {
+      if (!confirm('Delete?')) return
+      axios
+        .delete(`/api/documents/daily-reports/${id}?project_id=${projectId}`)
+        .then(() => {
+          fetchDailyReports()
+        })
+        .catch(err => console.error(err))
+    }
+    function closeDiaryModal() {
+      showDiaryModal.value = false
+    }
+    function onDiarySaved() {
+      showDiaryModal.value = false
+      fetchDailyReports()
+    }
+
+    function rowClass(d) {
+      return selectedDiaryIds.value.includes(d.id) ? 'table-active' : ''
+    }
+    const isAllSelected = computed(() => {
+      return (
+        dailyReports.value.length > 0 &&
+        selectedDiaryIds.value.length === dailyReports.value.length
+      )
+    })
+    function toggleSelectAll() {
+      if (isAllSelected.value) {
+        selectedDiaryIds.value = []
+      } else {
+        selectedDiaryIds.value = dailyReports.value.map(x => x.id)
       }
     }
+
+    function downloadMultiple(fileType) {
+      if (selectedDiaryIds.value.length === 0) {
+        alert('No diaries selected.')
+        return
+      }
+      showProgress.value = true
+      exportProgress.value = 0
+      exportDone.value = false
+      exportError.value = ''
+      exportDownloadUrl.value = ''
+
+      axios
+        .post('/api/documents/daily-report/multi_download_async', {
+          project_id: Number(projectId),
+          diary_ids: selectedDiaryIds.value,
+          file_type: fileType
+        })
+        .then(resp => {
+          const job_id = resp.data.job_id
+          if (!job_id) {
+            console.error('[DEBUG] No job_id returned from multi_download_async.')
+            throw new Error('No job_id returned.')
+          }
+
+          evtSrc = new EventSource(`/api/documents/daily-report/progress-sse/${job_id}`)
+          evtSrc.onopen = () => {
+            console.log('[DEBUG] SSE connection opened. job_id=', job_id)
+          }
+          evtSrc.onmessage = evt => {
+            try {
+              const data = JSON.parse(evt.data)
+              exportProgress.value = data.progress || 0
+
+              if (data.status === 'done') {
+                exportDone.value = true
+                exportProgress.value = 100
+                const dlUrl = `/api/documents/daily-report/multi_download_result?job_id=${job_id}`
+                exportDownloadUrl.value = dlUrl
+                // ★ 自動觸發下載
+                autoDownload(dlUrl)
+                if (evtSrc) {
+                  evtSrc.close()
+                  evtSrc = null
+                }
+              } else if (data.status === 'error') {
+                exportError.value = data.error_msg || 'Unknown Error'
+                if (evtSrc) {
+                  evtSrc.close()
+                  evtSrc = null
+                }
+              }
+            } catch (parseErr) {
+              console.error('[DEBUG] SSE parse error:', parseErr)
+            }
+          }
+          evtSrc.onerror = e => {
+            console.error('[DEBUG] SSE onerror:', e)
+            exportError.value = 'SSE Connection Error'
+            if (evtSrc) {
+              evtSrc.close()
+              evtSrc = null
+            }
+          }
+        })
+        .catch(err => {
+          console.error('[DEBUG] downloadMultiple error:', err)
+          exportError.value = String(err)
+        })
+    }
+
+    function autoDownload(url) {
+      if (!hiddenDownloadLink.value) return
+      hiddenDownloadLink.value.href = url
+      // 不指定 download filename，後端 Content-Disposition 會帶檔名
+      hiddenDownloadLink.value.download = ''
+      hiddenDownloadLink.value.click()
+    }
+
+    function downloadSingle(id, fileType) {
+      const url = `/api/documents/daily-report/${id}/download?project_id=${projectId}&file_type=${fileType}`
+      window.open(url, '_blank')
+    }
+
+    function closeProgressModal() {
+      showProgress.value = false
+      exportProgress.value = 0
+      exportDone.value = false
+      exportError.value = ''
+      exportDownloadUrl.value = ''
+      if (evtSrc) {
+        evtSrc.close()
+        evtSrc = null
+      }
+    }
+
+    onMounted(() => {
+      if (activeTab.value === 'DAILY_REPORT') {
+        fetchDailyReports()
+      }
+    })
+
+    return {
+      projectId,
+      docTypeTabs,
+      activeTab,
+
+      dailyReports,
+      selectedDiaryIds,
+      editingDiaryId,
+      showDiaryModal,
+      isAllSelected,
+      rowClass,
+
+      openCreateDiary,
+      editDiary,
+      deleteDiary,
+      closeDiaryModal,
+      onDiarySaved,
+
+      downloadMultiple,
+      downloadSingle,
+
+      toggleSelectAll,
+
+      showProgress,
+      exportProgress,
+      exportDone,
+      exportError,
+      exportDownloadUrl,
+      closeProgressModal,
+
+      hiddenDownloadLink
+    }
   }
-  </script>
-  
-  <style scoped>
-  .material-form-container {
-    max-width: 600px;
-    margin: 0 auto;
-  }
-  .form-card {
-    background: #f9f9f9;
-    padding: 1rem 1.5rem;
-    border-radius: 8px;
-    border: 1px solid #ccc;
-  }
-  .form-group {
-    margin-bottom: 1rem;
-  }
-  .form-label {
-    display: inline-block;
-    width: 120px;
-    font-weight: bold;
-    margin-right: 0.5rem;
-  }
-  .form-input {
-    width: calc(100% - 130px);
-    padding: 6px;
-    border: 1px solid #ccc;
-    border-radius: 4px;
-  }
-  .checkbox-group {
-    margin-bottom: 0.5rem;
-  }
-  .checkbox-label {
-    margin-left: 6px;
-  }
-  .btn-submit {
-    margin-top: 20px;
-    padding: 8px 16px;
-    background: #646cff;
-    color: #fff;
-    border: none;
-    border-radius: 4px;
-    cursor: pointer;
-  }
-  .btn-submit:hover {
-    background: #535bf2;
-  }
-  </style>
-  
+}
+</script>
+
+<style scoped>
+.table-active {
+  background-color: #f0f8ff !important;
+}
+.modal {
+  z-index: 1050;
+}
+.modal-backdrop {
+  z-index: 1040;
+}
+</style>

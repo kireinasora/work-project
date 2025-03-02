@@ -182,47 +182,59 @@ export default {
     const localReportDateStr = ref('')
     const staffList = ref([])
 
+    // 載入全部 staff
     const fetchStaff = async () => {
       try {
+        console.log("[DEBUG] fetchStaff => GET /api/staff")
         const { data } = await axios.get('/api/staff')
         staffList.value = data
       } catch (err) {
-        console.error(err)
+        console.error('[DEBUG] fetchStaff error:', err)
       }
     }
 
+    // 讀取全部日報 -> 找到指定 diaryId 的那一筆 (以 /api/documents/daily-reports)
     const fetchExistingDiary = async () => {
       if (!props.diaryId) return
       try {
-        const { data } = await axios.get(`/api/projects/${props.projectId}/site_diaries`)
+        console.log(`[DEBUG] fetchExistingDiary => GET /api/documents/daily-reports?project_id=${props.projectId}`)
+        const { data } = await axios.get('/api/documents/daily-reports', {
+          params: { project_id: props.projectId }
+        })
         const target = data.find(d => d.id === props.diaryId)
-        if (!target) return
-        setFormDataFromDiary(target)
+        if (target) {
+          setFormDataFromDiary(target)
+        } else {
+          console.log('[DEBUG] fetchExistingDiary => No matching diary found in daily-reports list.')
+        }
       } catch (err) {
-        console.error(err)
+        console.error('[DEBUG] fetchExistingDiary error:', err)
       }
     }
 
+    // 若想自動帶最後一筆，可在此撈清單後 pick 最後:
     const fetchLastDiaryAsDefault = async () => {
       if (props.diaryId) return
       try {
-        const { data } = await axios.get(
-          `/api/projects/${props.projectId}/site_diaries/last`
-        )
-        if (!data.id) {
-          // 無資料，不做預設
-          return
+        console.log(`[DEBUG] fetchLastDiaryAsDefault => GET /api/documents/daily-reports?project_id=${props.projectId}`)
+        const { data } = await axios.get('/api/documents/daily-reports', {
+          params: { project_id: props.projectId }
+        })
+        if (data.length > 0) {
+          // 以 id 最大者視為最後一筆
+          const sorted = data.slice().sort((a, b) => b.id - a.id)
+          const lastOne = sorted[0]
+          setFormDataFromDiary(lastOne)
+        } else {
+          console.log('[DEBUG] fetchLastDiaryAsDefault => no diaries found, skipping default fill')
         }
-        setFormDataFromDiary(data)
       } catch (err) {
-        console.error(err)
+        console.error('[DEBUG] fetchLastDiaryAsDefault error:', err)
       }
     }
 
     function setFormDataFromDiary(diaryData) {
-      // 報表日期
       localReportDateStr.value = diaryData.report_date || ''
-      // Weather, summary, day_count
       formData.value.weather_morning = diaryData.weather_morning || ''
       formData.value.weather_noon = diaryData.weather_noon || ''
       formData.value.day_count = diaryData.day_count || null
@@ -230,20 +242,22 @@ export default {
 
       // Workers
       const updatedWorkers = { ...initialFormData.workers }
-      for (const w of diaryData.workers || []) {
-        updatedWorkers[w.type] = w.quantity
+      const wObj = diaryData.workers || {}
+      for (const k of Object.keys(updatedWorkers)) {
+        updatedWorkers[k] = wObj[k] || 0
       }
       formData.value.workers = updatedWorkers
 
       // Machines
       const updatedMachines = { ...initialFormData.machines }
-      for (const m of diaryData.machines || []) {
-        updatedMachines[m.type] = m.quantity
+      const mObj = diaryData.machines || {}
+      for (const k of Object.keys(updatedMachines)) {
+        updatedMachines[k] = mObj[k] || 0
       }
       formData.value.machines = updatedMachines
 
       // Staff
-      selectedStaffIds.value = (diaryData.staffs || []).map(s => s.id)
+      selectedStaffIds.value = diaryData.staff_ids || []
     }
 
     const handleSubmit = async () => {
@@ -257,22 +271,25 @@ export default {
           summary: formData.value.summary,
           workers: formData.value.workers,
           machines: formData.value.machines,
-          staff_ids: selectedStaffIds.value
+          staff_ids: selectedStaffIds.value,
+          project_id: props.projectId
         }
 
         if (!props.diaryId) {
           // create
-          await axios.post(`/api/projects/${props.projectId}/site_diaries`, payload)
+          console.log("[DEBUG] handleSubmit => POST /api/documents/daily-reports", payload)
+          await axios.post('/api/documents/daily-reports', payload)
         } else {
           // update
+          console.log(`[DEBUG] handleSubmit => PUT /api/documents/daily-reports/${props.diaryId}?project_id=${props.projectId}`, payload)
           await axios.put(
-            `/api/projects/${props.projectId}/site_diaries/${props.diaryId}`,
+            `/api/documents/daily-reports/${props.diaryId}?project_id=${props.projectId}`,
             payload
           )
         }
         emit('updated')
       } catch (err) {
-        console.error(err)
+        console.error('[DEBUG] handleSubmit error:', err)
       }
     }
 

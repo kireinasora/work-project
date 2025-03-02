@@ -13,7 +13,7 @@ def generate_tree(startpath, ignore_dirs=None, ignore_files=None, files_to_show=
         if os.path.isdir(os.path.join(path, name)):
             return name in ignore_dirs
         # 檢查副檔名是否為允許的類型
-        allowed_extensions = {'.py', '.jpg', '.jpeg', '.html', '.css','.vue','ts','js','json','svg', 'ico', 'txt','ttc'}
+        allowed_extensions = {'.py', '.jpg', '.jpeg', '.html', '.css','.vue','ts','js','json','svg', 'ico', 'txt','ttc','xlsx'}
         file_ext = os.path.splitext(name)[1].lower()
         if file_ext not in allowed_extensions:
             return True

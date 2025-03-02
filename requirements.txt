@@ -3,3 +3,6 @@ Flask-PyMongo==3.0.1
 pymongo==4.11.0
 openpyxl==3.1.5
 gunicorn==23.0.0
+boto3==1.28.0
+uvicorn==0.23.2
+gevent==22.10.2

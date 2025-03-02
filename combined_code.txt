@@ -1,9 +1,13 @@
 專案檔案架構：
 ./
+└── gunicorn_config.py # gunicorn_config.py
 ├── backend/
 │   ├── __init__.py
 │   ├── db.py # backend/db.py
 │   └── main.py # backend/main.py
+│   ├── document_management/
+│   │   ├── routes.py # backend/document_management/routes.py
+│   │   └── services.py # backend/document_management/services.py
 │   ├── gantt_management/
 │   │   ├── routes.py # backend/gantt_management/routes.py
 │   │   └── services.py # backend/gantt_management/services.py
@@ -15,10 +19,6 @@
 │   │   │   └── logo.jpg
 │   ├── project_management/
 │   │   └── routes.py # backend/project_management/routes.py
-│   ├── site_diary/
-│   │   ├── progress_sse.py # backend/site_diary/progress_sse.py
-│   │   ├── routes.py # backend/site_diary/routes.py
-│   │   └── services.py # backend/site_diary/services.py
 │   ├── staff_management/
 │   │   └── routes.py # backend/staff_management/routes.py
 ├── fonts/
@@ -38,94 +38,94 @@
 │   │   ├── views/
 │   │   │   ├── HomeView.vue
 │   │   │   ├── MaterialFormView.vue
+│   │   │   ├── ProjectDocumentsView.vue
 │   │   │   ├── ProjectsGanttView.vue
 │   │   │   ├── ProjectsView.vue
-│   │   │   ├── SiteDiaryListView.vue
 │   │   │   └── StaffView.vue
 ================================================================================
 
 Dockerfile
 
 ================================================================================
+# Dockerfile
+
 ###############################################
-# 1) 前端：Node 環境，安裝並打包 Vite/Vue
+# 1) 前端：Node 環境
 ###############################################
-FROM node:18-slim AS frontend-builder
+FROM node:20-slim AS frontend-build
 
 WORKDIR /app/frontend
 
-# 複製前端 package.json / package-lock.json
+ENV NODE_OPTIONS="--max-old-space-size=768"
+
+RUN echo "[DEBUG] Node version: $(node -v)"
+RUN apt-get update && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN npm i -g npm@11.1.0
+RUN echo "[DEBUG] Upgraded to npm version: $(npm --version)"
+
 COPY frontend/package*.json ./
+RUN echo "[DEBUG] Removing node_modules & package-lock to avoid npm optional deps bug"
+RUN rm -rf node_modules package-lock.json
 
-# 安裝前端相依套件
-RUN npm install
+RUN npm install --legacy-peer-deps
 
-# 複製前端程式碼
 COPY frontend/ ./
-
-# 進行前端打包 (輸出到 /app/frontend/dist)
 RUN npm run build
 
-
 ###############################################
-# 2) 後端：Python + LibreOffice + 字型
+# 2) 後端 + 最終映像
 ###############################################
-FROM python:3.10-slim AS backend
-
-# 確保 APT 安裝過程不出現互動式介面
-ENV DEBIAN_FRONTEND=noninteractive
-
-# 先更新並安裝可能需要的工具（包含 GNUPG / CA certificate 等）
-RUN apt-get update --allow-releaseinfo-change \
- && apt-get install -y --no-install-recommends \
-    gnupg \
-    ca-certificates \
- && apt-get clean \
- && rm -rf /var/lib/apt/lists/*
-
-# 再進行 LibreOffice 與 fontconfig 安裝
-RUN apt-get update --allow-releaseinfo-change \
- && apt-get install -y --no-install-recommends \
-    libreoffice \
-    fontconfig \
- && apt-get clean \
- && rm -rf /var/lib/apt/lists/*
+FROM python:3.9-slim
 
 WORKDIR /app
 
-# -- 以下這兩行為「安裝字型」的關鍵步驟 --
-RUN mkdir -p /usr/share/fonts/truetype/custom
+# ★ 安裝 libreoffice、fontconfig，並將專案裡的 MINGLIU.TTC 拷貝至系統字型目錄。
+#   接著執行 fc-cache -fv 以更新字型快取，確保 LibreOffice 能辨識該字型。
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends fontconfig libreoffice && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
 
-# 將本機專案裡 ./fonts/MINGLIU.TTC 複製到容器裡
-COPY ./fonts/MINGLIU.TTC /usr/share/fonts/truetype/custom/MINGLIU.TTC
+COPY fonts/MINGLIU.TTC /usr/share/fonts/truetype/MINGLIU.TTC
+RUN fc-cache -fv
 
-# 更新字型快取
-RUN fc-cache -f -v
+# 設定語系；可依需求改為 zh_TW.UTF-8 / zh_CN.UTF-8 等。
+ENV LANG=zh_TW.UTF-8
+ENV LC_ALL=zh_TW.UTF-8
 
-# 安裝 Python 相依
-COPY requirements.txt ./
+# 將前端編譯產物複製進來
+COPY --from=frontend-build /app/frontend/dist /app/frontend/dist
+
+# 安裝後端相依套件
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# 在安裝後，偵錯檢查 gevent 版本
+RUN echo "[DEBUG] Checking gevent version..." && pip freeze | grep gevent || true
+
 # 複製後端程式
-COPY backend/ ./backend
+COPY backend/ /app/backend/
 
-# 從前端階段帶入打包成果
-COPY --from=frontend-builder /app/frontend/dist ./frontend/dist
+# ★ 新增：將 gunicorn_config.py 也複製進容器
+COPY gunicorn_config.py .
 
-# 設定 PYTHONPATH，確保可用 `from backend.xxx import ...`
-ENV PYTHONPATH=/app
+WORKDIR /app
 
-# Flask 對外提供的埠
-EXPOSE 5000
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 
-################################################################################
-# 直接在 Gunicorn 的參數中設定較高的 timeout、使用多 workers/threads
-################################################################################
-CMD ["/bin/sh", "-c", "gunicorn 'backend.main:create_app()' \
---bind 0.0.0.0:$PORT \
---workers 2 \
---threads 4 \
---timeout 300"]
+EXPOSE 8000
+
+# 幫助偵錯，確認 gunicorn_config.py 存在與否
+RUN echo "[DEBUG] Checking gunicorn_config.py..." && ls -al
+
+# 使用 Gunicorn (WSGI) 執行，並呼叫 backend.main:create_app() 工廠函式
+RUN echo "[DEBUG] Using Gunicorn with 'backend.main:create_app()'..."
+
+CMD ["gunicorn", "-c", "gunicorn_config.py", "backend.main:create_app()"]
 
 ================================================================================
 
@@ -146,6 +146,7 @@ from flask import Flask
 from flask_pymongo import PyMongo
 from bson.objectid import ObjectId
 from pymongo.errors import DuplicateKeyError, ConfigurationError, ConnectionFailure
+from datetime import datetime
 
 mongo = PyMongo()
 
@@ -243,6 +244,1153 @@ def to_iso_datetime(dt):
     if not dt:
         return None
     return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def parse_date_str(date_str: str, default_date_str: str = None):
+    """
+    將 'YYYY-MM-DD' parse 成 datetime(YYYY,MM,DD) (無時間)
+    若失敗或空 => 若 default_date_str 不為 None 就用 default_date_str; 否則回傳 None
+    """
+    if not date_str:
+        if default_date_str is not None:
+            return datetime.strptime(default_date_str, "%Y-%m-%d")
+        return None
+    try:
+        return datetime.strptime(date_str, "%Y-%m-%d")
+    except ValueError:
+        if default_date_str is not None:
+            return datetime.strptime(default_date_str, "%Y-%m-%d")
+        return None
+
+
+def normalize_progress(progress):
+    """
+    將 progress 值正規化為 0.0 到 1.0 之間的浮點數。
+    """
+    # 確保介於 0 ~ 1
+    try:
+        p = float(progress)
+        import math
+        if math.isnan(p) or p < 0:
+            p = 0.0
+        if p > 1:
+            p = 1.0
+        return p
+    except:
+        return 0.0
+
+
+def find_all_and_format(collection, query=None, sort_key="id", sort_order=1, projection=None, formatter=None):
+    """
+    通用查詢函數，用於查詢集合並返回格式化結果。
+    
+    參數:
+        collection: 集合名稱，如 'projects', 'staff' 等
+        query: 查詢條件，默認為 {}
+        sort_key: 排序欄位，默認為 'id'
+        sort_order: 排序方向，1 為升序，-1 為降序
+        projection: 投影，指定要返回的欄位，默認為 None
+        formatter: 格式化函數，用於處理每個文檔，默認為 None
+    
+    返回:
+        格式化後的結果列表
+    """
+    query = query or {}
+    cursor = mongo.db[collection].find(query, projection).sort([(sort_key, sort_order)])
+    
+    results = []
+    for doc in cursor:
+        if formatter:
+            doc = formatter(doc)
+        results.append(doc)
+    
+    return results
+
+
+def find_one_or_404(collection, query, error_msg=None):
+    """
+    查詢單個文檔，如果不存在則拋出 404 錯誤。
+    
+    參數:
+        collection: 集合名稱，如 'projects', 'staff' 等
+        query: 查詢條件
+        error_msg: 當文檔不存在時的錯誤訊息
+    
+    返回:
+        文檔對象
+    """
+    from flask import abort
+    
+    doc = mongo.db[collection].find_one(query)
+    if not doc:
+        abort(404, description=error_msg or f"Document not found in {collection}")
+    
+    return doc
+
+================================================================================
+
+backend/document_management/routes.py
+
+================================================================================
+# backend/document_management/routes.py
+
+import logging
+import os
+import uuid
+import zipfile
+import tempfile
+import threading
+import time
+from datetime import datetime
+
+import gevent
+
+from flask import Blueprint, request, jsonify, abort, Response, stream_with_context, send_file, current_app
+from bson.objectid import ObjectId
+
+from backend.db import mongo, get_next_sequence
+from backend.document_management.services import (
+    create_document,
+    get_document,
+    update_document,
+    delete_document,
+    list_documents,
+    add_document_version,
+    get_document_versions,
+    generate_diary_xlsx_only,
+    generate_diary_pdf_sheet
+)
+
+document_bp = Blueprint("document_bp", __name__)
+logger = logging.getLogger(__name__)
+
+# -------------------- SSE Job store (用於多筆下載) --------------------
+# ★ 新增 expires_at: time.time() + 1800 (半小時後過期)
+progress_store = {}  # job_id -> {
+#   "status":"in_progress"|"done"|"error",
+#   "progress":..., "file_path":..., "error_msg":"",
+#   "expires_at": float(timestamp)
+# }
+
+# =====================================================================
+# 通用文件 CRUD
+# =====================================================================
+
+@document_bp.route("/", methods=["GET"])
+def api_list_documents():
+    """
+    取得所有或篩選後的文件列表。
+    可用 query param 例如:
+      - ?project_id=123
+      - ?doc_type=DAILY_REPORT / MAT / RFI / ...
+    """
+    project_id = request.args.get("project_id", "").strip()
+    doc_type = request.args.get("doc_type", "").strip()
+
+    try:
+        docs = list_documents(project_id=project_id, doc_type=doc_type)
+        return jsonify(docs), 200
+    except Exception as ex:
+        logger.exception("[DEBUG] api_list_documents error:")
+        return jsonify({"error": str(ex)}), 500
+
+
+@document_bp.route("/", methods=["POST"])
+def api_create_document():
+    """
+    新增文件 (初始版本)
+    body JSON:
+      {
+        "title": "...",
+        "doc_type": "LETTER" | "MAT" | "DAILY_REPORT" | ...
+        "project_id": 123,
+        "description": "...",
+        ...
+      }
+    """
+    data = request.json or {}
+    try:
+        new_id = create_document(data)
+        return jsonify({"message": "Document created", "document_id": str(new_id)}), 201
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as ex:
+        logger.exception("[DEBUG] api_create_document error:")
+        return jsonify({"error": str(ex)}), 500
+
+
+@document_bp.route("/<doc_id>", methods=["GET"])
+def api_get_document(doc_id):
+    """
+    取得單一文件與最新版本資訊
+    """
+    try:
+        doc = get_document(doc_id)
+        if not doc:
+            abort(404, description="Document not found")
+        return jsonify(doc), 200
+    except Exception as ex:
+        logger.exception("[DEBUG] api_get_document error:")
+        return jsonify({"error": str(ex)}), 500
+
+
+@document_bp.route("/<doc_id>", methods=["PUT"])
+def api_update_document(doc_id):
+    """
+    更新文件的 metadata (不新增版本)。若要更新檔案需用 add version 方式。
+    body JSON:
+      {
+        "title": "...",
+        "description": "...",
+        ...
+      }
+    """
+    data = request.json or {}
+    try:
+        updated = update_document(doc_id, data)
+        if not updated:
+            abort(404, description="Document not found or no changes made")
+        return jsonify({"message": "Document updated"}), 200
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as ex:
+        logger.exception("[DEBUG] api_update_document error:")
+        return jsonify({"error": str(ex)}), 500
+
+
+@document_bp.route("/<doc_id>", methods=["DELETE"])
+def api_delete_document(doc_id):
+    """
+    刪除整個文件(及所有版本檔案)
+    """
+    try:
+        deleted = delete_document(doc_id)
+        if not deleted:
+            abort(404, description="Document not found")
+        return jsonify({"message": "Document deleted"}), 200
+    except Exception as ex:
+        logger.exception("[DEBUG] api_delete_document error:")
+        return jsonify({"error": str(ex)}), 500
+
+
+# ------------------------------------------------------
+# 版本管理：新增一個「文件版本」(帶檔案上傳)
+# ------------------------------------------------------
+
+@document_bp.route("/<doc_id>/versions", methods=["POST"])
+def api_add_document_version(doc_id):
+    """
+    新增一個版本 (可能包含上傳檔案到 S3)。
+    body JSON:
+      {
+        "version_note": "...",
+        "filename": "...",
+        "base64_file": "...",
+        ...
+      }
+    """
+    data = request.json or {}
+    try:
+        ver_id = add_document_version(doc_id, data)
+        return jsonify({"message": "Version added", "version_id": ver_id}), 201
+    except FileNotFoundError as fex:
+        return jsonify({"error": f"File not found: {fex}"}), 404
+    except Exception as ex:
+        logger.exception("[DEBUG] api_add_document_version error:")
+        return jsonify({"error": str(ex)}), 500
+
+
+@document_bp.route("/<doc_id>/versions", methods=["GET"])
+def api_get_document_versions(doc_id):
+    """
+    取得某文件的所有版本列表
+    """
+    try:
+        versions = get_document_versions(doc_id)
+        return jsonify(versions), 200
+    except Exception as ex:
+        logger.exception("[DEBUG] api_get_document_versions error:")
+        return jsonify({"error": str(ex)}), 500
+
+
+# =====================================================================
+#  以下為「日報 DAILY_REPORT」的整合 CRUD / 多筆下載 SSE 等
+# =====================================================================
+
+def _build_daily_report_query(project_id: int):
+    """回傳針對 doc_type=DAILY_REPORT 的 query dict"""
+    return {"project_id": project_id, "doc_type": "DAILY_REPORT"}
+
+
+@document_bp.route("/daily-reports", methods=["GET"])
+def list_daily_reports():
+    """
+    取得指定 project_id 的所有日報文件，並以 report_date(降冪)排序
+      GET /api/documents/daily-reports?project_id=xxx
+    """
+    project_id = request.args.get("project_id", "")
+    if not project_id.isdigit():
+        return jsonify([]), 200
+    pid = int(project_id)
+
+    # 直接按 daily_report_data.report_date 進行排序 (descending)
+    query = {
+        "doc_type": "DAILY_REPORT",
+        "project_id": pid
+    }
+    docs_cursor = mongo.db["documents"].find(query).sort("daily_report_data.report_date", -1)
+
+    output = []
+    for d in docs_cursor:
+        dr = d.get("daily_report_data", {})
+        item = {
+            "doc_db_id": str(d["_id"]),              # documents表的 str(ObjectId)
+            "id": d.get("daily_report_id"),          # 整數
+            "report_date": dr.get("report_date") or "",
+            "weather_morning": dr.get("weather_morning", ""),
+            "weather_noon": dr.get("weather_noon", ""),
+            "day_count": dr.get("day_count", None),
+            "summary": dr.get("summary", ""),
+            "staff_ids": dr.get("staff_ids", []),
+            "workers": dr.get("workers", {}),
+            "machines": dr.get("machines", {}),
+        }
+        uat = d.get("updated_at")
+        if isinstance(uat, datetime):
+            # 將原本 T 時區資訊移除，改成更易讀的格式
+            item["updated_at"] = uat.strftime("%Y-%m-%d %H:%M:%S")
+        else:
+            item["updated_at"] = ""
+        output.append(item)
+    return jsonify(output), 200
+
+
+@document_bp.route("/daily-reports", methods=["POST"])
+def create_daily_report():
+    """
+    建立一筆日報 => 插入 documents 裏頭 doc_type=DAILY_REPORT
+    body JSON 與舊 site_diary 相同
+    """
+    data = request.json or {}
+    project_id = data.get("project_id")
+    if not project_id:
+        return jsonify({"error": "Missing project_id"}), 400
+    try:
+        new_report_id = get_next_sequence("daily_reports")
+
+        doc_body = {
+            "doc_type": "DAILY_REPORT",
+            "project_id": project_id,
+            "title": f"DailyReport #{new_report_id}",
+            "description": f"Daily report for project {project_id}",
+            "daily_report_id": new_report_id,
+            "daily_report_data": {
+                "report_date": data.get("report_date", ""),
+                "weather_morning": data.get("weather_morning", ""),
+                "weather_noon": data.get("weather_noon", ""),
+                "day_count": data.get("day_count", None),
+                "summary": data.get("summary", ""),
+                "workers": data.get("workers", {}),
+                "machines": data.get("machines", {}),
+                "staff_ids": data.get("staff_ids", [])
+            }
+        }
+        result_id = create_document(doc_body)
+        return jsonify({
+            "message": "Daily report created",
+            "daily_report_id": new_report_id
+        }), 201
+    except Exception as ex:
+        logger.exception("[DEBUG] create_daily_report error:")
+        return jsonify({"error": str(ex)}), 500
+
+
+@document_bp.route("/daily-reports/<int:report_id>", methods=["PUT"])
+def update_daily_report(report_id):
+    """
+    更新日報 => 尋找 doc_type=DAILY_REPORT & daily_report_id=report_id
+    """
+    data = request.json or {}
+    project_id = data.get("project_id")
+    if not project_id:
+        return jsonify({"error": "Missing project_id"}), 400
+
+    doc = mongo.db["documents"].find_one({
+        "doc_type": "DAILY_REPORT",
+        "daily_report_id": report_id,
+        "project_id": int(project_id)
+    })
+    if not doc:
+        abort(404, description="Daily report not found")
+
+    dr_data = doc.get("daily_report_data", {})
+    dr_data["report_date"] = data.get("report_date", "")
+    dr_data["weather_morning"] = data.get("weather_morning", "")
+    dr_data["weather_noon"] = data.get("weather_noon", "")
+    dr_data["day_count"] = data.get("day_count", None)
+    dr_data["summary"] = data.get("summary", "")
+    dr_data["workers"] = data.get("workers", {})
+    dr_data["machines"] = data.get("machines", {})
+    dr_data["staff_ids"] = data.get("staff_ids", [])
+
+    update_fields = {
+        "daily_report_data": dr_data,
+        "updated_at": datetime.now()
+    }
+    mongo.db["documents"].update_one({"_id": doc["_id"]}, {"$set": update_fields})
+    return jsonify({"message": "Daily report updated"}), 200
+
+
+@document_bp.route("/daily-reports/<int:report_id>", methods=["DELETE"])
+def delete_daily_report(report_id):
+    """
+    刪除日報 => doc_type=DAILY_REPORT & daily_report_id=report_id
+    """
+    project_id = request.args.get("project_id", "")
+    if not project_id.isdigit():
+        abort(400, description="Missing or invalid project_id")
+
+    doc = mongo.db["documents"].find_one({
+        "doc_type": "DAILY_REPORT",
+        "daily_report_id": report_id,
+        "project_id": int(project_id)
+    })
+    if not doc:
+        abort(404, "Daily report not found")
+
+    doc_id = str(doc["_id"])
+    ok = delete_document(doc_id)
+    if not ok:
+        abort(404, "Daily report not found (delete failed)")
+
+    return jsonify({"message": "Daily report deleted"}), 200
+
+
+# ===================================================================
+# [單筆下載] - XLSX / PDF(sheet1) / PDF(sheet2)
+# ===================================================================
+
+@document_bp.route("/daily-report/<int:report_id>/download", methods=["GET"])
+def download_single_daily_report(report_id):
+    """
+    單筆下載日報；query param: file_type=xlsx|sheet1|sheet2
+    GET /api/documents/daily-report/<report_id>/download?project_id=xxx&file_type=xxx
+    """
+    project_id = request.args.get("project_id", "")
+    file_type = request.args.get("file_type", "xlsx").strip()
+    if not project_id.isdigit():
+        abort(400, description="Invalid project_id")
+
+    doc = mongo.db["documents"].find_one({
+        "doc_type": "DAILY_REPORT",
+        "daily_report_id": report_id,
+        "project_id": int(project_id)
+    })
+    if not doc:
+        abort(404, description="Daily report not found")
+
+    dr_data = doc.get("daily_report_data", {})
+    raw_date = dr_data.get("report_date", "")
+    date_str_for_filename = raw_date.replace("-", "") if raw_date else "noDate"
+
+    if file_type == "xlsx":
+        out_path = generate_diary_xlsx_only(doc)
+        download_name = f"{date_str_for_filename}_daily_report.xlsx"
+    elif file_type == "sheet1":
+        out_path = generate_diary_pdf_sheet(doc, sheet_name="sheet1")
+        download_name = f"{date_str_for_filename}_daily_report.pdf"
+    elif file_type == "sheet2":
+        out_path = generate_diary_pdf_sheet(doc, sheet_name="sheet2")
+        download_name = f"{date_str_for_filename}_worker_log.pdf"
+    else:
+        abort(400, description="Unsupported file_type")
+
+    return send_file(out_path, as_attachment=True, download_name=download_name)
+
+
+# ===================================================================
+# [多筆下載 - SSE 版本] - 以 doc_type=DAILY_REPORT 多筆下載
+# ===================================================================
+
+@document_bp.route("/daily-report/multi_download_async", methods=["POST"])
+def daily_report_multi_download_async():
+    """
+    非同步多筆下載 SSE:
+      body JSON: { "project_id":123, "diary_ids":[...], "file_type":"xlsx|sheet1|sheet2" }
+    回傳 { "job_id":... }
+    前端再用 SSE(/api/documents/daily-report/progress-sse/<job_id>) 監聽
+    完成後拿 /api/documents/daily-report/multi_download_result?job_id=xxx
+    """
+    data = request.json or {}
+    project_id = data.get("project_id")
+    diary_ids = data.get("diary_ids", [])
+    file_type = data.get("file_type", "xlsx")
+
+    if not project_id or not isinstance(diary_ids, list):
+        return jsonify({"error": "Missing project_id or diary_ids"}), 400
+
+    job_id = str(uuid.uuid4())
+    # ★ 設定到期時間 (半小時後)
+    expires_at = time.time() + 1800
+
+    progress_store[job_id] = {
+        "status": "in_progress",
+        "progress": 0,
+        "file_path": None,
+        "error_msg": "",
+        "expires_at": expires_at
+    }
+
+    try:
+        flask_app = current_app._get_current_object()
+    except Exception as e:
+        logger.exception("[DEBUG] Failed to get current_app object:")
+        return jsonify({"error": f"Cannot get Flask app object: {e}"}), 500
+
+    t = threading.Thread(
+        target=_background_zip_generation,
+        args=(flask_app, job_id, project_id, diary_ids, file_type),
+        daemon=True
+    )
+    t.start()
+
+    return jsonify({"job_id": job_id}), 200
+
+
+def _background_zip_generation(app, job_id, project_id, diary_ids, file_type):
+    logger.debug(
+        "[_background_zip_generation] Start job_id=%s project_id=%s diary_ids=%s file_type=%s",
+        job_id, project_id, diary_ids, file_type
+    )
+
+    with app.app_context():
+        from backend.document_management.services import (
+            generate_diary_xlsx_only,
+            generate_diary_pdf_sheet
+        )
+        try:
+            total = len(diary_ids)
+            if total == 0:
+                raise ValueError("No diaries specified.")
+
+            temp_dir = tempfile.mkdtemp(prefix="multi_daily_")
+            zip_filename = f"multiple_diaries_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+            zip_path = os.path.join(temp_dir, zip_filename)
+
+            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                for idx, d_id in enumerate(diary_ids, start=1):
+                    # 若該 job 已非 in_progress 狀態就結束
+                    if progress_store[job_id]["status"] != "in_progress":
+                        logger.debug("[DEBUG] Job %s no longer in progress, break the loop.", job_id)
+                        return
+
+                    progress_store[job_id]["progress"] = int(idx * 100 / total)
+
+                    doc = mongo.db["documents"].find_one({
+                        "doc_type": "DAILY_REPORT",
+                        "daily_report_id": d_id,
+                        "project_id": int(project_id)
+                    })
+                    if not doc:
+                        logger.debug(f"[DEBUG] Diary ID={d_id} not found, skipping.")
+                        continue
+
+                    dr_data = doc.get("daily_report_data", {})
+                    raw_date = dr_data.get("report_date", "")
+                    date_str = raw_date.replace("-", "") if raw_date else f"ID{d_id}"
+
+                    if file_type == 'xlsx':
+                        path_ = generate_diary_xlsx_only(doc)
+                        arcname_ = f"{date_str}_daily_report.xlsx"
+                    elif file_type == 'sheet1':
+                        path_ = generate_diary_pdf_sheet(doc, sheet_name='sheet1')
+                        arcname_ = f"{date_str}_daily_report.pdf"
+                    elif file_type == 'sheet2':
+                        path_ = generate_diary_pdf_sheet(doc, sheet_name='sheet2')
+                        arcname_ = f"{date_str}_worker_log.pdf"
+                    else:
+                        logger.error(f"[DEBUG] Unsupported file_type={file_type}, skipping this doc.")
+                        continue
+
+                    zf.write(path_, arcname=arcname_)
+
+            progress_store[job_id]["status"] = "done"
+            progress_store[job_id]["progress"] = 100
+            progress_store[job_id]["file_path"] = zip_path
+
+            logger.debug("[_background_zip_generation] Job done. file_path=%s", zip_path)
+
+        except Exception as e:
+            logger.exception("[DEBUG] background_zip_generation error:")
+            progress_store[job_id]["status"] = "error"
+            progress_store[job_id]["error_msg"] = str(e)
+
+
+@document_bp.route("/daily-report/progress-sse/<job_id>", methods=["GET"])
+def daily_report_progress_sse(job_id):
+    """
+    SSE：前端監看多筆下載進度
+    """
+
+    @stream_with_context
+    def generate_stream():
+        while True:
+            job_info = progress_store.get(job_id)
+            if not job_info:
+                yield _sse_pack({"error": "Invalid job_id"}, event="error")
+                break
+
+            # ★ 若已過期，改成 error
+            if time.time() > job_info.get("expires_at", 0):
+                job_info["status"] = "error"
+                job_info["error_msg"] = "Job expired"
+                yield _sse_pack({
+                    "progress": job_info.get("progress", 0),
+                    "status": "error",
+                    "error_msg": "Job expired"
+                }, event="error")
+                break
+
+            data_dict = {
+                "progress": job_info.get("progress", 0),
+                "status": job_info.get("status", "unknown"),
+                "error_msg": job_info.get("error_msg", "")
+            }
+
+            logger.debug(
+                "[SSE Debug] job_id=%s, progress=%s, status=%s",
+                job_id, data_dict["progress"], data_dict["status"]
+            )
+
+            yield _sse_pack(data_dict)
+
+            if data_dict["status"] in ("done", "error"):
+                break
+
+            gevent.sleep(1)
+
+    return Response(generate_stream(), mimetype='text/event-stream')
+
+
+def _sse_pack(data: dict, event=None) -> str:
+    import json
+    lines = []
+    if event:
+        lines.append(f"event: {event}")
+    lines.append("data: " + json.dumps(data, ensure_ascii=False))
+    lines.append("")
+    return "\n".join(lines) + "\n"
+
+
+@document_bp.route("/daily-report/multi_download_result", methods=["GET"])
+def daily_report_multi_download_result():
+    """
+    下載 SSE 完成後的 ZIP
+      GET /api/documents/daily-report/multi_download_result?job_id=xxx
+    """
+    job_id = request.args.get("job_id", "")
+    job_info = progress_store.get(job_id)
+    if not job_info:
+        return jsonify({"error": "Invalid job_id"}), 400
+
+    if job_info["status"] != "done":
+        return jsonify({"error": f"Job not done. status={job_info['status']}"}), 400
+
+    # ★ 再檢查是否過期
+    if time.time() > job_info.get("expires_at", 0):
+        return jsonify({"error": "Job expired"}), 400
+
+    zip_path = job_info["file_path"]
+    if not zip_path or not os.path.isfile(zip_path):
+        return jsonify({"error": "File not found"}), 404
+
+    filename = os.path.basename(zip_path)
+    # 預設 as_attachment=True 時，多數瀏覽器會彈出下載對話框或直接下載
+    return send_file(zip_path, as_attachment=True, download_name=filename)
+
+================================================================================
+
+backend/document_management/services.py
+
+================================================================================
+# backend/document_management/services.py
+
+import os
+import base64
+import uuid
+import logging
+import subprocess
+import platform
+import tempfile
+import shutil
+from datetime import datetime
+from typing import Optional, Dict, Any, List
+
+import boto3
+from botocore.exceptions import ClientError
+from flask import current_app
+from openpyxl import load_workbook
+from openpyxl.styles import Alignment
+
+from backend.db import mongo
+
+logger = logging.getLogger(__name__)
+
+
+def get_s3_client():
+    """
+    建立並回傳 boto3 S3 client。
+    """
+    aws_access_key = os.environ.get("AWS_ACCESS_KEY_ID", "")
+    aws_secret_key = os.environ.get("AWS_SECRET_ACCESS_KEY", "")
+    bucket_region = os.environ.get("AWS_DEFAULT_REGION", "ap-southeast-1")
+
+    if not aws_access_key or not aws_secret_key:
+        logger.warning("AWS_ACCESS_KEY_ID 或 AWS_SECRET_ACCESS_KEY 未設置，S3 上傳可能失敗。")
+
+    session = boto3.session.Session(
+        aws_access_key_id=aws_access_key,
+        aws_secret_access_key=aws_secret_key,
+        region_name=bucket_region
+    )
+    return session.client("s3")
+
+
+def _upload_file_to_s3(base64_file: str, original_filename: str) -> str:
+    """
+    將 base64 編碼的檔案內容上傳到 S3，回傳 S3 key。
+    """
+    bucket_name = os.environ.get("AWS_S3_BUCKET", "")
+    if not bucket_name:
+        raise ValueError("AWS_S3_BUCKET not set in environment.")
+
+    s3_client = get_s3_client()
+
+    ext = ""
+    if "." in original_filename:
+        ext = original_filename.split(".")[-1]
+    unique_id = str(uuid.uuid4())
+    s3_key = f"documents/{unique_id}.{ext}" if ext else f"documents/{unique_id}"
+
+    file_bytes = base64.b64decode(base64_file)
+    try:
+        s3_client.put_object(
+            Bucket=bucket_name,
+            Key=s3_key,
+            Body=file_bytes
+        )
+    except ClientError as e:
+        logger.error("Failed to upload to S3: %s", e)
+        raise
+
+    return s3_key
+
+
+# ------------------------------------------------------------
+#  通用 CRUD (documents collection)
+# ------------------------------------------------------------
+
+def create_document(data: Dict[str, Any]) -> str:
+    title = data.get("title") or "Untitled"
+    doc_type = data.get("doc_type") or "UNKNOWN"
+    project_id = data.get("project_id")
+    description = data.get("description", "")
+
+    if project_id is None:
+        raise ValueError("Missing project_id")
+
+    doc = {
+        "title": title,
+        "doc_type": doc_type,
+        "project_id": project_id,
+        "description": description,
+        "versions": [],
+        "daily_report_id": data.get("daily_report_id"),
+        "daily_report_data": data.get("daily_report_data"),
+        "created_at": datetime.now(),
+        "updated_at": datetime.now()
+    }
+    result = mongo.db["documents"].insert_one(doc)
+    return str(result.inserted_id)
+
+
+def get_document(doc_id: str) -> Optional[dict]:
+    doc = mongo.db["documents"].find_one({"_id": mongo.db["documents"].object_id(doc_id)})
+    if not doc:
+        return None
+    doc["id"] = str(doc["_id"])
+    del doc["_id"]
+    return doc
+
+
+def update_document(doc_id: str, data: Dict[str, Any]) -> bool:
+    update_fields = {}
+    if "title" in data:
+        update_fields["title"] = data["title"]
+    if "doc_type" in data:
+        update_fields["doc_type"] = data["doc_type"]
+    if "project_id" in data:
+        update_fields["project_id"] = data["project_id"]
+    if "description" in data:
+        update_fields["description"] = data["description"]
+
+    if not update_fields:
+        return False
+
+    update_fields["updated_at"] = datetime.now()
+
+    result = mongo.db["documents"].update_one(
+        {"_id": mongo.db["documents"].object_id(doc_id)},
+        {"$set": update_fields}
+    )
+    return (result.modified_count > 0)
+
+
+def delete_document(doc_id: str) -> bool:
+    doc = mongo.db["documents"].find_one({"_id": mongo.db["documents"].object_id(doc_id)})
+    if not doc:
+        return False
+
+    # 刪除所有版本檔案 (S3)
+    s3_client = get_s3_client()
+    bucket_name = os.environ.get("AWS_S3_BUCKET", "")
+    for ver in doc.get("versions", []):
+        s3_key = ver.get("s3_key", "")
+        if s3_key:
+            try:
+                s3_client.delete_object(Bucket=bucket_name, Key=s3_key)
+            except ClientError as e:
+                logger.warning("Failed to delete S3 key=%s: %s", s3_key, e)
+
+    mongo.db["documents"].delete_one({"_id": doc["_id"]})
+    return True
+
+
+def list_documents(project_id: str = "", doc_type: str = "") -> List[dict]:
+    query = {}
+    if project_id:
+        try:
+            query["project_id"] = int(project_id)
+        except:
+            pass
+    if doc_type:
+        query["doc_type"] = doc_type
+
+    cursor = mongo.db["documents"].find(query).sort("created_at", -1)
+    results = []
+    for d in cursor:
+        d["id"] = str(d["_id"])
+        del d["_id"]
+        results.append(d)
+    return results
+
+
+# ------------------------------------------------------------
+#  版本管理
+# ------------------------------------------------------------
+
+def add_document_version(doc_id: str, data: Dict[str, Any]) -> str:
+    doc = mongo.db["documents"].find_one({"_id": mongo.db["documents"].object_id(doc_id)})
+    if not doc:
+        raise ValueError("Document not found")
+
+    version_note = data.get("version_note", "")
+    filename = data.get("filename", "")
+    base64_file = data.get("base64_file", "")
+
+    new_version_id = str(uuid.uuid4())
+    s3_key = ""
+
+    if base64_file:
+        s3_key = _upload_file_to_s3(base64_file, filename)
+
+    new_version = {
+        "version_id": new_version_id,
+        "version_note": version_note,
+        "filename": filename,
+        "s3_key": s3_key,
+        "created_at": datetime.now()
+    }
+
+    mongo.db["documents"].update_one(
+        {"_id": doc["_id"]},
+        {
+            "$push": {"versions": new_version},
+            "$set": {"updated_at": datetime.now()}
+        }
+    )
+
+    return new_version_id
+
+
+def get_document_versions(doc_id: str) -> List[dict]:
+    doc = mongo.db["documents"].find_one({"_id": mongo.db["documents"].object_id(doc_id)})
+    if not doc:
+        raise ValueError("Document not found")
+    return doc.get("versions", [])
+
+
+# ------------------------------------------------------------
+# 產生/填寫 XLSX & PDF (Daily Report)
+# ------------------------------------------------------------
+
+def generate_diary_xlsx_only(site_diary_doc: Dict[str, Any]) -> str:
+    # 取得 project 資料
+    project_id = site_diary_doc.get("project_id")
+    project_doc = mongo.db.projects.find_one({"id": project_id})
+    if not project_doc:
+        raise ValueError(f"Project not found in MongoDB (id={project_id}).")
+
+    dr_data = site_diary_doc.get("daily_report_data", {})
+    report_date = dr_data.get("report_date", None)
+    date_str = report_date if report_date else ""
+
+    project_name = project_doc.get("name", "")
+    project_job_number = project_doc.get("job_number", "")
+    contractor_name = project_doc.get("contractor", "")
+
+    day_count_str = str(dr_data.get("day_count", ""))
+    summary_str = dr_data.get("summary", "")
+    weather_morning = dr_data.get("weather_morning", "")
+    weather_noon = dr_data.get("weather_noon", "")
+
+    start_date = project_doc.get("start_date")
+    start_date_str = start_date.strftime("%Y-%m-%d") if start_date else ""
+
+    duration_days = project_doc.get("duration_days")
+    duration_type = project_doc.get("duration_type")
+    if duration_days:
+        if duration_type == "business":
+            duration_str = f"{duration_days}工作天"
+        else:
+            duration_str = f"{duration_days}天"
+    else:
+        duration_str = ""
+
+    worker_map = {
+        "地盤總管": "D19",
+        "工程師":  "D20",
+        "管工":    "D21",
+        "平水員":  "D22",
+        "燒焊焊工": "D23",
+        "機手":    "D24",
+        "泥水工":  "D25",
+        "紮鐵工":  "D26",
+        "木板工":  "D27",
+        "電工":    "D28",
+        "水喉工":  "D29",
+        "雜工":    "D30",
+    }
+    machine_map = {
+        "挖掘機": "G19",
+        "發電機": "G20",
+        "風機":   "G21",
+        "泥頭車": "G22",
+        "吊機":   "G23",
+        "機炮":   "G24",
+        "屈鐵機": "G25",
+        "風車鋸": "G26",
+    }
+
+    workers_dict = dr_data.get("workers", {})
+    machines_dict = dr_data.get("machines", {})
+
+    template_path = os.path.join(
+        current_app.root_path,
+        'report_templates',
+        'daily_report.xlsx'
+    )
+    if not os.path.isfile(template_path):
+        raise FileNotFoundError(f"daily_report.xlsx not found: {template_path}")
+
+    temp_dir = tempfile.mkdtemp(prefix="diary_xlsx_")
+    date_str_for_filename = date_str.replace("-", "") if date_str else "noDate"
+    filled_xlsx_path = os.path.join(
+        temp_dir,
+        f"{date_str_for_filename}_daily_report.xlsx"
+    )
+
+    shutil.copy(template_path, filled_xlsx_path)
+
+    wb = load_workbook(filled_xlsx_path)
+    # Sheet1
+    if "每日施工進度報告表" in wb.sheetnames:
+        sh1 = wb["每日施工進度報告表"]
+        sh1["C2"].value = date_str
+        sh1["C2"].alignment = Alignment(horizontal='center', vertical='center')
+
+        sh1["K2"].value = start_date_str
+        sh1["K2"].alignment = Alignment(horizontal='center', vertical='center')
+
+        sh1["D4"].value = project_name
+        sh1["D4"].alignment = Alignment(horizontal='center', vertical='center')
+
+        sh1["D5"].value = project_job_number
+        sh1["D5"].alignment = Alignment(horizontal='center', vertical='center')
+
+        sh1["D6"].value = contractor_name
+        sh1["D6"].alignment = Alignment(horizontal='center', vertical='center')
+
+        sh1["E7"].value = weather_morning
+        sh1["E7"].alignment = Alignment(horizontal='center', vertical='center')
+
+        sh1["H7"].value = weather_noon
+        sh1["H7"].alignment = Alignment(horizontal='center', vertical='center')
+
+        sh1["D8"].value = duration_str
+        sh1["D8"].alignment = Alignment(horizontal='center', vertical='center')
+
+        sh1["J8"].value = day_count_str
+        sh1["J8"].alignment = Alignment(horizontal='center', vertical='center')
+
+        sh1["B10"].value = summary_str
+        sh1["B10"].alignment = Alignment(horizontal='center', vertical='center')
+
+        for w_type, cell_ref in worker_map.items():
+            qty = workers_dict.get(w_type, 0)
+            sh1[cell_ref].value = str(qty) if qty else ""
+            sh1[cell_ref].alignment = Alignment(horizontal='center', vertical='center')
+
+        for m_type, cell_ref in machine_map.items():
+            qty = machines_dict.get(m_type, 0)
+            sh1[cell_ref].value = str(qty) if qty else ""
+            sh1[cell_ref].alignment = Alignment(horizontal='center', vertical='center')
+
+        sh1.print_area = "A1:L46"
+
+    # Sheet2
+    if "每日本地工人及外地勞工施工人員紀錄表" in wb.sheetnames:
+        sh2 = wb["每日本地工人及外地勞工施工人員紀錄表"]
+        b3_date = date_str.replace("-", "/") if date_str else ""
+        sh2["B3"].value = b3_date
+        sh2["B3"].alignment = Alignment(horizontal='center', vertical='center')
+
+        sh2["B6"].value = project_name
+        sh2["B6"].alignment = Alignment(horizontal='center', vertical='center')
+
+        sh2["B7"].value = project_job_number
+        sh2["B7"].alignment = Alignment(horizontal='center', vertical='center')
+
+        sh2["B8"].value = contractor_name
+        sh2["B8"].alignment = Alignment(horizontal='center', vertical='center')
+
+        total_workers_sum = sum(workers_dict.values()) if workers_dict else 0
+        total_machines_sum = sum(machines_dict.values()) if machines_dict else 0
+        if (total_workers_sum + total_machines_sum) == 0:
+            for row in range(11, 26):
+                for col in range(2, 5):
+                    sh2.cell(row=row, column=col, value="☐")
+            for row in range(28, 33):
+                for col in range(2, 4):
+                    sh2.cell(row=row, column=col, value="☐")
+            sh2["C33"].value = 0
+            sh2["C34"].value = 0
+
+        sh2.print_area = "A1:E40"
+
+    wb.save(filled_xlsx_path)
+    wb.close()
+
+    return filled_xlsx_path
+
+
+def generate_diary_pdf_sheet(site_diary_doc: Dict[str, Any], sheet_name: str) -> str:
+    xlsx_path = generate_diary_xlsx_only(site_diary_doc)
+    temp_dir = os.path.dirname(xlsx_path)
+
+    dr_data = site_diary_doc.get("daily_report_data", {})
+    raw_date = dr_data.get("report_date", "")
+    date_str = raw_date.replace("-", "") if raw_date else "noDate"
+
+    if sheet_name == 'sheet1':
+        target_sheet_name = "每日施工進度報告表"
+        pdf_filename = f"{date_str}每日施工進度報告表.pdf"
+    else:
+        target_sheet_name = "每日本地工人及外地勞工施工人員紀錄表"
+        pdf_filename = f"{date_str}施工人員紀錄表.pdf"
+
+    pdf_path = os.path.join(temp_dir, pdf_filename)
+
+    single_sheet_xlsx = os.path.join(temp_dir, f"{date_str}_{sheet_name}_only.xlsx")
+    shutil.copy(xlsx_path, single_sheet_xlsx)
+
+    wb = load_workbook(single_sheet_xlsx)
+    if target_sheet_name not in wb.sheetnames:
+        wb.close()
+        raise RuntimeError(f"指定工作表 '{target_sheet_name}' 不存在於模板。")
+
+    for sn in wb.sheetnames:
+        if sn != target_sheet_name:
+            wb.remove(wb[sn])
+    wb.save(single_sheet_xlsx)
+    wb.close()
+
+    lo_exec = get_libreoffice_cmd()
+    input_filter = "Calc Office Open XML"
+
+    # ★ 調整/嘗試更多字型嵌入設定：EmbedStandardFonts, UseTaggedPDF 等
+    #   也可嘗試 EmbedAllFonts=true 或 ExportEmbedFonts=true，視實際 LibreOffice 版本支援情況而定
+    pdf_filter_options = "SelectPdfVersion=1;EmbedStandardFonts=true;UseTaggedPDF=true"
+    output_filter = f"pdf:calc_pdf_Export:{pdf_filter_options}"
+
+    if platform.system().lower().startswith("win"):
+        cmd = (
+            f'"{lo_exec}" --headless --convert-to "{output_filter}" '
+            f'--infilter="{input_filter}" "{single_sheet_xlsx}" --outdir "{temp_dir}"'
+        )
+        try:
+            result = subprocess.run(cmd, shell=True, check=True, capture_output=True)
+        except subprocess.CalledProcessError as e:
+            err_msg = e.stderr.decode('utf-8', errors='replace') if e.stderr else str(e)
+            raise RuntimeError(f"LibreOffice PDF conversion failed (Windows): {err_msg}") from e
+    else:
+        cmd_list = [
+            lo_exec, "--headless",
+            "--convert-to", output_filter,
+            f'--infilter={input_filter}',
+            single_sheet_xlsx,
+            "--outdir", temp_dir
+        ]
+        try:
+            result = subprocess.run(cmd_list, shell=False, check=True, capture_output=True)
+        except subprocess.CalledProcessError as e:
+            err_msg = e.stderr.decode('utf-8', errors='replace') if e.stderr else str(e)
+            raise RuntimeError(f"LibreOffice PDF conversion failed: {err_msg}") from e
+
+    generated_pdf_name = os.path.splitext(single_sheet_xlsx)[0] + ".pdf"
+    if os.path.isfile(generated_pdf_name):
+        os.rename(generated_pdf_name, pdf_path)
+    else:
+        raise RuntimeError(f"PDF 轉檔失敗: {generated_pdf_name} 不存在")
+
+    if not os.path.isfile(pdf_path):
+        raise RuntimeError(f"PDF 轉檔失敗: {pdf_path} 不存在")
+
+    return pdf_path
+
+
+def get_libreoffice_cmd() -> str:
+    custom_path = os.environ.get("LIBREOFFICE_PATH")
+    if custom_path:
+        if os.path.isfile(custom_path):
+            return custom_path
+        soffice_path = os.path.join(custom_path, "soffice")
+        libreoffice_path = os.path.join(custom_path, "libreoffice")
+        if os.path.isfile(soffice_path):
+            return soffice_path
+        if os.path.isfile(libreoffice_path):
+            return libreoffice_path
+        raise RuntimeError(f"LIBREOFFICE_PATH 無效: {custom_path}")
+
+    from shutil import which
+    for candidate in ("soffice", "libreoffice"):
+        exe_path = which(candidate)
+        if exe_path:
+            return exe_path
+
+    raise RuntimeError(
+        "無法自動找到 libreoffice/soffice！請安裝 LibreOffice 或設定 LIBREOFFICE_PATH"
+    )
 
 ================================================================================
 
@@ -526,7 +1674,7 @@ from datetime import datetime, date, timedelta
 from typing import Dict, Any, Optional, List
 from bson.objectid import ObjectId
 
-from backend.db import mongo, get_next_sequence
+from backend.db import mongo, get_next_sequence, parse_date_str, normalize_progress, find_all_and_format, find_one_or_404
 
 logger = logging.getLogger(__name__)
 
@@ -539,13 +1687,14 @@ def get_all_tasks_for_project(project_id: int):
     """
     查詢當前最新資料(不含版本快照)的 tasks。
     """
-    cursor = mongo.db["gantt_tasks"].find({"project_id": project_id})
-    tasks = []
-    for doc in cursor:
-        formatted = _format_task_doc(doc)
-        if formatted is not None:
-            tasks.append(formatted)
-    return tasks
+    def format_task(doc):
+        return _format_task_doc(doc)
+    
+    return find_all_and_format(
+        collection="gantt_tasks",
+        query={"project_id": project_id},
+        formatter=format_task
+    )
 
 
 def create_gantt_task(data: Dict[str, Any], snapshot_date_str: str = "") -> int:
@@ -571,9 +1720,9 @@ def create_gantt_task(data: Dict[str, Any], snapshot_date_str: str = "") -> int:
     if not start_date_str:
         raise ValueError("Must provide start_date")
 
-    start_dt = _parse_date_str(start_date_str, default_date_str="2025-01-01")
+    start_dt = parse_date_str(start_date_str, default_date_str="2025-01-01")
     if end_date_str:
-        end_dt = _parse_date_str(end_date_str, default_date_str=None)  # None代表就用start+1
+        end_dt = parse_date_str(end_date_str, default_date_str=None)  # None代表就用start+1
         if end_dt is None:
             end_dt = start_dt + timedelta(days=1)
     else:
@@ -592,16 +1741,19 @@ def create_gantt_task(data: Dict[str, Any], snapshot_date_str: str = "") -> int:
         end_dt = start_dt
 
     # progress
-    progress_val = _normalize_progress(progress)
+    progress_val = normalize_progress(progress)
 
     # 如果是 snapshot 模式 => 先讀出 tasks array，再 in-memory 新增
     if snapshot_date_str:
-        snap_doc = mongo.db["gantt_snapshots"].find_one({
-            "project_id": project_id,
-            "snapshot_date": snapshot_date_str
-        })
-        if not snap_doc:
-            raise ValueError(f"Snapshot not found for {snapshot_date_str}")
+        # 使用 find_one_or_404 函數查詢
+        snap_doc = find_one_or_404(
+            "gantt_snapshots",
+            {
+                "project_id": project_id,
+                "snapshot_date": snapshot_date_str
+            },
+            f"Snapshot not found for {snapshot_date_str}"
+        )
 
         tasks_list = snap_doc.get("tasks", [])
 
@@ -678,12 +1830,14 @@ def update_gantt_task(task_id: int, data: Dict[str, Any], snapshot_date_str: str
 
     if snapshot_date_str:
         # 更新快照 in memory
-        snap = mongo.db["gantt_snapshots"].find_one({
-            "project_id": project_id,
-            "snapshot_date": snapshot_date_str
-        })
-        if not snap:
-            raise KeyError("Snapshot not found")
+        snap = find_one_or_404(
+            "gantt_snapshots",
+            {
+                "project_id": project_id,
+                "snapshot_date": snapshot_date_str
+            },
+            "Snapshot not found"
+        )
 
         tasks_list = snap.get("tasks", [])
         # 找到該task
@@ -702,7 +1856,7 @@ def update_gantt_task(task_id: int, data: Dict[str, Any], snapshot_date_str: str
             updated_doc["text"] = data["text"]
 
         if progress is not None:
-            updated_doc["progress"] = _normalize_progress(progress)
+            updated_doc["progress"] = normalize_progress(progress)
 
         if parent_id is not None:
             updated_doc["parent_id"] = parent_id
@@ -711,16 +1865,16 @@ def update_gantt_task(task_id: int, data: Dict[str, Any], snapshot_date_str: str
             updated_doc["depends"] = depends
 
         # start/end/duration
-        old_start = _parse_date_str(updated_doc.get("start_date", ""), "2025-01-01")
-        old_end = _parse_date_str(updated_doc.get("end_date", ""), None)
+        old_start = parse_date_str(updated_doc.get("start_date", ""), "2025-01-01")
+        old_end = parse_date_str(updated_doc.get("end_date", ""), None)
         if start_date_str or end_date_str or duration is not None:
             start_dt = old_start
             end_dt = old_end if old_end else (old_start + timedelta(days=1))
 
             if start_date_str:
-                start_dt = _parse_date_str(start_date_str, "2025-01-01")
+                start_dt = parse_date_str(start_date_str, "2025-01-01")
             if end_date_str:
-                end_dt = _parse_date_str(end_date_str, None)
+                end_dt = parse_date_str(end_date_str, None)
                 if end_dt is None:
                     end_dt = start_dt + timedelta(days=1)
             elif duration is not None:
@@ -742,7 +1896,7 @@ def update_gantt_task(task_id: int, data: Dict[str, Any], snapshot_date_str: str
             updated_doc["type"] = task_type
             # 如果是 milestone, 要強制同一天
             if task_type == "milestone":
-                sdt = _parse_date_str(updated_doc["start_date"], "2025-01-01")
+                sdt = parse_date_str(updated_doc["start_date"], "2025-01-01")
                 updated_doc["end_date"] = sdt.date().isoformat()
 
         updated_doc["updated_at"] = datetime.now()
@@ -760,9 +1914,12 @@ def update_gantt_task(task_id: int, data: Dict[str, Any], snapshot_date_str: str
 
     else:
         # 更新 DB
-        doc = mongo.db["gantt_tasks"].find_one({"id": task_id, "project_id": project_id})
-        if not doc:
-            raise KeyError("Task not found")
+        # 使用 find_one_or_404 函數查詢
+        doc = find_one_or_404(
+            "gantt_tasks", 
+            {"id": task_id, "project_id": project_id},
+            "Task not found"
+        )
 
         update_fields = {}
 
@@ -770,7 +1927,7 @@ def update_gantt_task(task_id: int, data: Dict[str, Any], snapshot_date_str: str
             update_fields["text"] = data["text"]
 
         if progress is not None:
-            update_fields["progress"] = _normalize_progress(progress)
+            update_fields["progress"] = normalize_progress(progress)
 
         if parent_id is not None:
             update_fields["parent_id"] = parent_id
@@ -779,17 +1936,17 @@ def update_gantt_task(task_id: int, data: Dict[str, Any], snapshot_date_str: str
 
         old_start_str = doc.get("start_date", "")
         old_end_str = doc.get("end_date", "")
-        old_start_dt = _parse_date_str(old_start_str, "2025-01-01")
-        old_end_dt = _parse_date_str(old_end_str, None)
+        old_start_dt = parse_date_str(old_start_str, "2025-01-01")
+        old_end_dt = parse_date_str(old_end_str, None)
 
         if start_date_str or end_date_str or duration is not None:
             start_dt = old_start_dt
             end_dt = old_end_dt if old_end_dt else (old_start_dt + timedelta(days=1))
 
             if start_date_str:
-                start_dt = _parse_date_str(start_date_str, "2025-01-01")
+                start_dt = parse_date_str(start_date_str, "2025-01-01")
             if end_date_str:
-                end_dt = _parse_date_str(end_date_str, None)
+                end_dt = parse_date_str(end_date_str, None)
                 if end_dt is None:
                     end_dt = start_dt + timedelta(days=1)
             elif duration is not None:
@@ -809,7 +1966,7 @@ def update_gantt_task(task_id: int, data: Dict[str, Any], snapshot_date_str: str
         if task_type:
             update_fields["type"] = task_type
             if task_type == "milestone":
-                sdt = _parse_date_str(update_fields.get("start_date") or old_start_str, "2025-01-01")
+                sdt = parse_date_str(update_fields.get("start_date") or old_start_str, "2025-01-01")
                 update_fields["end_date"] = sdt.date().isoformat()
 
         update_fields["updated_at"] = datetime.now()
@@ -830,12 +1987,14 @@ def delete_gantt_task(project_id: int, task_id: int, snapshot_date_str: str = ""
              否則在 DB 中刪
     """
     if snapshot_date_str:
-        snap = mongo.db["gantt_snapshots"].find_one({
-            "project_id": project_id,
-            "snapshot_date": snapshot_date_str
-        })
-        if not snap:
-            raise KeyError("Snapshot not found")
+        snap = find_one_or_404(
+            "gantt_snapshots",
+            {
+                "project_id": project_id,
+                "snapshot_date": snapshot_date_str
+            },
+            "Snapshot not found"
+        )
 
         tasks_list = snap.get("tasks", [])
         new_tasks_list = []
@@ -909,25 +2068,30 @@ def _calc_duration(start_date_iso, end_date_iso):
 # --------------------------------------------------------------------------
 
 def get_gantt_snapshots_for_project(project_id: int):
-    cursor = mongo.db["gantt_snapshots"].find(
-        {"project_id": project_id},
-        sort=[("snapshot_date", 1)]
+    return find_all_and_format(
+        collection="gantt_snapshots",
+        query={"project_id": project_id},
+        sort_key="snapshot_date",
+        sort_order=1
     )
-    return list(cursor)
 
 
 def get_specific_snapshot(project_id: int, snapshot_date_str: str):
-    snap = mongo.db["gantt_snapshots"].find_one({
-        "project_id": project_id,
-        "snapshot_date": snapshot_date_str
-    })
-    return snap
+    return find_one_or_404(
+        "gantt_snapshots",
+        {
+            "project_id": project_id,
+            "snapshot_date": snapshot_date_str
+        },
+        f"Snapshot not found for date {snapshot_date_str}"
+    )
 
 
 def create_daily_snapshot(project_id: int, snap_date: date) -> str:
     """
     建立該日期的快照(若已存在則擲錯)。
     """
+    # 檢查是否已存在相同日期的快照
     exists = mongo.db["gantt_snapshots"].find_one({
         "project_id": project_id,
         "snapshot_date": snap_date.isoformat()
@@ -977,8 +2141,7 @@ def delete_gantt_snapshot(project_id: int, snapshot_date_str: str) -> bool:
 # --------------------------------------------------------------------------
 
 def get_holiday_settings(project_id: int) -> Optional[dict]:
-    doc = mongo.db["gantt_holidays"].find_one({"project_id": project_id})
-    return doc
+    return mongo.db["gantt_holidays"].find_one({"project_id": project_id})
 
 
 def update_holiday_settings(project_id: int, data: Dict[str, Any]):
@@ -1116,8 +2279,8 @@ def _calc_parent_fields(child_tasks: List[dict], parent_type: str):
     max_end = None
     total_progress = 0.0
     for c in child_tasks:
-        s = _parse_date_str(c.get("start_date", ""), "2025-01-01")
-        e = _parse_date_str(c.get("end_date", ""), "2025-01-02")
+        s = parse_date_str(c.get("start_date", ""), "2025-01-01")
+        e = parse_date_str(c.get("end_date", ""), "2025-01-02")
         p = c.get("progress", 0.0)
         if min_start is None or s < min_start:
             min_start = s
@@ -1160,12 +2323,15 @@ def reassign_task_ids(project_id: int, snapshot_date_str: str = ""):
     從1開始連號，建議依照「無 parent 的排在前面(可能有多個樹根)，再 BFS or DFS 排子」。
     """
     if snapshot_date_str:
-        snap = mongo.db["gantt_snapshots"].find_one({
-            "project_id": project_id,
-            "snapshot_date": snapshot_date_str
-        })
-        if not snap:
-            raise ValueError(f"Snapshot not found for {snapshot_date_str}")
+        snap = find_one_or_404(
+            "gantt_snapshots",
+            {
+                "project_id": project_id,
+                "snapshot_date": snapshot_date_str
+            },
+            f"Snapshot not found for {snapshot_date_str}"
+        )
+        
         tasks_list = snap.get("tasks", [])
         new_tasks_list = _reassign_ids_in_memory(tasks_list)
         # 寫回
@@ -1280,34 +2446,8 @@ def _reassign_ids_in_memory(tasks_list: List[dict]) -> List[dict]:
 # 工具函式
 # --------------------------------------------------------------------------
 
-def _parse_date_str(date_str: str, default_date_str: Optional[str]) -> Optional[datetime]:
-    """
-    將 'YYYY-MM-DD' parse 成 datetime(YYYY,MM,DD) (無時間)
-    若失敗或空 => 若 default_date_str 不為 None 就用 default_date_str; 否則回傳 None
-    """
-    if not date_str:
-        if default_date_str is not None:
-            return datetime.strptime(default_date_str, "%Y-%m-%d")
-        return None
-    try:
-        return datetime.strptime(date_str, "%Y-%m-%d")
-    except ValueError:
-        if default_date_str is not None:
-            return datetime.strptime(default_date_str, "%Y-%m-%d")
-        return None
-
-
-def _normalize_progress(progress):
-    # 確保介於 0 ~ 1
-    try:
-        p = float(progress)
-    except:
-        p = 0.0
-    if math.isnan(p) or p < 0:
-        p = 0.0
-    if p > 1:
-        p = 1.0
-    return p
+# 已將 _parse_date_str 和 _normalize_progress 移至 backend/db.py 作為共用函數
+# 現在使用 db 模組中的 parse_date_str 和 normalize_progress
 
 ================================================================================
 
@@ -1322,20 +2462,16 @@ from werkzeug.exceptions import NotFound
 
 from backend.project_management.routes import projects_bp
 from backend.material_management.routes import material_bp
-from backend.site_diary.routes import site_diary_bp
+# from backend.site_diary.routes import site_diary_bp  # <-- 已刪除，不再引用
 from backend.staff_management.routes import staff_bp
 
-# ★ 移除對 server.py 的 import
-# from backend.server import download_bp
-
-# ★ 引用並初始化 Mongo
 from backend.db import init_mongo_app
 
-# SSE Blueprint
-from backend.site_diary.progress_sse import progress_sse_bp
-
-# Gantt Management blueprint
+# from backend.site_diary.progress_sse import progress_sse_bp  # <-- 已刪除，不再引用
 from backend.gantt_management.routes import gantt_bp
+
+# ★★ 新增文件管理 blueprint
+from backend.document_management.routes import document_bp
 
 
 def create_app():
@@ -1347,19 +2483,14 @@ def create_app():
     # Blueprint 註冊
     app.register_blueprint(projects_bp, url_prefix='/api/projects')
     app.register_blueprint(material_bp, url_prefix='/api')
-    app.register_blueprint(site_diary_bp, url_prefix='/api/projects')
+    # app.register_blueprint(site_diary_bp, url_prefix='/api/projects')  # <-- 已刪除
     app.register_blueprint(staff_bp, url_prefix='/api/staff')
-
-    # ★ 移除 server.py blueprint
-    # app.register_blueprint(download_bp)
-
-    # SSE blueprint
-    app.register_blueprint(progress_sse_bp, url_prefix='/api')
-
-    # Gantt blueprint
+    # app.register_blueprint(progress_sse_bp, url_prefix='/api')  # <-- 已刪除
     app.register_blueprint(gantt_bp, url_prefix='/api/projects')
 
-    # 提供前端打包後的 SPA 檔案
+    # ★★ 文件管理
+    app.register_blueprint(document_bp, url_prefix='/api/documents')
+
     @app.route('/', defaults={'path': ''})
     @app.route('/<path:path>')
     def serve_vue_app(path):
@@ -1370,9 +2501,6 @@ def create_app():
         else:
             return send_from_directory(dist_dir, 'index.html')
 
-    # ===============★ 處理 404 ★===============
-    # 如果路由未匹配到，而且是 /api/... ，就回傳 JSON 404。
-    # 否則一律回傳前端 index.html 讓前端路由處理 (SPA)。
     @app.errorhandler(NotFound)
     def handle_404(e):
         if request.path.startswith('/api'):
@@ -1730,1033 +2858,26 @@ def delete_project(project_id):
 
 ================================================================================
 
-backend/site_diary/progress_sse.py
-
-================================================================================
-# backend/site_diary/progress_sse.py
-
-import time
-import uuid
-import threading
-from flask import Blueprint, Response, stream_with_context
-
-progress_sse_bp = Blueprint('progress_sse_bp', __name__)
-
-# 全域字典：job_id -> {"status": ..., "progress": ..., "file_path": ..., "error_msg": ...}
-# 實務可用 Redis / DB 等替代。
-progress_store = {}
-
-@progress_sse_bp.route('/progress-sse/<job_id>', methods=['GET'])
-def sse_progress(job_id):
-    """
-    SSE 端點：前端可透過 EventSource('/api/progress-sse/<job_id>')
-    來接收進度 (以 data: {...} 形式送出)。
-    只要 status != 'done'/'error'，就持續每秒推送一次。
-    """
-    @stream_with_context
-    def generate_stream():
-        while True:
-            job_info = progress_store.get(job_id)
-            if not job_info:
-                # job_id 不存在 => 立即送出錯誤並結束串流
-                yield _sse_pack({"error": "Invalid job_id"}, event="error")
-                break
-
-            data_dict = {
-                "progress": job_info.get("progress", 0),
-                "status": job_info.get("status", "unknown"),
-                "error_msg": job_info.get("error_msg", "")
-            }
-
-            yield _sse_pack(data_dict)
-
-            # 若完成或出錯，結束 SSE
-            if data_dict["status"] in ("done", "error"):
-                break
-
-            # 否則繼續等待一秒
-            time.sleep(1)
-
-    return Response(generate_stream(), mimetype='text/event-stream')
-
-
-def _sse_pack(data: dict, event=None) -> str:
-    """
-    將 dict 轉成 SSE 格式字串, 例如:
-      event: <event>\n
-      data: <json>\n
-      \n
-    """
-    import json
-    lines = []
-    if event:
-        lines.append(f"event: {event}")
-    json_str = json.dumps(data, ensure_ascii=False)
-    lines.append(f"data: {json_str}")
-    lines.append("")  # 空行代表訊息分隔
-    return "\n".join(lines) + "\n"
-
-================================================================================
-
-backend/site_diary/routes.py
-
-================================================================================
-# backend/site_diary/routes.py
-
-import traceback
-import logging
-from flask import Blueprint, request, jsonify, send_file, Response, abort, current_app
-from datetime import datetime
-from urllib.parse import quote
-import os
-import tempfile
-import shutil
-import zipfile
-
-from backend.db import mongo, get_next_sequence, to_iso_date, to_iso_datetime
-logger = logging.getLogger(__name__)
-
-site_diary_bp = Blueprint('site_diary_bp', __name__)
-
-# ★ 新增
-import threading
-import uuid
-from backend.site_diary.progress_sse import progress_store
-from backend.site_diary.services import (
-    generate_diary_xlsx_only,
-    generate_diary_pdf_sheet,
-)
-
-
-@site_diary_bp.route('/<int:project_id>/site_diaries', methods=['POST'])
-def create_site_diary(project_id):
-    logger.debug("create_site_diary() called, project_id=%s", project_id)
-
-    project_doc = mongo.db.projects.find_one({"id": project_id})
-    if not project_doc:
-        logger.warning("Project not found: project_id=%s, returning 404", project_id)
-        abort(404, description="Project not found")
-
-    data = request.json or {}
-    logger.debug("Received data for create_site_diary: %s", data)
-
-    report_date_str = data.get('report_date')
-    if report_date_str:
-        report_date = datetime.strptime(report_date_str, '%Y-%m-%d')
-    else:
-        report_date = None
-
-    doc_id = get_next_sequence("site_diaries")
-
-    workers_dict = data.get('workers', {})
-    machines_dict = data.get('machines', {})
-    staff_ids = data.get('staff_ids', [])
-
-    site_diary_doc = {
-        "id": doc_id,
-        "project_id": project_id,
-        "report_date": report_date,
-        "weather_morning": data.get('weather_morning', ''),
-        "weather_noon": data.get('weather_noon', ''),
-        "day_count": data.get('day_count'),
-        "summary": data.get('summary', ''),
-        "workers": workers_dict,
-        "machines": machines_dict,
-        "staff_ids": staff_ids,
-        "updated_at": datetime.now()
-    }
-
-    # 若未填 day_count，則自動計算
-    if site_diary_doc["day_count"] is None:
-        max_day = mongo.db.site_diaries.find(
-            {"project_id": project_id, "day_count": {"$ne": None}},
-            {"day_count": 1}
-        ).sort("day_count", -1).limit(1)
-        row = next(max_day, None)
-        if row:
-            site_diary_doc["day_count"] = row["day_count"] + 1
-        else:
-            site_diary_doc["day_count"] = 1
-
-    mongo.db.site_diaries.insert_one(site_diary_doc)
-    logger.info("Site diary created: diary_id=%s, day_count=%s", doc_id, site_diary_doc["day_count"])
-
-    return jsonify({
-        "message": "Site diary created",
-        "site_diary_id": doc_id,
-        "day_count": site_diary_doc["day_count"]
-    }), 201
-
-
-@site_diary_bp.route('/<int:project_id>/site_diaries', methods=['GET'])
-def get_site_diaries(project_id):
-    """
-    可傳 query param:
-      - sort_by=(report_date|day_count|updated_at|...) 預設 report_date
-      - sort_order=(1|-1) 預設 1 (ASC)
-    """
-    logger.debug("get_site_diaries() called, project_id=%s", project_id)
-
-    project_doc = mongo.db.projects.find_one({"id": project_id})
-    if not project_doc:
-        logger.warning("Project not found: project_id=%s, returning 404", project_id)
-        abort(404, description="Project not found")
-
-    sort_by = request.args.get('sort_by', 'report_date').strip() or 'report_date'
-    sort_order_str = request.args.get('sort_order', '1').strip()
-    try:
-        sort_order = int(sort_order_str)
-        if sort_order not in (1, -1):
-            sort_order = 1
-    except ValueError:
-        sort_order = 1
-
-    cursor = mongo.db.site_diaries.find({"project_id": project_id}).sort([(sort_by, sort_order)])
-    results = []
-
-    for sd in cursor:
-        worker_list = []
-        for w_type, qty in sd.get("workers", {}).items():
-            worker_list.append({"type": w_type, "quantity": qty})
-        machine_list = []
-        for m_type, qty in sd.get("machines", {}).items():
-            machine_list.append({"type": m_type, "quantity": qty})
-        staff_list = []
-        staff_ids = sd.get("staff_ids", [])
-        if staff_ids:
-            staff_docs = list(mongo.db.staff.find({"id": {"$in": staff_ids}}))
-            staff_map = {s["id"]: s for s in staff_docs}
-            for sid in staff_ids:
-                st_doc = staff_map.get(sid)
-                if st_doc:
-                    staff_list.append({
-                        "id": st_doc["id"],
-                        "name": st_doc.get("name"),
-                        "role": st_doc.get("role")
-                    })
-
-        results.append({
-            "id": sd["id"],
-            "report_date": to_iso_date(sd.get("report_date")),
-            "weather_morning": sd.get("weather_morning", ""),
-            "weather_noon": sd.get("weather_noon", ""),
-            "day_count": sd.get("day_count"),
-            "summary": sd.get("summary", ""),
-            "workers": worker_list,
-            "machines": machine_list,
-            "staffs": staff_list,
-            "updated_at": to_iso_datetime(sd.get("updated_at"))
-        })
-
-    logger.debug("Returning %d diaries for project_id=%s", len(results), project_id)
-    return jsonify(results), 200
-
-
-@site_diary_bp.route('/<int:project_id>/site_diaries/<int:diary_id>', methods=['PUT'])
-def update_site_diary(project_id, diary_id):
-    logger.debug("update_site_diary() called, project_id=%s, diary_id=%s", project_id, diary_id)
-
-    site_diary = mongo.db.site_diaries.find_one({"project_id": project_id, "id": diary_id})
-    if not site_diary:
-        logger.warning("SiteDiary not found: project_id=%s, diary_id=%s", project_id, diary_id)
-        abort(404, description="SiteDiary not found")
-
-    data = request.json or {}
-    logger.debug("Received data for update_site_diary: %s", data)
-
-    update_fields = {}
-    report_date_str = data.get('report_date')
-    if report_date_str == "":
-        update_fields["report_date"] = None
-    elif report_date_str:
-        update_fields["report_date"] = datetime.strptime(report_date_str, '%Y-%m-%d')
-
-    if "weather_morning" in data:
-        update_fields["weather_morning"] = data["weather_morning"]
-    if "weather_noon" in data:
-        update_fields["weather_noon"] = data["weather_noon"]
-    if "day_count" in data:
-        update_fields["day_count"] = data["day_count"]
-    if "summary" in data:
-        update_fields["summary"] = data["summary"]
-    if "workers" in data:
-        update_fields["workers"] = data["workers"]
-    if "machines" in data:
-        update_fields["machines"] = data["machines"]
-    if "staff_ids" in data:
-        update_fields["staff_ids"] = data["staff_ids"]
-
-    # 若前端沒傳 day_count 或給 null，就繼續自動計算
-    if ("day_count" not in data) or (data["day_count"] is None):
-        max_day = mongo.db.site_diaries.find(
-            {"project_id": project_id, "day_count": {"$ne": None}},
-            {"day_count": 1}
-        ).sort("day_count", -1).limit(1)
-        row = next(max_day, None)
-        if row:
-            update_fields["day_count"] = row["day_count"] + 1
-        else:
-            update_fields["day_count"] = 1
-
-    update_fields["updated_at"] = datetime.now()
-
-    if update_fields:
-        mongo.db.site_diaries.update_one(
-            {"project_id": project_id, "id": diary_id},
-            {"$set": update_fields}
-        )
-        logger.info("Site diary updated: project_id=%s, diary_id=%s, fields=%s",
-                    project_id, diary_id, list(update_fields.keys()))
-    else:
-        logger.debug("No fields updated.")
-
-    return jsonify({
-        "message": "Site diary updated",
-        "day_count": update_fields.get("day_count", site_diary.get("day_count"))
-    }), 200
-
-
-@site_diary_bp.route('/<int:project_id>/site_diaries/<int:diary_id>', methods=['DELETE'])
-def delete_site_diary(project_id, diary_id):
-    logger.debug("delete_site_diary() called, project_id=%s, diary_id=%s", project_id, diary_id)
-
-    result = mongo.db.site_diaries.delete_one({"project_id": project_id, "id": diary_id})
-    if result.deleted_count == 0:
-        logger.warning("Site diary not found, cannot delete: project_id=%s, diary_id=%s", project_id, diary_id)
-        abort(404, description="Site diary not found")
-
-    logger.info("Site diary deleted: project_id=%s, diary_id=%s", project_id, diary_id)
-    return jsonify({"message": "Site diary deleted"}), 200
-
-
-@site_diary_bp.route('/<int:project_id>/site_diaries/<int:diary_id>/download_report', methods=['GET'])
-def download_site_diary_report(project_id, diary_id):
-    """
-    依照 ?file= 參數決定下載哪個檔案 (xlsx, sheet1, sheet2)。
-    若帶有冒號 (例如 sheet1:1)，則自動擷取冒號前部分避免錯誤。
-    """
-    logger.debug("download_site_diary_report() called, project_id=%s, diary_id=%s", project_id, diary_id)
-
-    site_diary = mongo.db.site_diaries.find_one({"project_id": project_id, "id": diary_id})
-    if not site_diary:
-        logger.warning("SiteDiary not found, returning 404: project_id=%s, diary_id=%s", project_id, diary_id)
-        return jsonify({"error": "SiteDiary not found"}), 404
-
-    file_type_param = request.args.get('file', 'xlsx')
-    main_file_type = file_type_param.split(':')[0].strip()
-    logger.debug("Raw file param=%r => main_file_type=%r", file_type_param, main_file_type)
-
-    if site_diary.get("report_date"):
-        date_str = site_diary["report_date"].strftime("%Y%m%d")
-    else:
-        date_str = "noDate"
-
-    try:
-        if main_file_type == 'xlsx':
-            from backend.site_diary.services import generate_diary_xlsx_only
-            xlsx_path = generate_diary_xlsx_only(site_diary)
-            download_name = f"{date_str}_daily_report.xlsx"
-            logger.info("Returning XLSX report: %s", download_name)
-            return _send_file_with_utf8_filename(xlsx_path, download_name)
-
-        elif main_file_type in ('sheet1', 'sheet2'):
-            from backend.site_diary.services import generate_diary_pdf_sheet
-            pdf_path = generate_diary_pdf_sheet(site_diary, sheet_name=main_file_type)
-            if main_file_type == 'sheet1':
-                download_name = f"{date_str}每日施工進度報告表.pdf"
-                ascii_fallback = f"{date_str}_daily_report.pdf"
-            else:
-                download_name = f"{date_str}施工人員紀錄表.pdf"
-                ascii_fallback = f"{date_str}_worker_log.pdf"
-
-            logger.info("Returning PDF report: %s (sheet=%s)", download_name, main_file_type)
-            return _send_file_with_utf8_filename(pdf_path, download_name, ascii_fallback)
-
-        else:
-            logger.warning("Unknown file type: %r => returning 400", file_type_param)
-            return jsonify({"error": f"Unknown file type '{file_type_param}'"}), 400
-
-    except FileNotFoundError as e:
-        logger.error("FileNotFoundError: %s", e, exc_info=True)
-        return jsonify({"error": f"FileNotFoundError: {e}"}), 404
-    except PermissionError as e:
-        logger.error("PermissionError: %s", e, exc_info=True)
-        return jsonify({"error": f"PermissionError: {e}"}), 403
-    except RuntimeError as e:
-        logger.error("RuntimeError: %s", e, exc_info=True)
-        return jsonify({"error": f"RuntimeError: {e}"}), 500
-    except Exception as e:
-        tb = traceback.format_exc()
-        logger.exception("Unhandled exception during download_site_diary_report:")
-        return jsonify({"error": str(e), "traceback": tb}), 500
-
-
-def _send_file_with_utf8_filename(file_path: str, download_name: str, ascii_fallback: str = None) -> Response:
-    """
-    統一版本：可接收 2~3 個參數。
-      file_path:      實際檔案路徑
-      download_name:  想顯示給使用者下載的檔名(可能含中文)
-      ascii_fallback: 若瀏覽器不支援 RFC 5987 filename*=UTF-8 用的備用檔名
-    """
-    from flask import send_file
-    from urllib.parse import quote
-
-    response = send_file(file_path, as_attachment=True)
-
-    if not ascii_fallback:
-        # 若呼叫者沒傳入 ascii_fallback 就自動生成簡易檔名
-        ascii_fallback = "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "_" for ch in download_name)
-
-    utf8_quoted = quote(download_name, encoding="utf-8")
-    disposition_value = (
-        f'attachment; filename="{ascii_fallback}"; '
-        f'filename*=UTF-8\'\'{utf8_quoted}'
-    )
-    safe_disposition = disposition_value.encode('latin-1', 'replace').decode('latin-1')
-    response.headers["Content-Disposition"] = safe_disposition
-
-    return response
-
-
-@site_diary_bp.route('/<int:project_id>/site_diaries/last', methods=['GET'])
-def get_last_site_diary(project_id):
-    """
-    取得該 project 最後一筆日報(依報表日期 desc, id desc)
-    """
-    logger.debug("get_last_site_diary() called, project_id=%s", project_id)
-
-    project_doc = mongo.db.projects.find_one({"id": project_id})
-    if not project_doc:
-        logger.debug("Project not found for last site diary: project_id=%s", project_id)
-        return jsonify({}), 200
-
-    last_sd = mongo.db.site_diaries.find({"project_id": project_id}).sort("id", -1).limit(1)
-    last_diary = next(last_sd, None)
-    if not last_diary:
-        logger.debug("No diaries found for project_id=%s", project_id)
-        return jsonify({}), 200
-
-    worker_list = [{"id": i, "type": w_type, "quantity": qty}
-                   for i, (w_type, qty) in enumerate(last_diary.get("workers", {}).items(), start=1)]
-    machine_list = [{"id": i, "type": m_type, "quantity": qty}
-                    for i, (m_type, qty) in enumerate(last_diary.get("machines", {}).items(), start=1)]
-
-    staff_list = []
-    staff_ids = last_diary.get("staff_ids", [])
-    if staff_ids:
-        staff_docs = list(mongo.db.staff.find({"id": {"$in": staff_ids}}))
-        staff_map = {s["id"]: s for s in staff_docs}
-        for sid in staff_ids:
-            st_doc = staff_map.get(sid)
-            if st_doc:
-                staff_list.append({
-                    "id": st_doc["id"],
-                    "name": st_doc.get("name"),
-                    "role": st_doc.get("role")
-                })
-
-    result = {
-        "id": last_diary["id"],
-        "report_date": to_iso_date(last_diary.get("report_date")),
-        "weather_morning": last_diary.get("weather_morning", ""),
-        "weather_noon": last_diary.get("weather_noon", ""),
-        "day_count": last_diary.get("day_count"),
-        "summary": last_diary.get("summary", ""),
-        "workers": worker_list,
-        "machines": machine_list,
-        "staffs": staff_list
-    }
-
-    logger.debug("Returning last diary for project_id=%s => diary_id=%s", project_id, last_diary["id"])
-    return jsonify(result), 200
-
-
-# ============================================================================
-# [多筆下載 - 同步版] (原本就有) - 量小可直接使用
-# ============================================================================
-@site_diary_bp.route('/<int:project_id>/site_diaries/multi_download', methods=['POST'])
-def multi_download_site_diary(project_id):
-    """
-    多筆下載 - 同步版。
-    數量較大時，若處理時間過長可能導致 Gunicorn timeout。
-    """
-    data = request.json or {}
-    diary_ids = data.get("diary_ids", [])
-    file_type = data.get("file_type", "xlsx")
-    logger.info("multi_download_site_diary called => diary_ids=%s, file_type=%s", diary_ids, file_type)
-
-    if not diary_ids:
-        return jsonify({"error": "No diary_ids provided"}), 400
-
-    temp_dir = tempfile.mkdtemp(prefix="multi_diary_")
-    zip_filename = f"multiple_diaries_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
-    zip_path = os.path.join(temp_dir, zip_filename)
-
-    used_names = set()
-
-    from backend.site_diary.services import generate_diary_xlsx_only, generate_diary_pdf_sheet
-
-    def ensure_unique_filename(base_name, used):
-        if base_name not in used:
-            used.add(base_name)
-            return base_name
-        base, ext = os.path.splitext(base_name)
-        i = 2
-        new_name = f"{base}_{i}{ext}"
-        while new_name in used:
-            i += 1
-            new_name = f"{base}_{i}{ext}"
-        used.add(new_name)
-        return new_name
-
-    try:
-        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-            for d_id in diary_ids:
-                diary_doc = mongo.db.site_diaries.find_one({"project_id": project_id, "id": d_id})
-                if not diary_doc:
-                    logger.warning("Diary not found or belongs to another project: id=%s", d_id)
-                    continue
-
-                # 依 file_type 產檔
-                if diary_doc.get("report_date"):
-                    date_prefix = diary_doc["report_date"].strftime("%Y%m%d")
-                else:
-                    date_prefix = "noDate"
-
-                if file_type == 'xlsx':
-                    xlsx_path = generate_diary_xlsx_only(diary_doc)
-                    base_name = f"{date_prefix}_daily_report.xlsx"
-                    final_name = ensure_unique_filename(base_name, used_names)
-                    zf.write(xlsx_path, arcname=final_name)
-
-                elif file_type in ('sheet1', 'sheet2'):
-                    pdf_path = generate_diary_pdf_sheet(diary_doc, sheet_name=file_type)
-                    if file_type == 'sheet1':
-                        base_name = f"{date_prefix}_daily_report.pdf"
-                    else:
-                        base_name = f"{date_prefix}_worker_log.pdf"
-                    final_name = ensure_unique_filename(base_name, used_names)
-                    zf.write(pdf_path, arcname=final_name)
-
-                else:
-                    logger.warning("Skipping unknown file_type=%s for diary_id=%s", file_type, d_id)
-                    continue
-
-        logger.info("multi_download => created ZIP: %s", zip_path)
-        return _send_file_with_utf8_filename(zip_path, zip_filename)
-
-    except Exception as exc:
-        logger.exception("multi_download_site_diary() exception: ")
-        shutil.rmtree(temp_dir, ignore_errors=True)
-        return jsonify({"error": str(exc)}), 500
-
-
-# ============================================================================
-# [多筆下載 - 非同步版 + SSE進度]  ---------------------------------------------
-# ============================================================================
-
-@site_diary_bp.route('/<int:project_id>/site_diaries/multi_download_async', methods=['POST'])
-def multi_download_site_diary_async(project_id):
-    """
-    非同步版 + SSE:
-      1) 前端 POST {diary_ids, file_type} 進來
-      2) 後端產生 job_id, 用執行緒背景處理, 立即回傳 {"job_id": ...}
-      3) 前端用 SSE(/api/progress-sse/<job_id>) 監看進度
-      4) 完成後 (status=done), 再呼叫 multi_download_result 取得最後ZIP
-    """
-    data = request.json or {}
-    diary_ids = data.get("diary_ids", [])
-    file_type = data.get("file_type", "xlsx")
-    if not diary_ids:
-        return jsonify({"error": "No diary_ids provided"}), 400
-
-    project_doc = mongo.db.projects.find_one({"id": project_id})
-    if not project_doc:
-        abort(404, description="Project not found")
-
-    job_id = str(uuid.uuid4())
-    progress_store[job_id] = {
-        "status": "in_progress",
-        "progress": 0,
-        "file_path": None,
-        "error_msg": ""
-    }
-
-    # ★ 關鍵修正：在啟動背景執行緒前，先抓取「當前 app 物件」並傳進去
-    appctx = current_app._get_current_object()
-
-    t = threading.Thread(
-        target=_background_zip_generation,
-        args=(appctx, job_id, project_id, diary_ids, file_type),
-        daemon=True
-    )
-    t.start()
-
-    return jsonify({"job_id": job_id}), 200
-
-
-def _background_zip_generation(app, job_id, project_id, diary_ids, file_type):
-    """
-    在背景執行的打包函式，會更新 progress_store[job_id] 中的 progress/status/file_path
-
-    ★ 使用 with app.app_context(): 避免 'Working outside of application context' 錯誤
-    """
-    try:
-        with app.app_context():
-            total = len(diary_ids)
-            if total == 0:
-                raise ValueError("No diaries specified.")
-
-            temp_dir = tempfile.mkdtemp(prefix="multi_diary_")
-            zip_filename = f"multiple_diaries_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
-            zip_path = os.path.join(temp_dir, zip_filename)
-
-            used_names = set()
-
-            from backend.site_diary.services import generate_diary_xlsx_only, generate_diary_pdf_sheet
-
-            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-                for idx, d_id in enumerate(diary_ids, start=1):
-                    # 更新進度
-                    progress_store[job_id]["progress"] = int(idx * 100 / total)
-
-                    diary_doc = mongo.db.site_diaries.find_one({"project_id": project_id, "id": d_id})
-                    if not diary_doc:
-                        continue
-
-                    if diary_doc.get("report_date"):
-                        date_str = diary_doc["report_date"].strftime("%Y%m%d")
-                    else:
-                        date_str = "noDate"
-
-                    if file_type == 'xlsx':
-                        path_ = generate_diary_xlsx_only(diary_doc)
-                        base_name = f"{date_str}_daily_report.xlsx"
-                    elif file_type == 'sheet1':
-                        path_ = generate_diary_pdf_sheet(diary_doc, sheet_name='sheet1')
-                        base_name = f"{date_str}_daily_report.pdf"
-                    elif file_type == 'sheet2':
-                        path_ = generate_diary_pdf_sheet(diary_doc, sheet_name='sheet2')
-                        base_name = f"{date_str}_worker_log.pdf"
-                    else:
-                        continue
-
-                    final_name = _ensure_unique_filename(base_name, used_names)
-                    zf.write(path_, arcname=final_name)
-
-            progress_store[job_id]["status"] = "done"
-            progress_store[job_id]["file_path"] = zip_path
-
-    except Exception as e:
-        progress_store[job_id]["status"] = "error"
-        progress_store[job_id]["error_msg"] = str(e)
-        logger.exception("background_zip_generation error:")
-    finally:
-        # 確保結束時強制 progress=100
-        progress_store[job_id]["progress"] = 100
-
-
-def _ensure_unique_filename(base_name, used_names):
-    if base_name not in used_names:
-        used_names.add(base_name)
-        return base_name
-    base, ext = os.path.splitext(base_name)
-    i = 2
-    new_name = f"{base}_{i}{ext}"
-    while new_name in used_names:
-        i += 1
-        new_name = f"{base}_{i}{ext}"
-    used_names.add(new_name)
-    return new_name
-
-
-@site_diary_bp.route('/<int:project_id>/site_diaries/multi_download_result', methods=['GET'])
-def multi_download_result(project_id):
-    """
-    當 SSE 監測到 status=done 後，前端呼叫:
-       GET /api/projects/<project_id>/site_diaries/multi_download_result?job_id=xxx
-    以實際拿到 ZIP 檔。
-    """
-    job_id = request.args.get('job_id')
-    if not job_id:
-        return jsonify({"error": "Missing job_id"}), 400
-
-    job_info = progress_store.get(job_id)
-    if not job_info:
-        return jsonify({"error": "Invalid job_id"}), 400
-
-    if job_info["status"] != "done":
-        return jsonify({"error": f"Job not done. status={job_info['status']}"}), 400
-
-    zip_path = job_info["file_path"]
-    if not zip_path or not os.path.isfile(zip_path):
-        return jsonify({"error": "File not found for this job."}), 404
-
-    filename = os.path.basename(zip_path)
-    return send_file(zip_path, as_attachment=True, download_name=filename)
-
-================================================================================
-
-backend/site_diary/services.py
-
-================================================================================
-# backend/site_diary/services.py
-
-import os
-import tempfile
-import shutil
-import subprocess
-from datetime import datetime
-from typing import Dict, Any
-import platform
-from shutil import which
-
-from flask import current_app
-from openpyxl import load_workbook
-from openpyxl.styles import Alignment
-
-# ★ 新增：使用我們的 Mongo 物件
-from backend.db import mongo
-
-
-def generate_diary_xlsx_only(site_diary_doc: Dict[str, Any]) -> str:
-    """
-    產生/填寫 daily_report.xlsx 後，回傳填好的暫存 XLSX 檔路徑 (含所有工作表)。
-    目前只用 Sheet1/Sheet2，但整份 workbook 都會被保留。
-    """
-    # 先依 project_id 找出對應的專案資料 (Mongo)
-    project_id = site_diary_doc.get("project_id")
-    project_doc = mongo.db.projects.find_one({"id": project_id})
-    if not project_doc:
-        raise ValueError("Project not found in MongoDB (id={}).".format(project_id))
-
-    # 日報日期
-    report_date = site_diary_doc.get("report_date")
-    # Mongodb 中該欄可能是 datetime 或 None
-    date_str = report_date.strftime("%Y-%m-%d") if report_date else ""
-
-    # 專案基本資訊
-    project_name = project_doc.get("name", "")
-    project_job_number = project_doc.get("job_number", "")
-    contractor_name = project_doc.get("contractor", "")
-
-    # 日數 / 摘要 / 天氣
-    day_count_str = str(site_diary_doc.get("day_count", ""))
-    summary_str = site_diary_doc.get("summary", "")
-    weather_morning = site_diary_doc.get("weather_morning", "")
-    weather_noon = site_diary_doc.get("weather_noon", "")
-
-    # 專案開始日期
-    start_date = project_doc.get("start_date")
-    start_date_str = start_date.strftime("%Y-%m-%d") if start_date else ""
-
-    # 工期
-    duration_days = project_doc.get("duration_days")
-    duration_type = project_doc.get("duration_type")
-    if duration_days:
-        if duration_type == "business":
-            duration_str = f"{duration_days}工作天"
-        else:
-            duration_str = f"{duration_days}天"
-    else:
-        duration_str = ""
-
-    # 建立 worker_map / machine_map => 對應 Excel 中的儲存格 (Sheet1)
-    worker_map = {
-        "地盤總管": "D19",
-        "工程師":  "D20",
-        "管工":    "D21",
-        "平水員":  "D22",
-        "燒焊焊工": "D23",
-        "機手":    "D24",
-        "泥水工":  "D25",
-        "紮鐵工":  "D26",
-        "木板工":  "D27", 
-        "電工":    "D28",
-        "水喉工":  "D29",
-        "雜工":    "D30",
-    }
-    machine_map = {
-        "挖掘機": "G19",
-        "發電機": "G20",
-        "風機":   "G21",
-        "泥頭車": "G22",
-        "吊機":   "G23",
-        "機炮":   "G24",
-        "屈鐵機": "G25",  
-        "風車鋸": "G26",  
-    }
-
-    # 從 site_diary_doc 取出 workers/machines 這兩個 dict
-    workers_dict = site_diary_doc.get("workers", {})
-    machines_dict = site_diary_doc.get("machines", {})
-
-    # 找到 daily_report.xlsx 模板位置
-    template_path = os.path.join(
-        current_app.root_path,
-        'site_diary',
-        'templates',
-        'daily_report.xlsx'
-    )
-    if not os.path.isfile(template_path):
-        raise FileNotFoundError(f"daily_report.xlsx not found: {template_path}")
-
-    # 在系統臨時資料夾中建立暫存路徑
-    temp_dir = tempfile.mkdtemp(prefix="diary_xlsx_")
-
-    # 用報表日期組出輸出檔名
-    date_str_for_filename = "noDate" if not date_str else report_date.strftime("%Y%m%d")
-    filled_xlsx_path = os.path.join(
-        temp_dir,
-        f"{date_str_for_filename}_daily_report.xlsx"
-    )
-
-    # 複製模板
-    shutil.copy(template_path, filled_xlsx_path)
-
-    # 打開並填寫
-    wb = load_workbook(filled_xlsx_path)
-    # 目前預期兩個 sheet: 「每日施工進度報告表」「每日本地工人及外地勞工施工人員紀錄表」
-
-    # Sheet1: "每日施工進度報告表"
-    if "每日施工進度報告表" in wb.sheetnames:
-        sh1 = wb["每日施工進度報告表"]
-
-        # 基本欄位
-        sh1["C2"].value = date_str
-        sh1["C2"].alignment = Alignment(horizontal='center', vertical='center')
-
-        sh1["K2"].value = start_date_str
-        sh1["K2"].alignment = Alignment(horizontal='center', vertical='center')
-
-        sh1["D4"].value = project_name
-        sh1["D4"].alignment = Alignment(horizontal='center', vertical='center')
-
-        sh1["D5"].value = project_job_number
-        sh1["D5"].alignment = Alignment(horizontal='center', vertical='center')
-
-        sh1["D6"].value = contractor_name
-        sh1["D6"].alignment = Alignment(horizontal='center', vertical='center')
-
-        sh1["E7"].value = weather_morning
-        sh1["E7"].alignment = Alignment(horizontal='center', vertical='center')
-
-        sh1["H7"].value = weather_noon
-        sh1["H7"].alignment = Alignment(horizontal='center', vertical='center')
-
-        sh1["D8"].value = duration_str
-        sh1["D8"].alignment = Alignment(horizontal='center', vertical='center')
-
-        sh1["J8"].value = day_count_str
-        sh1["J8"].alignment = Alignment(horizontal='center', vertical='center')
-
-        sh1["B10"].value = summary_str
-        sh1["B10"].alignment = Alignment(horizontal='center', vertical='center')
-
-        # 工人數量
-        for w_type, cell_ref in worker_map.items():
-            qty = workers_dict.get(w_type, 0)
-            sh1[cell_ref].value = str(qty) if qty else ""
-            sh1[cell_ref].alignment = Alignment(horizontal='center', vertical='center')
-
-        # 機器數量
-        for m_type, cell_ref in machine_map.items():
-            qty = machines_dict.get(m_type, 0)
-            sh1[cell_ref].value = str(qty) if qty else ""
-            sh1[cell_ref].alignment = Alignment(horizontal='center', vertical='center')
-
-        # 列印範圍
-        sh1.print_area = "A1:L46"
-
-    # Sheet2: "每日本地工人及外地勞工施工人員紀錄表"
-    if "每日本地工人及外地勞工施工人員紀錄表" in wb.sheetnames:
-        sh2 = wb["每日本地工人及外地勞工施工人員紀錄表"]
-
-        # B3 放日期 (用 YYYY/MM/DD)
-        b3_date = report_date.strftime("%Y/%m/%d") if report_date else ""
-        sh2["B3"].value = b3_date
-        sh2["B3"].alignment = Alignment(horizontal='center', vertical='center')
-
-        # 專案名稱
-        sh2["B6"].value = project_name
-        sh2["B6"].alignment = Alignment(horizontal='center', vertical='center')
-
-        # 工程編號
-        sh2["B7"].value = project_job_number
-        sh2["B7"].alignment = Alignment(horizontal='center', vertical='center')
-
-        # 承建商
-        sh2["B8"].value = contractor_name
-        sh2["B8"].alignment = Alignment(horizontal='center', vertical='center')
-
-        # ===== 關鍵需求：若全部工人 + 機器皆為 0，則 B11-D25, B28-C32 全填 "☐"，並 C33=0, C34=0 =====
-        total_workers_sum = sum(workers_dict.values())
-        total_machines_sum = sum(machines_dict.values())
-        if (total_workers_sum + total_machines_sum) == 0:
-            # B11 ~ D25
-            for row in range(11, 26):
-                for col in range(2, 5):  # 2~4 => B, C, D
-                    sh2.cell(row=row, column=col, value="☐")
-            # B28 ~ C32
-            for row in range(28, 33):
-                for col in range(2, 4):  # 2~3 => B, C
-                    sh2.cell(row=row, column=col, value="☐")
-            # C33 = 0, C34 = 0
-            sh2["C33"].value = 0
-            sh2["C34"].value = 0
-
-        sh2.print_area = "A1:E40"
-
-    wb.save(filled_xlsx_path)
-    wb.close()
-
-    return filled_xlsx_path
-
-
-def generate_diary_pdf_sheet(site_diary_doc: Dict[str, Any], sheet_name: str) -> str:
-    """
-    依照 sheet_name ('sheet1' or 'sheet2')，只輸出對應工作表的 PDF:
-      - sheet1 => "每日施工進度報告表"
-      - sheet2 => "每日本地工人及外地勞工施工人員紀錄表"
-
-    內部流程：
-      1) 先 generate_diary_xlsx_only() 產生含所有工作表的 XLSX
-      2) 複製一份，刪掉不必要的工作表，只保留目標表
-      3) 用 LibreOffice CLI 轉成 PDF (指定內嵌字型、PDF/A-1) 以避免中文亂碼
-      4) 回傳轉好的 PDF 路徑
-    """
-    # 產生整本 XLSX
-    xlsx_path = generate_diary_xlsx_only(site_diary_doc)
-    temp_dir = os.path.dirname(xlsx_path)
-
-    # 報表日期（命名用）
-    report_date = site_diary_doc.get("report_date")
-    date_str_for_filename = "noDate"
-    if report_date:
-        date_str_for_filename = report_date.strftime("%Y%m%d")
-
-    # 決定要保留的工作表名稱
-    if sheet_name == 'sheet1':
-        target_sheet_name = "每日施工進度報告表"
-        pdf_filename = f"{date_str_for_filename}每日施工進度報告表.pdf"
-    else:
-        target_sheet_name = "每日本地工人及外地勞工施工人員紀錄表"
-        pdf_filename = f"{date_str_for_filename}施工人員紀錄表.pdf"
-
-    pdf_path = os.path.join(temp_dir, pdf_filename)
-
-    # 先另存一份只保留指定工作表的 XLSX
-    single_sheet_xlsx = os.path.join(temp_dir, f"{date_str_for_filename}_{sheet_name}_only.xlsx")
-    shutil.copy(xlsx_path, single_sheet_xlsx)
-
-    wb = load_workbook(single_sheet_xlsx)
-    if target_sheet_name not in wb.sheetnames:
-        wb.close()
-        raise RuntimeError(f"指定工作表 '{target_sheet_name}' 不存在於模板中。")
-
-    # 刪除其他工作表
-    for sn in wb.sheetnames:
-        if sn != target_sheet_name:
-            wb.remove(wb[sn])
-    wb.save(single_sheet_xlsx)
-    wb.close()
-
-    # 執行 LibreOffice CLI 轉 PDF
-    lo_exec = get_libreoffice_cmd()
-    input_filter = "Calc Office Open XML"
-
-    # ★ 為了避免中文亂碼，指定 PDF/A-1 與 EmbedStandardFonts=true
-    pdf_filter_options = "SelectPdfVersion=1;EmbedStandardFonts=true"
-    output_filter = f"pdf:calc_pdf_Export:{pdf_filter_options}"
-
-    if platform.system().lower().startswith("win"):
-        # Windows系統
-        cmd = (
-            f'"{lo_exec}" --headless --convert-to "{output_filter}" '
-            f'--infilter="{input_filter}" "{single_sheet_xlsx}" --outdir "{temp_dir}"'
-        )
-        try:
-            result = subprocess.run(cmd, shell=True, check=True, capture_output=True)
-        except subprocess.CalledProcessError as e:
-            err_msg = e.stderr.decode('utf-8', errors='replace') if e.stderr else str(e)
-            raise RuntimeError(f"LibreOffice PDF conversion failed (Windows): {err_msg}") from e
-    else:
-        # Linux / Mac
-        cmd_list = [
-            lo_exec, "--headless",
-            "--convert-to", output_filter,
-            f'--infilter={input_filter}',
-            single_sheet_xlsx,
-            "--outdir", temp_dir
-        ]
-        try:
-            result = subprocess.run(cmd_list, shell=False, check=True, capture_output=True)
-        except subprocess.CalledProcessError as e:
-            err_msg = e.stderr.decode('utf-8', errors='replace') if e.stderr else str(e)
-            raise RuntimeError(f"LibreOffice PDF conversion failed: {err_msg}") from e
-
-    generated_pdf_name = os.path.splitext(single_sheet_xlsx)[0] + ".pdf"
-    if os.path.isfile(generated_pdf_name):
-        os.rename(generated_pdf_name, pdf_path)
-    else:
-        raise RuntimeError(f"PDF 轉檔失敗: {generated_pdf_name} 不存在")
-
-    if not os.path.isfile(pdf_path):
-        raise RuntimeError(f"PDF 轉檔失敗: {pdf_path} 不存在")
-
-    return pdf_path
-
-
-def get_libreoffice_cmd() -> str:
-    """
-    取得 LibreOffice 執行檔路徑:
-      1) 若有環境變數 LIBREOFFICE_PATH，先檢查是否有效
-      2) 否則嘗試 which('soffice') 或 which('libreoffice')
-      3) 全部找不到就拋錯
-    """
-    custom_path = os.environ.get("LIBREOFFICE_PATH")
-    if custom_path:
-        if os.path.isfile(custom_path):
-            return custom_path
-        soffice_path = os.path.join(custom_path, "soffice")
-        libreoffice_path = os.path.join(custom_path, "libreoffice")
-        if os.path.isfile(soffice_path):
-            return soffice_path
-        if os.path.isfile(libreoffice_path):
-            return libreoffice_path
-        raise RuntimeError(f"LIBREOFFICE_PATH 無效: {custom_path}")
-
-    for candidate in ("soffice", "libreoffice"):
-        exe_path = which(candidate)
-        if exe_path:
-            return exe_path
-
-    raise RuntimeError(
-        "無法自動找到 libreoffice/soffice！請安裝 LibreOffice 或設定 LIBREOFFICE_PATH"
-    )
-
-================================================================================
-
 backend/staff_management/routes.py
 
 ================================================================================
 # backend/staff_management/routes.py
 from flask import Blueprint, request, jsonify, abort
 
-from backend.db import mongo, get_next_sequence
+from backend.db import mongo, get_next_sequence, find_all_and_format, find_one_or_404
 
 staff_bp = Blueprint('staff_bp', __name__)
 
 @staff_bp.route('', methods=['GET'])
 def list_staff():
-    cursor = mongo.db.staff.find({}, sort=[("id", 1)])
-    results = []
-    for s in cursor:
-        results.append({
-            "id": s["id"],
-            "name": s.get("name", ""),
-            "role": s.get("role", "")
-        })
+    def format_staff(doc):
+        return {
+            "id": doc["id"],
+            "name": doc.get("name", ""),
+            "role": doc.get("role", "")
+        }
+    
+    results = find_all_and_format(collection='staff', formatter=format_staff)
     return jsonify(results), 200
 
 
@@ -2782,17 +2903,76 @@ def create_staff():
     }), 201
 
 
+@staff_bp.route('/<int:staff_id>', methods=['GET'])
+def get_staff(staff_id):
+    staff = find_one_or_404('staff', {"id": staff_id}, "Staff not found")
+    
+    return jsonify({
+        "id": staff["id"],
+        "name": staff.get("name", ""),
+        "role": staff.get("role", "")
+    }), 200
+
+
+@staff_bp.route('/<int:staff_id>', methods=['PUT'])
+def update_staff(staff_id):
+    staff = find_one_or_404('staff', {"id": staff_id}, "Staff not found")
+    
+    data = request.json or {}
+    update_fields = {}
+    if "name" in data:
+        update_fields["name"] = data["name"]
+    if "role" in data:
+        update_fields["role"] = data["role"]
+    
+    if update_fields:
+        mongo.db.staff.update_one({"id": staff_id}, {"$set": update_fields})
+    
+    return jsonify({"message": "Staff updated"}), 200
+
+
 @staff_bp.route('/<int:staff_id>', methods=['DELETE'])
 def delete_staff(staff_id):
     result = mongo.db.staff.delete_one({"id": staff_id})
     if result.deleted_count == 0:
         abort(404, description="Staff not found")
+    
     return jsonify({"message": "Staff deleted"}), 200
 
 ================================================================================
 
 fonts/MINGLIU.TTC
 
+================================================================================
+
+frontend/build.js
+
+================================================================================
+// build.js - 非常基礎的構建腳本
+import { execSync } from 'child_process'
+import fs from 'fs'
+
+// 確保 dist 目錄存在
+if (!fs.existsSync('./dist')) {
+  fs.mkdirSync('./dist')
+}
+
+try {
+  console.log('正在執行超輕量構建（使用 npx）...')
+  // 使用 npx 確保能找到 vite 命令
+  execSync('npx vite build --mode production --outDir dist', { 
+    stdio: 'inherit',
+    env: {
+      ...process.env,
+      VITE_SKIP_TS_CHECK: 'true',
+      NODE_ENV: 'production'
+    }
+  })
+  console.log('構建完成!')
+} catch (error) {
+  console.error('構建失敗:', error)
+  process.exit(1)
+} 
 ================================================================================
 
 frontend/index.html
@@ -2828,7 +3008,7 @@ frontend/package.json
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "vue-tsc -b && vite build",
+    "build": "npx vite build",
     "preview": "vite preview"
   },
   "dependencies": {
@@ -2843,9 +3023,12 @@ frontend/package.json
     "vue-router": "^4.5.0"
   },
   "devDependencies": {
-    "@types/node": "^22.13.0",
+    "@types/axios": "^0.14.0",
+    "@types/node": "^18.11.9",
+    "@types/webpack-env": "^1.18.8",
     "@vitejs/plugin-vue": "^5.2.1",
     "@vue/tsconfig": "^0.7.0",
+    "esbuild": "^0.19.11",
     "typescript": "~5.6.2",
     "vite": "^6.0.5",
     "vue-tsc": "^2.2.0"
@@ -2946,6 +3129,165 @@ export default {
    若是 Gantt 頁面，則改用上方 <div style="margin:0;padding:0;"> 撐滿整個畫面。 */
 </style>
 
+================================================================================
+
+frontend/src/App.vue.js
+
+================================================================================
+import { computed } from 'vue';
+import { useRoute } from 'vue-router';
+export default (await import('vue')).defineComponent({
+    name: 'App',
+    setup() {
+        const route = useRoute();
+        // 簡單判斷路徑中是否包含 /gantt
+        // （也可改更精準判斷 route.name === 'ProjectsGantt' 之類）
+        const isGanttPage = computed(() => {
+            return route.path.includes('/gantt');
+        });
+        return {
+            isGanttPage
+        };
+    }
+}); /* PartiallyEnd: #3632/script.vue */
+function __VLS_template() {
+    const __VLS_ctx = {};
+    let __VLS_components;
+    let __VLS_directives;
+    // CSS variable injection 
+    // CSS variable injection end 
+    __VLS_elementAsFunction(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({});
+    __VLS_elementAsFunction(__VLS_intrinsicElements.nav, __VLS_intrinsicElements.nav)({
+        ...{ class: ("navbar navbar-expand-lg navbar-dark bg-primary") },
+    });
+    __VLS_elementAsFunction(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
+        ...{ class: ("container-fluid") },
+    });
+    __VLS_elementAsFunction(__VLS_intrinsicElements.a, __VLS_intrinsicElements.a)({
+        ...{ class: ("navbar-brand") },
+        href: ("#"),
+    });
+    __VLS_elementAsFunction(__VLS_intrinsicElements.button, __VLS_intrinsicElements.button)({
+        ...{ class: ("navbar-toggler") },
+        type: ("button"),
+        'data-bs-toggle': ("collapse"),
+        'data-bs-target': ("#navbarSupportedContent"),
+        'aria-controls': ("navbarSupportedContent"),
+        'aria-expanded': ("false"),
+        'aria-label': ("Toggle navigation"),
+    });
+    __VLS_elementAsFunction(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({
+        ...{ class: ("navbar-toggler-icon") },
+    });
+    __VLS_elementAsFunction(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
+        ...{ class: ("collapse navbar-collapse") },
+        id: ("navbarSupportedContent"),
+    });
+    __VLS_elementAsFunction(__VLS_intrinsicElements.ul, __VLS_intrinsicElements.ul)({
+        ...{ class: ("navbar-nav ms-auto mb-2 mb-lg-0") },
+    });
+    __VLS_elementAsFunction(__VLS_intrinsicElements.li, __VLS_intrinsicElements.li)({
+        ...{ class: ("nav-item") },
+    });
+    const __VLS_0 = {}.RouterLink;
+    /** @type { [typeof __VLS_components.RouterLink, typeof __VLS_components.routerLink, typeof __VLS_components.RouterLink, typeof __VLS_components.routerLink, ] } */ ;
+    // @ts-ignore
+    const __VLS_1 = __VLS_asFunctionalComponent(__VLS_0, new __VLS_0({
+        to: ("/"),
+        ...{ class: ("nav-link") },
+    }));
+    const __VLS_2 = __VLS_1({
+        to: ("/"),
+        ...{ class: ("nav-link") },
+    }, ...__VLS_functionalComponentArgsRest(__VLS_1));
+    __VLS_5.slots.default;
+    var __VLS_5;
+    __VLS_elementAsFunction(__VLS_intrinsicElements.li, __VLS_intrinsicElements.li)({
+        ...{ class: ("nav-item") },
+    });
+    const __VLS_6 = {}.RouterLink;
+    /** @type { [typeof __VLS_components.RouterLink, typeof __VLS_components.routerLink, typeof __VLS_components.RouterLink, typeof __VLS_components.routerLink, ] } */ ;
+    // @ts-ignore
+    const __VLS_7 = __VLS_asFunctionalComponent(__VLS_6, new __VLS_6({
+        to: ("/projects"),
+        ...{ class: ("nav-link") },
+    }));
+    const __VLS_8 = __VLS_7({
+        to: ("/projects"),
+        ...{ class: ("nav-link") },
+    }, ...__VLS_functionalComponentArgsRest(__VLS_7));
+    __VLS_11.slots.default;
+    var __VLS_11;
+    __VLS_elementAsFunction(__VLS_intrinsicElements.li, __VLS_intrinsicElements.li)({
+        ...{ class: ("nav-item") },
+    });
+    const __VLS_12 = {}.RouterLink;
+    /** @type { [typeof __VLS_components.RouterLink, typeof __VLS_components.routerLink, typeof __VLS_components.RouterLink, typeof __VLS_components.routerLink, ] } */ ;
+    // @ts-ignore
+    const __VLS_13 = __VLS_asFunctionalComponent(__VLS_12, new __VLS_12({
+        to: ("/material"),
+        ...{ class: ("nav-link") },
+    }));
+    const __VLS_14 = __VLS_13({
+        to: ("/material"),
+        ...{ class: ("nav-link") },
+    }, ...__VLS_functionalComponentArgsRest(__VLS_13));
+    __VLS_17.slots.default;
+    var __VLS_17;
+    __VLS_elementAsFunction(__VLS_intrinsicElements.li, __VLS_intrinsicElements.li)({
+        ...{ class: ("nav-item") },
+    });
+    const __VLS_18 = {}.RouterLink;
+    /** @type { [typeof __VLS_components.RouterLink, typeof __VLS_components.routerLink, typeof __VLS_components.RouterLink, typeof __VLS_components.routerLink, ] } */ ;
+    // @ts-ignore
+    const __VLS_19 = __VLS_asFunctionalComponent(__VLS_18, new __VLS_18({
+        to: ("/staff"),
+        ...{ class: ("nav-link") },
+    }));
+    const __VLS_20 = __VLS_19({
+        to: ("/staff"),
+        ...{ class: ("nav-link") },
+    }, ...__VLS_functionalComponentArgsRest(__VLS_19));
+    __VLS_23.slots.default;
+    var __VLS_23;
+    if (__VLS_ctx.isGanttPage) {
+        __VLS_elementAsFunction(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
+            ...{ style: ({}) },
+        });
+        const __VLS_24 = {}.RouterView;
+        /** @type { [typeof __VLS_components.RouterView, typeof __VLS_components.routerView, ] } */ ;
+        // @ts-ignore
+        const __VLS_25 = __VLS_asFunctionalComponent(__VLS_24, new __VLS_24({}));
+        const __VLS_26 = __VLS_25({}, ...__VLS_functionalComponentArgsRest(__VLS_25));
+    }
+    else {
+        __VLS_elementAsFunction(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
+            ...{ class: ("container my-4") },
+        });
+        const __VLS_30 = {}.RouterView;
+        /** @type { [typeof __VLS_components.RouterView, typeof __VLS_components.routerView, ] } */ ;
+        // @ts-ignore
+        const __VLS_31 = __VLS_asFunctionalComponent(__VLS_30, new __VLS_30({}));
+        const __VLS_32 = __VLS_31({}, ...__VLS_functionalComponentArgsRest(__VLS_31));
+    }
+    ['navbar', 'navbar-expand-lg', 'navbar-dark', 'bg-primary', 'container-fluid', 'navbar-brand', 'navbar-toggler', 'navbar-toggler-icon', 'collapse', 'navbar-collapse', 'navbar-nav', 'ms-auto', 'mb-2', 'mb-lg-0', 'nav-item', 'nav-link', 'nav-item', 'nav-link', 'nav-item', 'nav-link', 'nav-item', 'nav-link', 'container', 'my-4',];
+    var __VLS_slots;
+    var $slots;
+    let __VLS_inheritedAttrs;
+    var $attrs;
+    const __VLS_refs = {};
+    var $refs;
+    var $el;
+    return {
+        attrs: {},
+        slots: __VLS_slots,
+        refs: $refs,
+        rootEl: $el,
+    };
+}
+;
+let __VLS_self;
+//# sourceMappingURL=App.vue.js.map
 ================================================================================
 
 frontend/src/assets/vue.svg
@@ -3299,6 +3641,7 @@ export default {
 frontend/src/components/ProjectDetail.vue
 
 ================================================================================
+<!-- frontend/src/components/ProjectDetail.vue -->
 <template>
   <div v-if="project" class="card p-3">
     <h5 class="card-title">Project Detail</h5>
@@ -3312,21 +3655,24 @@ frontend/src/components/ProjectDetail.vue
     <p>Contractor: {{ project.contractor }}</p>
 
     <div class="mt-3">
-      <router-link
-        :to="`/projects/${projectId}/diaries`"
-        class="btn btn-info me-2"
-      >
-        Manage Site Diaries
-      </router-link>
+      <!-- 
+        已移除舊的 "Manage Site Diaries" 按鈕，避免觸發 /projects/:projectId/diaries 404
+      -->
 
-      <!-- ★ 新增的按鈕: Go to Gantt Chart -->
       <router-link
         :to="`/projects/${projectId}/gantt`"
-        class="btn btn-warning"
+        class="btn btn-warning me-2"
       >
         Gantt
       </router-link>
-      <!-- -------------- -->
+
+      <!-- 新增文件(包含 Daily Reports)的入口 -->
+      <router-link
+        :to="`/projects/${projectId}/documents`"
+        class="btn btn-secondary"
+      >
+        Documents
+      </router-link>
     </div>
   </div>
 </template>
@@ -3614,89 +3960,55 @@ frontend/src/components/ProjectList.vue
           <td>{{ item.start_date }}</td>
           <td>{{ item.end_date }}</td>
           <td>
-            <button class="btn btn-info btn-sm me-2" @click="showDetail(item.id)">
-              Detail
-            </button>
-            <button class="btn btn-warning btn-sm me-2" @click="editProject(item.id)">
+            <!-- 改為 Gantt 與 Documents -->
+            <router-link
+              class="btn btn-warning btn-sm me-2"
+              :to="`/projects/${item.id}/gantt`"
+            >
+              Gantt
+            </router-link>
+
+            <router-link
+              class="btn btn-secondary btn-sm me-2"
+              :to="`/projects/${item.id}/documents`"
+            >
+              Documents
+            </router-link>
+
+            <!-- Edit -->
+            <button
+              class="btn btn-info btn-sm me-2"
+              @click="editProject(item.id)"
+            >
               Edit
             </button>
-            <button class="btn btn-danger btn-sm" @click="deleteProject(item.id)">
+
+            <!-- Delete -->
+            <button
+              class="btn btn-danger btn-sm"
+              @click="deleteProject(item.id)"
+            >
               Delete
             </button>
           </td>
         </tr>
       </tbody>
     </table>
-
-    <!-- Detail Modal (Bootstrap) -->
-    <div
-      class="modal"
-      :class="{ fade: true, show: detailDialog }"
-      :style="{ display: detailDialog ? 'block' : 'none' }"
-      tabindex="-1"
-      role="dialog"
-      aria-modal="true"
-      v-if="detailDialog"
-      @click.self="detailDialog = false"
-    >
-      <div class="modal-dialog" role="document">
-        <div class="modal-content">
-          <div class="modal-header">
-            <h5 class="modal-title">Project Detail</h5>
-            <button
-              type="button"
-              class="btn-close"
-              @click="detailDialog = false"
-            ></button>
-          </div>
-          <div class="modal-body">
-            <ProjectDetail :projectId="detailProjectId" />
-          </div>
-          <div class="modal-footer">
-            <button
-              type="button"
-              class="btn btn-secondary"
-              @click="detailDialog = false"
-            >
-              Close
-            </button>
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <!-- Modal backdrop -->
-    <div
-      v-if="detailDialog"
-      class="modal-backdrop fade show"
-    ></div>
   </div>
 </template>
 
 <script>
 import axios from 'axios'
-import ProjectDetail from '@/components/ProjectDetail.vue'
 
 export default {
   name: 'ProjectList',
-  components: { ProjectDetail },
   props: {
     projects: {
       type: Array,
       default: () => []
     }
   },
-  data() {
-    return {
-      detailDialog: false,
-      detailProjectId: null
-    }
-  },
   methods: {
-    showDetail(projectId) {
-      this.detailProjectId = projectId
-      this.detailDialog = true
-    },
     editProject(projectId) {
       this.$emit('edit-project', projectId)
     },
@@ -3719,14 +4031,6 @@ export default {
 }
 .mb-6 {
   margin-bottom: 24px;
-}
-
-/* ★ 關鍵：確保 modal 與 backdrop 層級正確 */
-.modal {
-  z-index: 1050; /* Bootstrap默認modal z-index */
-}
-.modal-backdrop {
-  z-index: 1040; /* 低於modal即可 */
 }
 </style>
 
@@ -3919,47 +4223,59 @@ export default {
     const localReportDateStr = ref('')
     const staffList = ref([])
 
+    // 載入全部 staff
     const fetchStaff = async () => {
       try {
+        console.log("[DEBUG] fetchStaff => GET /api/staff")
         const { data } = await axios.get('/api/staff')
         staffList.value = data
       } catch (err) {
-        console.error(err)
+        console.error('[DEBUG] fetchStaff error:', err)
       }
     }
 
+    // 讀取全部日報 -> 找到指定 diaryId 的那一筆 (以 /api/documents/daily-reports)
     const fetchExistingDiary = async () => {
       if (!props.diaryId) return
       try {
-        const { data } = await axios.get(`/api/projects/${props.projectId}/site_diaries`)
+        console.log(`[DEBUG] fetchExistingDiary => GET /api/documents/daily-reports?project_id=${props.projectId}`)
+        const { data } = await axios.get('/api/documents/daily-reports', {
+          params: { project_id: props.projectId }
+        })
         const target = data.find(d => d.id === props.diaryId)
-        if (!target) return
-        setFormDataFromDiary(target)
+        if (target) {
+          setFormDataFromDiary(target)
+        } else {
+          console.log('[DEBUG] fetchExistingDiary => No matching diary found in daily-reports list.')
+        }
       } catch (err) {
-        console.error(err)
+        console.error('[DEBUG] fetchExistingDiary error:', err)
       }
     }
 
+    // 若想自動帶最後一筆，可在此撈清單後 pick 最後:
     const fetchLastDiaryAsDefault = async () => {
       if (props.diaryId) return
       try {
-        const { data } = await axios.get(
-          `/api/projects/${props.projectId}/site_diaries/last`
-        )
-        if (!data.id) {
-          // 無資料，不做預設
-          return
+        console.log(`[DEBUG] fetchLastDiaryAsDefault => GET /api/documents/daily-reports?project_id=${props.projectId}`)
+        const { data } = await axios.get('/api/documents/daily-reports', {
+          params: { project_id: props.projectId }
+        })
+        if (data.length > 0) {
+          // 以 id 最大者視為最後一筆
+          const sorted = data.slice().sort((a, b) => b.id - a.id)
+          const lastOne = sorted[0]
+          setFormDataFromDiary(lastOne)
+        } else {
+          console.log('[DEBUG] fetchLastDiaryAsDefault => no diaries found, skipping default fill')
         }
-        setFormDataFromDiary(data)
       } catch (err) {
-        console.error(err)
+        console.error('[DEBUG] fetchLastDiaryAsDefault error:', err)
       }
     }
 
     function setFormDataFromDiary(diaryData) {
-      // 報表日期
       localReportDateStr.value = diaryData.report_date || ''
-      // Weather, summary, day_count
       formData.value.weather_morning = diaryData.weather_morning || ''
       formData.value.weather_noon = diaryData.weather_noon || ''
       formData.value.day_count = diaryData.day_count || null
@@ -3967,20 +4283,22 @@ export default {
 
       // Workers
       const updatedWorkers = { ...initialFormData.workers }
-      for (const w of diaryData.workers || []) {
-        updatedWorkers[w.type] = w.quantity
+      const wObj = diaryData.workers || {}
+      for (const k of Object.keys(updatedWorkers)) {
+        updatedWorkers[k] = wObj[k] || 0
       }
       formData.value.workers = updatedWorkers
 
       // Machines
       const updatedMachines = { ...initialFormData.machines }
-      for (const m of diaryData.machines || []) {
-        updatedMachines[m.type] = m.quantity
+      const mObj = diaryData.machines || {}
+      for (const k of Object.keys(updatedMachines)) {
+        updatedMachines[k] = mObj[k] || 0
       }
       formData.value.machines = updatedMachines
 
       // Staff
-      selectedStaffIds.value = (diaryData.staffs || []).map(s => s.id)
+      selectedStaffIds.value = diaryData.staff_ids || []
     }
 
     const handleSubmit = async () => {
@@ -3994,22 +4312,25 @@ export default {
           summary: formData.value.summary,
           workers: formData.value.workers,
           machines: formData.value.machines,
-          staff_ids: selectedStaffIds.value
+          staff_ids: selectedStaffIds.value,
+          project_id: props.projectId
         }
 
         if (!props.diaryId) {
           // create
-          await axios.post(`/api/projects/${props.projectId}/site_diaries`, payload)
+          console.log("[DEBUG] handleSubmit => POST /api/documents/daily-reports", payload)
+          await axios.post('/api/documents/daily-reports', payload)
         } else {
           // update
+          console.log(`[DEBUG] handleSubmit => PUT /api/documents/daily-reports/${props.diaryId}?project_id=${props.projectId}`, payload)
           await axios.put(
-            `/api/projects/${props.projectId}/site_diaries/${props.diaryId}`,
+            `/api/documents/daily-reports/${props.diaryId}?project_id=${props.projectId}`,
             payload
           )
         }
         emit('updated')
       } catch (err) {
-        console.error(err)
+        console.error('[DEBUG] handleSubmit error:', err)
       }
     }
 
@@ -4066,6 +4387,22 @@ export default {
 
 ================================================================================
 
+frontend/src/main.js
+
+================================================================================
+// frontend/src/main.ts
+import { createApp } from 'vue';
+import App from './App.vue';
+import router from './router';
+// 改用 Bootstrap 5（CSS + JS Bundle）
+import 'bootstrap/dist/css/bootstrap.min.css';
+import 'bootstrap/dist/js/bootstrap.bundle.min.js';
+const app = createApp(App);
+app.use(router);
+app.mount('#app');
+//# sourceMappingURL=main.js.map
+================================================================================
+
 frontend/src/main.ts
 
 ================================================================================
@@ -4084,6 +4421,47 @@ app.mount('#app')
 
 ================================================================================
 
+frontend/src/router.js
+
+================================================================================
+// frontend/src/router.ts
+import { createRouter, createWebHistory } from 'vue-router'
+import HomeView from './views/HomeView.vue'
+import ProjectsView from './views/ProjectsView.vue'
+import MaterialFormView from './views/MaterialFormView.vue'
+import StaffView from './views/StaffView.vue'
+import ProjectsGanttView from './views/ProjectsGanttView.vue'
+
+// ★ 移除原先的「SiteDiaryListView」路由，改由 ProjectDocumentsView 裡面的 DAILY_REPORT 分頁
+// import SiteDiaryListView from './views/SiteDiaryListView.vue' (已刪除)
+
+import ProjectDocumentsView from './views/ProjectDocumentsView.vue'
+
+const routes = [
+  { path: '/', component: HomeView },
+  { path: '/projects', component: ProjectsView },
+  { path: '/material', component: MaterialFormView },
+  { path: '/staff', component: StaffView },
+
+  // ★ 移除 /projects/:projectId/diaries，直接合併到 project documents
+  // { path: '/projects/:projectId/diaries', component: SiteDiaryListView },
+
+  { path: '/projects/:projectId/gantt', component: ProjectsGanttView },
+
+  // ★ 調整文件管理頁面
+  {
+    path: '/projects/:projectId/documents',
+    component: ProjectDocumentsView
+  }
+]
+
+export default createRouter({
+  history: createWebHistory(),
+  routes
+})
+
+================================================================================
+
 frontend/src/router.ts
 
 ================================================================================
@@ -4094,19 +4472,27 @@ import ProjectsView from './views/ProjectsView.vue'
 import MaterialFormView from './views/MaterialFormView.vue'
 import StaffView from './views/StaffView.vue'
 import SiteDiaryListView from './views/SiteDiaryListView.vue'
-
-// ★ 新增 import
 import ProjectsGanttView from './views/ProjectsGanttView.vue'
+
+// ★ 新增：專案文件管理頁面
+import ProjectDocumentsView from './views/ProjectDocumentsView.vue'
 
 const routes = [
   { path: '/', component: HomeView },
   { path: '/projects', component: ProjectsView },
   { path: '/material', component: MaterialFormView },
   { path: '/staff', component: StaffView },
-  { path: '/projects/:projectId/diaries', component: SiteDiaryListView },
 
-  // ★ 新增：Gantt 頁面
-  { path: '/projects/:projectId/gantt', component: ProjectsGanttView }
+  // ======= 移除舊的 /projects/:projectId/diaries 以免呼叫 /site_diaries =======
+  // { path: '/projects/:projectId/diaries', component: SiteDiaryListView },
+
+  { path: '/projects/:projectId/gantt', component: ProjectsGanttView },
+
+  // ★ 新增：各 project 的文件列表頁 (裡面含 Daily Report)
+  {
+    path: '/projects/:projectId/documents',
+    component: ProjectDocumentsView
+  }
 ]
 
 export default createRouter({
@@ -4294,306 +4680,991 @@ frontend/src/views/MaterialFormView.vue
 
 ================================================================================
 <template>
-    <div class="material-form-container">
-      <h1>Material Submission Form</h1>
-  
-      <div class="form-card">
-        <form @submit.prevent="handleSubmit">
-  
-          <!-- Special Fields (工程編號、工程名稱、文件編號) -->
-          <div
-            v-for="(info, fieldName) in specialFields"
-            :key="fieldName"
-            class="form-group"
-          >
-            <label :for="fieldName" class="form-label">
-              {{ fieldName }}:
-            </label>
+  <div class="container my-4">
+    <h2>Documents of Project #{{ projectId }}</h2>
+
+    <!-- ★ Tabs -->
+    <ul class="nav nav-tabs mb-3">
+      <li class="nav-item" v-for="tab in docTypeTabs" :key="tab.value">
+        <a
+          href="#"
+          class="nav-link"
+          :class="{ active: activeTab === tab.value }"
+          @click.prevent="activeTab = tab.value"
+        >
+          {{ tab.label }}
+        </a>
+      </li>
+    </ul>
+
+    <!-- 若為 DAILY_REPORT => 顯示日報 -->
+    <div v-if="activeTab === 'DAILY_REPORT'">
+      <h4>Daily Reports</h4>
+
+      <!-- 多選下載: XLSX / PDF(表1) / PDF(表2) -->
+      <div class="d-flex justify-content-between mb-2">
+        <div v-if="dailyReports.length > 0">
+          <div class="form-check form-check-inline">
             <input
-              type="text"
-              :id="fieldName"
-              v-model="formData[fieldName]"
-              class="form-input"
-            />
-          </div>
-  
-          <hr />
-  
-          <!-- Regular Fields (報批之材料、牌子(如有)、預算表之項目編號、型號、貨期、數量) -->
-          <div
-            v-for="(item, i) in regularFields"
-            :key="i"
-            class="form-group"
-          >
-            <label :for="item[0]" class="form-label">
-              {{ item[0] }}:
-            </label>
-            <input
-              type="text"
-              :id="item[0]"
-              v-model="formData[item[0]]"
-              class="form-input"
-            />
-          </div>
-  
-          <hr />
-  
-          <!-- Material Type Checkboxes -->
-          <h3>Material Type</h3>
-          <div
-            v-for="(box, i) in materialTypeCheckboxes"
-            :key="i"
-            class="checkbox-group"
-          >
-            <input
+              class="form-check-input"
               type="checkbox"
-              :id="box[0]"
-              v-model="formData[box[0]]"
+              id="selectAllDiaries"
+              :checked="isAllSelected"
+              @change="toggleSelectAll"
             />
-            <label :for="box[0]" class="checkbox-label">
-              {{ box[0] }}
-            </label>
+            <label class="form-check-label" for="selectAllDiaries">Select All</label>
           </div>
-  
-          <hr />
-  
-          <!-- Material Status Checkboxes -->
-          <h3>Material Status</h3>
-          <div
-            v-for="(box, i) in materialStatusCheckboxes"
-            :key="i"
-            class="checkbox-group"
+          <button
+            class="btn btn-primary btn-sm"
+            :disabled="selectedDiaryIds.length === 0"
+            @click="downloadMultiple('xlsx')"
           >
-            <input
-              type="checkbox"
-              :id="box[0]"
-              v-model="formData[box[0]]"
-            />
-            <label :for="box[0]" class="checkbox-label">
-              {{ box[0] }}
-            </label>
-          </div>
-  
-          <hr />
-  
-          <!-- Attachment Type -->
-          <h3>Attachment Type</h3>
-          <div class="form-group">
-            <label for="附件" class="form-label">附件:</label>
-            <input
-              type="text"
-              id="附件"
-              v-model="formData['附件']"
-              class="form-input"
-            />
-          </div>
-          <div
-            v-for="(box, i) in attachmentTypeCheckboxes"
-            :key="i"
-            class="checkbox-group"
+            XLSX
+          </button>
+          <button
+            class="btn btn-primary btn-sm ms-1"
+            :disabled="selectedDiaryIds.length === 0"
+            @click="downloadMultiple('sheet1')"
           >
-            <input
-              type="checkbox"
-              :id="box[0]"
-              v-model="formData[box[0]]"
+            PDF (Sheet1)
+          </button>
+          <button
+            class="btn btn-primary btn-sm ms-1"
+            :disabled="selectedDiaryIds.length === 0"
+            @click="downloadMultiple('sheet2')"
+          >
+            PDF (Sheet2)
+          </button>
+        </div>
+        <button
+          class="btn btn-success btn-sm"
+          @click="openCreateDiary"
+        >
+          + New Daily Report
+        </button>
+      </div>
+
+      <!-- Diary Table -->
+      <table class="table table-sm table-bordered">
+        <thead>
+          <tr>
+            <th style="width:40px;">
+              <input
+                type="checkbox"
+                :checked="isAllSelected"
+                @change="toggleSelectAll"
+                class="form-check-input"
+              />
+            </th>
+            <th>ID</th>
+            <th>Date</th>
+            <th>Weather(M)</th>
+            <th>Weather(N)</th>
+            <th>Day#</th>
+            <th>Updated</th>
+            <th>Edit</th>
+            <th>Del</th>
+            <th>Download</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr
+            v-for="dr in dailyReports"
+            :key="dr.id"
+            :class="rowClass(dr)"
+          >
+            <td>
+              <input
+                type="checkbox"
+                class="form-check-input"
+                :value="dr.id"
+                v-model="selectedDiaryIds"
+              />
+            </td>
+            <td>{{ dr.id }}</td>
+            <td>{{ dr.report_date }}</td>
+            <td>{{ dr.weather_morning }}</td>
+            <td>{{ dr.weather_noon }}</td>
+            <td>{{ dr.day_count }}</td>
+            <td>{{ dr.updated_at }}</td>
+            <td>
+              <button
+                class="btn btn-warning btn-sm"
+                @click="editDiary(dr.id)"
+              >
+                Edit
+              </button>
+            </td>
+            <td>
+              <button
+                class="btn btn-danger btn-sm"
+                @click="deleteDiary(dr.id)"
+              >
+                Del
+              </button>
+            </td>
+            <td>
+              <div class="btn-group btn-group-sm">
+                <button
+                  class="btn btn-outline-primary"
+                  @click="downloadSingle(dr.id, 'xlsx')"
+                >
+                  XLSX
+                </button>
+                <button
+                  class="btn btn-outline-primary"
+                  @click="downloadSingle(dr.id, 'sheet1')"
+                >
+                  PDF1
+                </button>
+                <button
+                  class="btn btn-outline-primary"
+                  @click="downloadSingle(dr.id, 'sheet2')"
+                >
+                  PDF2
+                </button>
+              </div>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- 其他 doc_type 省略... -->
+
+    <!-- (略) 新增文件 Modal ... -->
+
+    <!-- 日報用的 Modal (Create/Edit) -->
+    <div
+      class="modal"
+      :class="{ fade: true, show: showDiaryModal }"
+      :style="{ display: showDiaryModal ? 'block' : 'none' }"
+      tabindex="-1"
+      role="dialog"
+      aria-modal="true"
+      v-if="showDiaryModal"
+      @click.self="closeDiaryModal"
+    >
+      <div class="modal-dialog modal-xl" role="document">
+        <div class="modal-content">
+          <div class="modal-body">
+            <DailyReportForm
+              :projectId="Number(projectId)"
+              :editingId="editingDiaryId"
+              @saved="onDiarySaved"
+              @cancel="closeDiaryModal"
             />
-            <label :for="box[0]" class="checkbox-label">
-              {{ box[0] }}
-            </label>
           </div>
-  
-          <hr />
-  
-          <!-- 日期與檔案名稱 -->
-          <div class="form-group">
-            <label for="日期" class="form-label">日期:</label>
-            <input
-              type="date"
-              id="日期"
-              v-model="formData['日期']"
-              class="form-input"
-            />
-          </div>
-  
-          <div class="form-group">
-            <label for="檔案名稱" class="form-label">檔案名稱:</label>
-            <input
-              type="text"
-              id="檔案名稱"
-              v-model="formData['檔案名稱']"
-              class="form-input"
-            />
-          </div>
-  
-          <button type="submit" class="btn-submit">Generate Excel</button>
-        </form>
+        </div>
       </div>
     </div>
-  </template>
-  
-  <script>
-  import axios from 'axios'
-  
-  export default {
-    name: 'MaterialFormView',
-    data() {
-      return {
-        // 前端資料物件：包含所有要傳給後端的欄位
-        formData: {
-          '工程編號': '',
-          '工程名稱': '',
-          '文件編號': '',
-          '報批之材料': '',
-          '牌子(如有)': '',
-          '預算表之項目編號': '',
-          '型號': '',
-          '貨期': '',
-          '數量': '',
-          // Material Type
-          '結構': false,
-          '供水': false,
-          '建築': false,
-          '電氣': false,
-          '排水': false,
-          '其他': false,
-          // Material Status
-          '與設計相同': false,
-          '與標書相同': false,
-          '與後加工程建議書相同': false,
-          '同等質量': false,
-          '替換材料': false,
-          '原設計沒有指定': false,
-          // Attachment
-          '附件': '',
-          // Attachment Type
-          '樣板': false,
-          '目錄': false,
-          '來源證': false,
-          '其他(附件)': false, // 避免和 Material Type 的 '其他' 混淆，可稍微改個 key
-          // 日期、檔案名稱
-          '日期': new Date().toISOString().split('T')[0],
-          '檔案名稱': ''
-        },
-  
-        // specialFields: 與後端 constants.py 中的 special_fields 相對應
-        specialFields: {
-          '工程編號': [6,2,4,'37/2024/DVPS'],
-          '工程名稱': [7,2,4,'黑沙馬路行人道優化工程(第二期)'],
-          '文件編號': [6,8,8,'']
-        },
-  
-        // regularFields: 與後端 constants.py 中的 regular_fields 相對應
-        regularFields: [
-          ['報批之材料', 11, 3],
-          ['牌子(如有)', 12, 3],
-          ['預算表之項目編號', 11, 7],
-          ['型號', 12, 6],
-          ['貨期', 13, 6],
-          ['數量', 14, 6]
-        ],
-  
-        // materialTypeCheckboxes: 與後端 constants.py 中的 material_type_checkboxes 相對應
-        materialTypeCheckboxes: [
-          ['結構', 7, 6],
-          ['供水', 8, 6],
-          ['建築', 7, 8],
-          ['電氣', 8, 8],
-          ['排水', 7, 10],
-          ['其他', 8, 10]
-        ],
-  
-        // materialStatusCheckboxes: 與後端 constants.py 中的 material_status_checkboxes 相對應
-        materialStatusCheckboxes: [
-          ['與設計相同', 13, 1],
-          ['與標書相同', 14, 1],
-          ['與後加工程建議書相同', 15, 1],
-          ['同等質量', 16, 1],
-          ['替換材料', 17, 1],
-          ['原設計沒有指定', 18, 1]
-        ],
-  
-        // attachmentTypeCheckboxes: 與後端 constants.py 中的 attachment_type_checkboxes 相對應
-        attachmentTypeCheckboxes: [
-          ['樣板', 16, 5],
-          ['目錄', 17, 5],
-          ['來源證', 16, 7],
-          ['其他(附件)', 17, 7]
-        ]
-      }
-    },
-    methods: {
-      async handleSubmit() {
-        try {
-          // 將前端 formData 傳給後端 /api/material-submission
-          const response = await axios.post('/api/material-submission', this.formData, {
-            responseType: 'blob'
-          })
-          // 下載後端回傳的 Excel 檔
-          const fileURL = window.URL.createObjectURL(new Blob([response.data]))
-          const fileLink = document.createElement('a')
-          fileLink.href = fileURL
-          const filename = this.formData['檔案名稱'] || '材料報批表_filled.xlsx'
-          fileLink.setAttribute(
-            'download',
-            filename.endsWith('.xlsx') ? filename : filename + '.xlsx'
-          )
-          document.body.appendChild(fileLink)
-          fileLink.click()
-          fileLink.remove()
-        } catch (err) {
-          console.error('下載發生錯誤', err)
-        }
+    <div
+      v-if="showDiaryModal"
+      class="modal-backdrop fade show"
+    ></div>
+
+    <!-- SSE 下載進度 (自動下載) -->
+    <div
+      class="modal"
+      :class="{ fade: true, show: showProgress }"
+      :style="{ display: showProgress ? 'block' : 'none' }"
+      tabindex="-1"
+      role="dialog"
+      aria-modal="true"
+      v-if="showProgress"
+    >
+      <div class="modal-dialog" role="document">
+        <div class="modal-content">
+          <div class="modal-header">
+            <h5>Export Progress</h5>
+            <button
+              type="button"
+              class="btn-close"
+              @click="closeProgressModal"
+            ></button>
+          </div>
+          <div class="modal-body">
+            <div v-if="exportError" class="alert alert-danger">
+              {{ exportError }}
+            </div>
+            <div v-else-if="exportDone" class="alert alert-success">
+              Done! (Auto-Download triggered)
+            </div>
+            <p v-else>Processing... {{ exportProgress }}%</p>
+            <div class="progress mb-2">
+              <div
+                class="progress-bar"
+                role="progressbar"
+                :style="{ width: exportProgress + '%' }"
+                aria-valuemin="0"
+                aria-valuemax="100"
+              >
+                {{ exportProgress }}%
+              </div>
+            </div>
+          </div>
+          <div
+            class="modal-footer"
+            v-if="exportDone || exportError"
+          >
+            <button
+              class="btn btn-secondary"
+              @click="closeProgressModal"
+            >
+              Close
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div
+      v-if="showProgress"
+      class="modal-backdrop fade show"
+    ></div>
+
+    <!-- ★ 用於自動點擊下載的隱藏連結 -->
+    <a ref="hiddenDownloadLink" style="display:none;"></a>
+  </div>
+</template>
+
+<script>
+import axios from 'axios'
+import { ref, computed, onMounted } from 'vue'
+import { useRoute } from 'vue-router'
+import DailyReportForm from '@/components/SiteDiaryForm.vue'
+
+export default {
+  name: 'MaterialFormView',
+  components: {
+    DailyReportForm
+  },
+  setup() {
+    const route = useRoute()
+    const projectId = route.params.projectId
+
+    const docTypeTabs = [
+      { label: 'DRAWING', value: 'DRAWING' },
+      { label: 'MAT', value: 'MAT' },
+      { label: 'LETTER', value: 'LETTER' },
+      { label: 'DAILY_REPORT', value: 'DAILY_REPORT' }
+    ]
+    const activeTab = ref('DAILY_REPORT')
+
+    const dailyReports = ref([])
+    const selectedDiaryIds = ref([])
+    const editingDiaryId = ref(0)
+    const showDiaryModal = ref(false)
+
+    const showProgress = ref(false)
+    const exportProgress = ref(0)
+    const exportDone = ref(false)
+    const exportError = ref('')
+    const exportDownloadUrl = ref('')
+
+    // ★ 用於自動下載
+    const hiddenDownloadLink = ref(null)
+
+    let evtSrc = null
+
+    function fetchDailyReports() {
+      axios
+        .get('/api/documents/daily-reports', {
+          params: { project_id: projectId }
+        })
+        .then(res => {
+          dailyReports.value = res.data
+          selectedDiaryIds.value = []
+        })
+        .catch(err => console.error(err))
+    }
+
+    function openCreateDiary() {
+      editingDiaryId.value = 0
+      showDiaryModal.value = true
+    }
+    function editDiary(id) {
+      editingDiaryId.value = id
+      showDiaryModal.value = true
+    }
+    function deleteDiary(id) {
+      if (!confirm('Delete?')) return
+      axios
+        .delete(`/api/documents/daily-reports/${id}?project_id=${projectId}`)
+        .then(() => {
+          fetchDailyReports()
+        })
+        .catch(err => console.error(err))
+    }
+    function closeDiaryModal() {
+      showDiaryModal.value = false
+    }
+    function onDiarySaved() {
+      showDiaryModal.value = false
+      fetchDailyReports()
+    }
+
+    function rowClass(d) {
+      return selectedDiaryIds.value.includes(d.id) ? 'table-active' : ''
+    }
+    const isAllSelected = computed(() => {
+      return (
+        dailyReports.value.length > 0 &&
+        selectedDiaryIds.value.length === dailyReports.value.length
+      )
+    })
+    function toggleSelectAll() {
+      if (isAllSelected.value) {
+        selectedDiaryIds.value = []
+      } else {
+        selectedDiaryIds.value = dailyReports.value.map(x => x.id)
       }
     }
+
+    function downloadMultiple(fileType) {
+      if (selectedDiaryIds.value.length === 0) {
+        alert('No diaries selected.')
+        return
+      }
+      showProgress.value = true
+      exportProgress.value = 0
+      exportDone.value = false
+      exportError.value = ''
+      exportDownloadUrl.value = ''
+
+      axios
+        .post('/api/documents/daily-report/multi_download_async', {
+          project_id: Number(projectId),
+          diary_ids: selectedDiaryIds.value,
+          file_type: fileType
+        })
+        .then(resp => {
+          const job_id = resp.data.job_id
+          if (!job_id) {
+            console.error('[DEBUG] No job_id returned from multi_download_async.')
+            throw new Error('No job_id returned.')
+          }
+
+          evtSrc = new EventSource(`/api/documents/daily-report/progress-sse/${job_id}`)
+          evtSrc.onopen = () => {
+            console.log('[DEBUG] SSE connection opened. job_id=', job_id)
+          }
+          evtSrc.onmessage = evt => {
+            try {
+              const data = JSON.parse(evt.data)
+              exportProgress.value = data.progress || 0
+
+              if (data.status === 'done') {
+                exportDone.value = true
+                exportProgress.value = 100
+                const dlUrl = `/api/documents/daily-report/multi_download_result?job_id=${job_id}`
+                exportDownloadUrl.value = dlUrl
+                // ★ 自動觸發下載
+                autoDownload(dlUrl)
+                if (evtSrc) {
+                  evtSrc.close()
+                  evtSrc = null
+                }
+              } else if (data.status === 'error') {
+                exportError.value = data.error_msg || 'Unknown Error'
+                if (evtSrc) {
+                  evtSrc.close()
+                  evtSrc = null
+                }
+              }
+            } catch (parseErr) {
+              console.error('[DEBUG] SSE parse error:', parseErr)
+            }
+          }
+          evtSrc.onerror = e => {
+            console.error('[DEBUG] SSE onerror:', e)
+            exportError.value = 'SSE Connection Error'
+            if (evtSrc) {
+              evtSrc.close()
+              evtSrc = null
+            }
+          }
+        })
+        .catch(err => {
+          console.error('[DEBUG] downloadMultiple error:', err)
+          exportError.value = String(err)
+        })
+    }
+
+    function autoDownload(url) {
+      if (!hiddenDownloadLink.value) return
+      hiddenDownloadLink.value.href = url
+      // 不指定 download filename，後端 Content-Disposition 會帶檔名
+      hiddenDownloadLink.value.download = ''
+      hiddenDownloadLink.value.click()
+    }
+
+    function downloadSingle(id, fileType) {
+      const url = `/api/documents/daily-report/${id}/download?project_id=${projectId}&file_type=${fileType}`
+      window.open(url, '_blank')
+    }
+
+    function closeProgressModal() {
+      showProgress.value = false
+      exportProgress.value = 0
+      exportDone.value = false
+      exportError.value = ''
+      exportDownloadUrl.value = ''
+      if (evtSrc) {
+        evtSrc.close()
+        evtSrc = null
+      }
+    }
+
+    onMounted(() => {
+      if (activeTab.value === 'DAILY_REPORT') {
+        fetchDailyReports()
+      }
+    })
+
+    return {
+      projectId,
+      docTypeTabs,
+      activeTab,
+
+      dailyReports,
+      selectedDiaryIds,
+      editingDiaryId,
+      showDiaryModal,
+      isAllSelected,
+      rowClass,
+
+      openCreateDiary,
+      editDiary,
+      deleteDiary,
+      closeDiaryModal,
+      onDiarySaved,
+
+      downloadMultiple,
+      downloadSingle,
+
+      toggleSelectAll,
+
+      showProgress,
+      exportProgress,
+      exportDone,
+      exportError,
+      exportDownloadUrl,
+      closeProgressModal,
+
+      hiddenDownloadLink
+    }
   }
-  </script>
-  
-  <style scoped>
-  .material-form-container {
-    max-width: 600px;
-    margin: 0 auto;
+}
+</script>
+
+<style scoped>
+.table-active {
+  background-color: #f0f8ff !important;
+}
+.modal {
+  z-index: 1050;
+}
+.modal-backdrop {
+  z-index: 1040;
+}
+</style>
+
+================================================================================
+
+frontend/src/views/ProjectDocumentsView.vue
+
+================================================================================
+<template>
+  <div class="container my-4">
+    <h2>Documents of Project #{{ projectId }}</h2>
+
+    <!-- ★ Tabs (英文 + 指定順序) -->
+    <ul class="nav nav-tabs mb-3">
+      <li class="nav-item" v-for="tab in docTypeTabs" :key="tab.value">
+        <a
+          href="#"
+          class="nav-link"
+          :class="{ active: activeTab === tab.value }"
+          @click.prevent="activeTab = tab.value"
+        >
+          {{ tab.label }}
+        </a>
+      </li>
+    </ul>
+
+    <!-- 若為 DAILY_REPORT => 顯示日報 -->
+    <div v-if="activeTab === 'DAILY_REPORT'">
+      <h4>Daily Reports</h4>
+
+      <!-- 多選下載: XLSX / PDF(表1) / PDF(表2) -->
+      <div class="d-flex justify-content-between mb-2">
+        <div class="multi-select-actions" v-if="dailyReports.length > 0">
+          <div class="form-check form-check-inline">
+            <input
+              class="form-check-input"
+              type="checkbox"
+              id="selectAllDiaries"
+              :checked="isAllDiariesSelected"
+              @change="toggleSelectAllDiaries"
+            />
+            <label class="form-check-label" for="selectAllDiaries">Select All</label>
+          </div>
+          <button
+            class="btn btn-primary btn-sm"
+            :disabled="selectedDiaryIds.length === 0"
+            @click="downloadMultipleAsync('xlsx')"
+          >
+            Download XLSX
+          </button>
+          <button
+            class="btn btn-primary btn-sm ms-1"
+            :disabled="selectedDiaryIds.length === 0"
+            @click="downloadMultipleAsync('sheet1')"
+          >
+            PDF (Sheet1)
+          </button>
+          <button
+            class="btn btn-primary btn-sm ms-1"
+            :disabled="selectedDiaryIds.length === 0"
+            @click="downloadMultipleAsync('sheet2')"
+          >
+            PDF (Sheet2)
+          </button>
+        </div>
+        <div>
+          <button class="btn btn-success btn-sm" @click="openCreateDiary">
+            + New Daily Report
+          </button>
+        </div>
+      </div>
+
+      <!-- Diary Table -->
+      <table class="table table-sm table-bordered">
+        <thead>
+          <tr>
+            <th style="width: 40px;">
+              <input
+                type="checkbox"
+                :checked="isAllDiariesSelected"
+                @change="toggleSelectAllDiaries"
+                class="form-check-input"
+              />
+            </th>
+            <th>ID</th>
+            <th>Date</th>
+            <th>Weather(M)</th>
+            <th>Weather(N)</th>
+            <th>Day Count</th>
+            <th>Last Updated</th>
+            <th>Edit</th>
+            <th>Del</th>
+            <th>Download</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr
+            v-for="item in dailyReports"
+            :key="item.id"
+            :class="getDiaryRowClass(item)"
+          >
+            <td>
+              <input
+                type="checkbox"
+                v-model="selectedDiaryIds"
+                :value="item.id"
+                class="form-check-input"
+              />
+            </td>
+            <td>{{ item.id }}</td>
+            <td>{{ item.report_date }}</td>
+            <td>{{ item.weather_morning }}</td>
+            <td>{{ item.weather_noon }}</td>
+            <td>{{ item.day_count }}</td>
+            <td>{{ item.updated_at || '' }}</td>
+            <td>
+              <button
+                class="btn btn-warning btn-sm"
+                @click="editDiary(item.id)"
+              >
+                Edit
+              </button>
+            </td>
+            <td>
+              <button
+                class="btn btn-danger btn-sm"
+                @click="deleteDiary(item.id)"
+              >
+                Del
+              </button>
+            </td>
+            <td>
+              <div class="btn-group btn-group-sm">
+                <button
+                  class="btn btn-outline-primary"
+                  @click="downloadSingleDiary(item.id, 'xlsx')"
+                >
+                  XLSX
+                </button>
+                <button
+                  class="btn btn-outline-primary"
+                  @click="downloadSingleDiary(item.id, 'sheet1')"
+                >
+                  PDF1
+                </button>
+                <button
+                  class="btn btn-outline-primary"
+                  @click="downloadSingleDiary(item.id, 'sheet2')"
+                >
+                  PDF2
+                </button>
+              </div>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- 其餘 doc_type (DRAWING, TECH_APPROVAL, MAT, LETTER, ... ) 略 -->
+
+    <!-- [Modal] 日報 (Create/Edit) -->
+    <div
+      class="modal"
+      :class="{ fade: true, show: showDiaryModal }"
+      :style="{ display: showDiaryModal ? 'block' : 'none' }"
+      tabindex="-1"
+      role="dialog"
+      aria-modal="true"
+      v-if="showDiaryModal"
+      @click.self="showDiaryModal = false"
+    >
+      <div class="modal-dialog modal-xl" role="document">
+        <div class="modal-content">
+          <div class="modal-body">
+            <DailyReportForm
+              :projectId="Number(projectId)"
+              :diaryId="editingDiaryId"
+              @updated="onDiaryUpdated"
+              @cancel="onDiaryCancelled"
+            />
+          </div>
+        </div>
+      </div>
+    </div>
+    <div
+      v-if="showDiaryModal"
+      class="modal-backdrop fade show"
+    ></div>
+
+    <!-- SSE 下載進度 (自動下載) -->
+    <div
+      class="modal"
+      :class="{ fade: true, show: showProgressModal }"
+      :style="{ display: showProgressModal ? 'block' : 'none' }"
+      tabindex="-1"
+      role="dialog"
+      aria-modal="true"
+      v-if="showProgressModal"
+    >
+      <div class="modal-dialog" role="document">
+        <div class="modal-content">
+          <div class="modal-header">
+            <h5 class="modal-title">Export Progress</h5>
+            <button type="button" class="btn-close" @click="closeProgressModal"></button>
+          </div>
+          <div class="modal-body">
+            <div v-if="exportError" class="alert alert-danger">
+              {{ exportError }}
+            </div>
+            <div v-else-if="exportDone" class="alert alert-success">
+              Export completed! (Auto Download)
+            </div>
+            <p v-else>Preparing files... ({{ exportProgress }}%)</p>
+            <div class="progress mb-2">
+              <div
+                class="progress-bar"
+                role="progressbar"
+                :style="{ width: exportProgress + '%' }"
+                :aria-valuenow="exportProgress"
+                aria-valuemin="0"
+                aria-valuemax="100"
+              >
+                {{ exportProgress }}%
+              </div>
+            </div>
+          </div>
+          <div class="modal-footer" v-if="exportDone || exportError">
+            <button type="button" class="btn btn-secondary" @click="closeProgressModal">
+              Close
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div
+      v-if="showProgressModal"
+      class="modal-backdrop fade show"
+    ></div>
+
+    <!-- ★ 隱藏的 <a> 用於自動觸發下載 -->
+    <a ref="hiddenDownloadLink" style="display:none;"></a>
+  </div>
+</template>
+
+<script lang="ts">
+import { ref, computed, onMounted } from 'vue'
+import axios from 'axios'
+import { useRoute } from 'vue-router'
+import DailyReportForm from '@/components/SiteDiaryForm.vue'
+
+interface DailyReportData {
+  id: number
+  report_date: string
+  weather_morning: string
+  weather_noon: string
+  day_count: number
+  updated_at?: string
+}
+
+export default {
+  name: 'ProjectDocumentsView',
+  components: {
+    DailyReportForm
+  },
+  setup() {
+    const route = useRoute()
+    const projectId = route.params.projectId as string
+
+    const docTypeTabs = [
+      { label: 'DRAWING',          value: 'DRAWING' },
+      { label: 'TECH_APPROVAL',    value: 'TECH_APPROVAL' },
+      { label: 'MAT',              value: 'MAT' },
+      { label: 'LETTER',           value: 'LETTER' },
+      { label: 'RFI',              value: 'RFI' },
+      { label: 'RIN',              value: 'RIN' },
+      { label: 'RECEIVED_LETTER',  value: 'RECEIVED_LETTER' },
+      { label: 'TEST_REPORT',      value: 'TEST_REPORT' },
+      { label: 'DAILY_REPORT',     value: 'DAILY_REPORT' }
+    ]
+    const activeTab = ref('DAILY_REPORT')
+
+    const dailyReports = ref<DailyReportData[]>([])
+    const selectedDiaryIds = ref<number[]>([])
+    const editingDiaryId = ref<number>(0)
+    const showDiaryModal = ref(false)
+
+    // SSE
+    const showProgressModal = ref(false)
+    const exportProgress = ref(0)
+    const exportError = ref('')
+    const exportDone = ref(false)
+    const exportDownloadUrl = ref('')
+    const hiddenDownloadLink = ref<HTMLAnchorElement | null>(null)
+
+    let eventSource: EventSource | null = null
+
+    async function fetchDailyReports() {
+      try {
+        const res = await axios.get('/api/documents/daily-reports', {
+          params: { project_id: projectId }
+        })
+        dailyReports.value = res.data
+        selectedDiaryIds.value = []
+      } catch (err) {
+        console.error('[DEBUG] fetchDailyReports error:', err)
+      }
+    }
+
+    function openCreateDiary() {
+      editingDiaryId.value = 0
+      showDiaryModal.value = true
+    }
+    function editDiary(id: number) {
+      editingDiaryId.value = id
+      showDiaryModal.value = true
+    }
+    async function deleteDiary(id: number) {
+      if (!confirm('Delete this daily report?')) return
+      try {
+        await axios.delete(`/api/documents/daily-reports/${id}`, {
+          params: { project_id: projectId }
+        })
+        fetchDailyReports()
+      } catch (err) {
+        console.error(err)
+        alert('Delete failed.')
+      }
+    }
+    function onDiaryUpdated() {
+      showDiaryModal.value = false
+      fetchDailyReports()
+    }
+    function onDiaryCancelled() {
+      showDiaryModal.value = false
+    }
+    function downloadSingleDiary(id: number, fileType: string) {
+      const url = `/api/documents/daily-report/${id}/download?project_id=${projectId}&file_type=${fileType}`
+      window.open(url, '_blank')
+    }
+
+    const isAllDiariesSelected = computed(() => {
+      return (
+        dailyReports.value.length > 0 &&
+        selectedDiaryIds.value.length === dailyReports.value.length
+      )
+    })
+    function toggleSelectAllDiaries() {
+      if (isAllDiariesSelected.value) {
+        selectedDiaryIds.value = []
+      } else {
+        selectedDiaryIds.value = dailyReports.value.map(d => d.id)
+      }
+    }
+    function getDiaryRowClass(d: DailyReportData) {
+      return selectedDiaryIds.value.includes(d.id) ? 'table-active' : ''
+    }
+    function downloadMultipleAsync(fileType: string) {
+      if (selectedDiaryIds.value.length === 0) {
+        alert('No diaries selected.')
+        return
+      }
+      showProgressModal.value = true
+      exportProgress.value = 0
+      exportError.value = ''
+      exportDone.value = false
+      exportDownloadUrl.value = ''
+
+      axios.post('/api/documents/daily-report/multi_download_async', {
+        project_id: Number(projectId),
+        diary_ids: selectedDiaryIds.value,
+        file_type: fileType
+      })
+      .then(resp => {
+        const job_id = resp.data.job_id
+        if (!job_id) {
+          console.error('[DEBUG] No job_id returned from multi_download_async.')
+          throw new Error('No job_id returned')
+        }
+        eventSource = new EventSource(`/api/documents/daily-report/progress-sse/${job_id}`)
+        eventSource.onopen = () => {
+          console.log('[DEBUG] SSE connected. job_id=', job_id)
+        }
+        eventSource.onmessage = evt => {
+          try {
+            const data = JSON.parse(evt.data)
+            exportProgress.value = data.progress || 0
+            if (data.status === 'done') {
+              exportDone.value = true
+              exportProgress.value = 100
+              const dlUrl = `/api/documents/daily-report/multi_download_result?job_id=${job_id}`
+              exportDownloadUrl.value = dlUrl
+              autoDownload(dlUrl)
+              if (eventSource) {
+                eventSource.close()
+                eventSource = null
+              }
+            } else if (data.status === 'error') {
+              exportError.value = data.error_msg || 'Unknown error'
+              if (eventSource) {
+                eventSource.close()
+                eventSource = null
+              }
+            }
+          } catch (parseErr) {
+            console.error('[DEBUG] SSE parse error:', parseErr)
+          }
+        }
+        eventSource.onerror = err => {
+          console.error('[DEBUG] SSE onerror:', err)
+          exportError.value = 'SSE Connection Error'
+          if (eventSource) {
+            eventSource.close()
+            eventSource = null
+          }
+        }
+      })
+      .catch(e => {
+        console.error('[DEBUG] downloadMultipleAsync error:', e)
+        exportError.value = String(e)
+      })
+    }
+
+    function autoDownload(url: string) {
+      if (!hiddenDownloadLink.value) return
+      hiddenDownloadLink.value.href = url
+      hiddenDownloadLink.value.download = ''
+      hiddenDownloadLink.value.click()
+    }
+
+    function closeProgressModal() {
+      showProgressModal.value = false
+      exportProgress.value = 0
+      exportDone.value = false
+      exportError.value = ''
+      exportDownloadUrl.value = ''
+      if (eventSource) {
+        eventSource.close()
+        eventSource = null
+      }
+    }
+
+    onMounted(() => {
+      if (activeTab.value === 'DAILY_REPORT') {
+        fetchDailyReports()
+      } else {
+        // 省略 fetchDocuments() or other doc type
+      }
+    })
+
+    return {
+      projectId,
+      docTypeTabs,
+      activeTab,
+      dailyReports,
+      selectedDiaryIds,
+      editingDiaryId,
+      showDiaryModal,
+      showProgressModal,
+      exportProgress,
+      exportError,
+      exportDone,
+      exportDownloadUrl,
+      hiddenDownloadLink,
+
+      isAllDiariesSelected,
+      toggleSelectAllDiaries,
+      getDiaryRowClass,
+
+      fetchDailyReports,
+      openCreateDiary,
+      editDiary,
+      deleteDiary,
+      onDiaryUpdated,
+      onDiaryCancelled,
+      downloadSingleDiary,
+
+      downloadMultipleAsync,
+      closeProgressModal,
+      autoDownload
+    }
   }
-  .form-card {
-    background: #f9f9f9;
-    padding: 1rem 1.5rem;
-    border-radius: 8px;
-    border: 1px solid #ccc;
-  }
-  .form-group {
-    margin-bottom: 1rem;
-  }
-  .form-label {
-    display: inline-block;
-    width: 120px;
-    font-weight: bold;
-    margin-right: 0.5rem;
-  }
-  .form-input {
-    width: calc(100% - 130px);
-    padding: 6px;
-    border: 1px solid #ccc;
-    border-radius: 4px;
-  }
-  .checkbox-group {
-    margin-bottom: 0.5rem;
-  }
-  .checkbox-label {
-    margin-left: 6px;
-  }
-  .btn-submit {
-    margin-top: 20px;
-    padding: 8px 16px;
-    background: #646cff;
-    color: #fff;
-    border: none;
-    border-radius: 4px;
-    cursor: pointer;
-  }
-  .btn-submit:hover {
-    background: #535bf2;
-  }
-  </style>
-  
+}
+</script>
+
+<style scoped>
+.me-2 {
+  margin-right: 8px;
+}
+.modal {
+  z-index: 1050;
+}
+.modal-backdrop {
+  z-index: 1040;
+}
+.table-active {
+  background-color: #f0f8ff !important;
+}
+</style>
+
 ================================================================================
 
 frontend/src/views/ProjectsGanttView.vue
@@ -5350,564 +6421,6 @@ export default {
 
 ================================================================================
 
-frontend/src/views/SiteDiaryListView.vue
-
-================================================================================
-<template>
-  <div class="container-fluid" style="max-width:2000px; margin:0 auto;">
-    <h2>Site Diaries Management</h2>
-
-    <div v-if="projectInfo" class="border p-3 mb-4">
-      <h3>Project: {{ projectInfo.name }}</h3>
-      <p>Owner: {{ projectInfo.owner }}</p>
-    </div>
-
-    <!-- 排序操作 -->
-    <div class="d-flex align-items-center mb-3" style="gap: 1rem;">
-      <div>
-        <label>Sort By:</label>
-        <select v-model="sortBy" class="form-select form-select-sm w-auto d-inline-block">
-          <option value="report_date">Date</option>
-          <option value="day_count">Day Count</option>
-          <option value="updated_at">Last Edited</option>
-        </select>
-      </div>
-      <div>
-        <label>Order:</label>
-        <select v-model.number="sortOrder" class="form-select form-select-sm w-auto d-inline-block">
-          <option :value="1">ASC</option>
-          <option :value="-1">DESC</option>
-        </select>
-      </div>
-      <button class="btn btn-secondary btn-sm" @click="fetchSiteDiaries">Apply Sort</button>
-    </div>
-
-    <button class="btn btn-success mb-4" @click="openCreateDialog">NEW SITE DIARY</button>
-
-    <!-- 多選下載操作區 -->
-    <div class="mb-3 d-flex align-items-center" style="gap: 1rem;">
-      <div class="form-check">
-        <input
-          class="form-check-input"
-          type="checkbox"
-          id="selectAll"
-          :checked="isAllSelected"
-          @change="toggleSelectAll"
-        />
-        <label class="form-check-label" for="selectAll">全選</label>
-      </div>
-
-      <!-- 改用非同步 + SSE 的下載按鈕 -->
-      <button class="btn btn-outline-primary btn-sm" @click="downloadMultipleAsync('xlsx')">
-        Download XLSX (多筆, SSE)
-      </button>
-      <button class="btn btn-outline-primary btn-sm" @click="downloadMultipleAsync('sheet1')">
-        Download PDF(表1) (SSE)
-      </button>
-      <button class="btn btn-outline-primary btn-sm" @click="downloadMultipleAsync('sheet2')">
-        Download PDF(表2) (SSE)
-      </button>
-    </div>
-
-    <div class="table-responsive">
-      <!-- 使用 table-sm 並在 :class="getRowClass(item)" 來標示星期天 -->
-      <table class="table table-sm table-bordered table-hover mb-6">
-        <thead>
-          <tr>
-            <th>#</th>
-            <th>勾選</th>
-            <th>日期</th>
-            <th>天氣(早)</th>
-            <th>天氣(中)</th>
-            <th>日數</th>
-            <th>Last Edited</th>
-            <th>EDIT</th>
-            <th>DELETE</th>
-            <th>DOWNLOAD (Single)</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr
-            v-for="(item, index) in siteDiaries"
-            :key="item.id"
-            :class="getRowClass(item)"
-          >
-            <td>{{ index + 1 }}</td>
-            <td>
-              <input
-                type="checkbox"
-                class="form-check-input"
-                :value="item.id"
-                v-model="selectedDiaryIds"
-              />
-            </td>
-            <td>{{ item.report_date }}</td>
-            <td>{{ item.weather_morning }}</td>
-            <td>{{ item.weather_noon }}</td>
-            <td>{{ item.day_count }}</td>
-            <td>{{ item.updated_at || '' }}</td>
-            <td>
-              <button class="btn btn-warning btn-sm" @click="openEditDialog(item.id)">
-                EDIT
-              </button>
-            </td>
-            <td>
-              <button class="btn btn-danger btn-sm" @click="deleteDiary(item.id)">
-                DELETE
-              </button>
-            </td>
-            <td>
-              <div class="dropdown">
-                <button
-                  class="btn btn-info btn-sm dropdown-toggle"
-                  type="button"
-                  data-bs-toggle="dropdown"
-                >
-                  DOWNLOAD
-                </button>
-                <ul class="dropdown-menu">
-                  <li>
-                    <a
-                      class="dropdown-item"
-                      href="#"
-                      @click.prevent="downloadReport(item.id, 'xlsx')"
-                    >
-                      Excel (XLSX)
-                    </a>
-                  </li>
-                  <li>
-                    <a
-                      class="dropdown-item"
-                      href="#"
-                      @click.prevent="downloadReport(item.id, 'sheet1')"
-                    >
-                      PDF(表1)
-                    </a>
-                  </li>
-                  <li>
-                    <a
-                      class="dropdown-item"
-                      href="#"
-                      @click.prevent="downloadReport(item.id, 'sheet2')"
-                    >
-                      PDF(表2)
-                    </a>
-                  </li>
-                </ul>
-              </div>
-            </td>
-          </tr>
-        </tbody>
-      </table>
-    </div>
-
-    <!-- Diary Form Modal -->
-    <div
-      class="modal"
-      :class="{ fade: true, show: displayFormDialog }"
-      :style="{ display: displayFormDialog ? 'block' : 'none' }"
-      tabindex="-1"
-      role="dialog"
-      aria-modal="true"
-      v-if="displayFormDialog"
-    >
-      <div class="modal-dialog modal-xl" role="document">
-        <div class="modal-content">
-          <div class="modal-body">
-            <SiteDiaryForm
-              :projectId="projectIdNumber"
-              :diaryId="editingDiaryId"
-              @updated="onDiaryUpdated"
-              @cancel="onDiaryCancelled"
-            />
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <!-- Modal backdrop for form -->
-    <div
-      v-if="displayFormDialog"
-      class="modal-backdrop fade show"
-    ></div>
-
-    <!-- SSE 進度 Modal -->
-    <div
-      class="modal"
-      :class="{ fade: true, show: showProgressModal }"
-      :style="{ display: showProgressModal ? 'block' : 'none' }"
-      tabindex="-1"
-      role="dialog"
-      aria-modal="true"
-      v-if="showProgressModal"
-    >
-      <div class="modal-dialog modal-sm" role="document">
-        <div class="modal-content">
-          <div class="modal-header">
-            <h5 class="modal-title">Export Progress</h5>
-            <button
-              type="button"
-              class="btn-close"
-              @click="abortSse"
-            ></button>
-          </div>
-          <div class="modal-body text-center">
-            <p v-if="progressStatus === 'error'" class="text-danger">
-              Error: {{ progressErrorMsg }}
-            </p>
-            <p v-else-if="progressStatus === 'done'" class="text-success">
-              All done!
-            </p>
-            <p v-else>
-              Exporting... ({{ sseProgress }}%)
-            </p>
-
-            <!-- Bootstrap 進度條範例 -->
-            <div class="progress" style="height: 24px;">
-              <div
-                class="progress-bar"
-                role="progressbar"
-                :style="{width: sseProgress + '%'}"
-                :aria-valuenow="sseProgress"
-                aria-valuemin="0"
-                aria-valuemax="100"
-              >
-                {{ sseProgress }}%
-              </div>
-            </div>
-
-          </div>
-          <div class="modal-footer">
-            <button
-              v-if="progressStatus === 'done' || progressStatus === 'error'"
-              type="button"
-              class="btn btn-secondary"
-              @click="closeProgressModal"
-            >
-              Close
-            </button>
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <!-- Modal backdrop for SSE progress -->
-    <div
-      v-if="showProgressModal"
-      class="modal-backdrop fade show"
-    ></div>
-  </div>
-</template>
-
-<script>
-import axios from 'axios'
-import { ref, computed, onMounted } from 'vue'
-import { useRoute } from 'vue-router'
-import SiteDiaryForm from '@/components/SiteDiaryForm.vue'
-
-export default {
-  name: 'SiteDiaryListView',
-  components: { SiteDiaryForm },
-  setup() {
-    const route = useRoute()
-    const siteDiaries = ref([])
-    const projectInfo = ref(null)
-    const displayFormDialog = ref(false)
-    const editingDiaryId = ref(null)
-
-    // 多選勾選
-    const selectedDiaryIds = ref([])
-
-    // 排序
-    const sortBy = ref('report_date')
-    const sortOrder = ref(1)
-
-    const projectIdNumber = computed(() => Number(route.params.projectId))
-
-    // =============== SSE 相關的狀態 ===============
-    const showProgressModal = ref(false)
-    const sseProgress = ref(0)
-    const progressStatus = ref('idle') // idle, in_progress, done, error
-    const progressErrorMsg = ref('')
-    let sse = null // 用於記錄 SSE 連線物件 (EventSource)
-
-    // 取得專案資訊
-    const fetchProjectInfo = async () => {
-      try {
-        const { data } = await axios.get(`/api/projects/${projectIdNumber.value}`)
-        projectInfo.value = data
-      } catch (error) {
-        console.error(error)
-      }
-    }
-
-    // 取得日報列表
-    const fetchSiteDiaries = async () => {
-      try {
-        const { data } = await axios.get(
-          `/api/projects/${projectIdNumber.value}/site_diaries`,
-          { params: { sort_by: sortBy.value, sort_order: sortOrder.value } }
-        )
-        siteDiaries.value = data
-        selectedDiaryIds.value = [] // 每次重新載入都清空勾選
-      } catch (err) {
-        console.error(err)
-      }
-    }
-
-    // 開啟「新建」對話框
-    const openCreateDialog = () => {
-      editingDiaryId.value = null
-      displayFormDialog.value = true
-    }
-
-    // 開啟「編輯」對話框
-    const openEditDialog = (diaryId) => {
-      editingDiaryId.value = diaryId
-      displayFormDialog.value = true
-    }
-
-    // 刪除日報
-    const deleteDiary = async (diaryId) => {
-      if (!confirm('Are you sure you want to delete this Site Diary?')) return
-      try {
-        await axios.delete(`/api/projects/${projectIdNumber.value}/site_diaries/${diaryId}`)
-        alert('Diary deleted.')
-        fetchSiteDiaries()
-      } catch (err) {
-        console.error(err)
-      }
-    }
-
-    // 單筆下載 (維持原狀)
-    const downloadReport = async (diaryId, fileType) => {
-      try {
-        const response = await axios.get(
-          `/api/projects/${projectIdNumber.value}/site_diaries/${diaryId}/download_report?file=${fileType}`,
-          { responseType: 'blob' }
-        )
-        let filename
-        if (fileType === 'xlsx') {
-          filename = 'daily_report_filled.xlsx'
-        } else if (fileType === 'sheet1') {
-          filename = 'daily_report_sheet1.pdf'
-        } else {
-          filename = 'daily_report_sheet2.pdf'
-        }
-
-        // 嘗試從 headers 取得後端回傳檔名
-        const cd = response.headers['content-disposition']
-        if (cd) {
-          const m = /filename[^;=\n]*=((['"]).*?\2|[^;\n]*)/.exec(cd)
-          if (m && m[1]) {
-            filename = m[1].replace(/['"]/g, '')
-          }
-        }
-
-        const blobUrl = window.URL.createObjectURL(response.data)
-        const link = document.createElement('a')
-        link.href = blobUrl
-        link.setAttribute('download', filename)
-        document.body.appendChild(link)
-        link.click()
-        link.remove()
-        window.URL.revokeObjectURL(blobUrl)
-      } catch (err) {
-        console.error('Download failed:', err)
-      }
-    }
-
-    // ================ 重新改寫多筆下載 (SSE 版本) ====================
-    const downloadMultipleAsync = async (fileType) => {
-      if (!selectedDiaryIds.value.length) {
-        alert('請先勾選一筆以上的日報！')
-        return
-      }
-      // 先呼叫非同步 API => 取得 job_id
-      try {
-        // 重置 SSE 狀態
-        sseProgress.value = 0
-        progressStatus.value = 'in_progress'
-        progressErrorMsg.value = ''
-        showProgressModal.value = true
-
-        const payload = {
-          diary_ids: selectedDiaryIds.value,
-          file_type: fileType
-        }
-        const res = await axios.post(
-          `/api/projects/${projectIdNumber.value}/site_diaries/multi_download_async`,
-          payload
-        )
-        const { job_id } = res.data
-
-        // 開始 SSE 監聽
-        startSse(job_id)
-      } catch (err) {
-        console.error('multi_download_async error:', err)
-        alert('多筆下載時發生錯誤。請查看 console log')
-      }
-    }
-
-    function startSse(jobId) {
-      const sseUrl = `/api/progress-sse/${jobId}`
-      sse = new EventSource(sseUrl)
-
-      sse.onmessage = (evt) => {
-        const data = JSON.parse(evt.data) // { progress, status, error_msg? }
-        sseProgress.value = data.progress
-        progressStatus.value = data.status || 'unknown'
-
-        if (data.status === 'error') {
-          progressErrorMsg.value = data.error_msg || ''
-          sse.close()
-        } else if (data.status === 'done') {
-          sse.close()
-
-          // SSE 結束後，再下載最後 ZIP
-          fetchFinalZip(jobId)
-        }
-      }
-
-      sse.onerror = (err) => {
-        console.error('SSE error:', err)
-        if (sse) {
-          sse.close()
-        }
-        progressStatus.value = 'error'
-        progressErrorMsg.value = 'SSE 連線出錯'
-      }
-    }
-
-    async function fetchFinalZip(jobId) {
-      try {
-        // 直接透過 window.location 下載
-        //   GET /api/projects/:projectId/site_diaries/multi_download_result?job_id=xxx
-        const finalUrl = `/api/projects/${projectIdNumber.value}/site_diaries/multi_download_result?job_id=${jobId}`
-        window.location = finalUrl
-      } catch (err) {
-        console.error('fetchFinalZip error:', err)
-        progressStatus.value = 'error'
-        progressErrorMsg.value = String(err)
-      }
-    }
-
-    // 讓使用者有機會手動關閉 SSE
-    function abortSse() {
-      if (sse) {
-        sse.close()
-      }
-      progressStatus.value = 'error'
-      progressErrorMsg.value = 'User aborted.'
-    }
-
-    // 關閉 SSE 進度視窗
-    function closeProgressModal() {
-      showProgressModal.value = false
-    }
-
-    // ===============================================
-
-    // 點擊「儲存 / 更新」後 => 關閉表單並重整列表
-    const onDiaryUpdated = () => {
-      displayFormDialog.value = false
-      fetchSiteDiaries()
-    }
-
-    // 點擊 Cancel => 僅關閉表單
-    const onDiaryCancelled = () => {
-      displayFormDialog.value = false
-    }
-
-    // 是否全選
-    const isAllSelected = computed(() => {
-      return siteDiaries.value.length > 0 &&
-        selectedDiaryIds.value.length === siteDiaries.value.length
-    })
-    const toggleSelectAll = (e) => {
-      if (e.target.checked) {
-        selectedDiaryIds.value = siteDiaries.value.map(d => d.id)
-      } else {
-        selectedDiaryIds.value = []
-      }
-    }
-
-    // 若是星期天 => 顯示特殊背景
-    const getRowClass = (diary) => {
-      if (!diary.report_date) return ''
-      const d = new Date(diary.report_date)
-      return d.getDay() === 0 ? 'sunday-row' : ''
-    }
-
-    onMounted(() => {
-      fetchProjectInfo()
-      fetchSiteDiaries()
-    })
-
-    return {
-      siteDiaries,
-      projectInfo,
-      displayFormDialog,
-      editingDiaryId,
-
-      selectedDiaryIds,
-      isAllSelected,
-      toggleSelectAll,
-
-      sortBy,
-      sortOrder,
-      projectIdNumber,
-
-      fetchSiteDiaries,
-      openCreateDialog,
-      openEditDialog,
-      deleteDiary,
-      downloadReport,
-
-      // 新增 SSE 相關
-      downloadMultipleAsync,
-      showProgressModal,
-      sseProgress,
-      progressStatus,
-      progressErrorMsg,
-      abortSse,
-      closeProgressModal,
-
-      onDiaryUpdated,
-      onDiaryCancelled,
-      getRowClass
-    }
-  }
-}
-</script>
-
-<style scoped>
-.mb-6 {
-  margin-bottom: 24px;
-}
-
-/*  專門針對星期天列，套用底色 */
-.sunday-row td {
-  background-color: #e9e9e9 !important;
-}
-
-/*  更改 table-sm 的內補與行高 => 更緊湊的列高 */
-.table-sm > :not(caption) > * > * {
-  padding: 0.3rem 0.5rem !important;
-  line-height: 1.1 !important;
-}
-
-/* Modal 層級調整 */
-.modal {
-  z-index: 1050;
-}
-.modal-backdrop {
-  z-index: 1040;
-}
-</style>
-
-================================================================================
-
 frontend/src/views/StaffView.vue
 
 ================================================================================
@@ -6083,10 +6596,44 @@ frontend/tsconfig.json
 
 ================================================================================
 {
-  "files": [],
-  "references": [
-    { "path": "./tsconfig.app.json" },
-    { "path": "./tsconfig.node.json" }
+  "compilerOptions": {
+    "target": "ES2020",
+    "module": "ESNext",
+    "strict": true,
+    "jsx": "preserve",
+    "importHelpers": true,
+    "moduleResolution": "node",
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "sourceMap": true,
+    "baseUrl": ".",
+    "types": [
+      "node",
+      "vue",
+      "axios"
+    ],
+    "lib": [
+      "ESNext",
+      "DOM",
+      "DOM.Iterable",
+      "ScriptHost"
+    ],
+    "paths": {
+      "@/*": [
+        "src/*"
+      ]
+    }
+  },
+  "include": [
+    "src/**/*.ts",
+    "src/**/*.tsx",
+    "src/**/*.vue",
+    "tests/**/*.ts",
+    "tests/**/*.tsx"
+  ],
+  "exclude": [
+    "node_modules"
   ]
 }
 
@@ -6129,27 +6676,70 @@ import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
 import { fileURLToPath, URL } from 'node:url'
 
-export default defineConfig({
-  plugins: [vue()],
-  // ★ 新增 resolve.alias 配置
-  resolve: {
-    alias: {
-      '@': fileURLToPath(new URL('./src', import.meta.url))
-    }
-  },
-  server: {
-    proxy: {
-      '/api': {
-        target: 'http://127.0.0.1:5000',
-        changeOrigin: true
+// 最基本的配置，避免使用高級功能
+export default defineConfig(({ mode }) => {
+  const isProduction = (mode === 'production')
+  
+  // 生產模式下的基本配置
+  if (isProduction) {
+    return {
+      plugins: [vue()],
+      
+      // 最基本的構建選項
+      build: {
+        // 最小化複雜度
+        outDir: 'dist',
+        emptyOutDir: true,
+        // 關閉 sourcemap 以節省記憶體
+        sourcemap: false
+      },
+
+      // 路徑別名
+      resolve: {
+        alias: {
+          '@': fileURLToPath(new URL('./src', import.meta.url))
+        }
       }
     }
-  },
-  build: {
-    outDir: 'dist', // 打包後輸出位置
-    emptyOutDir: true
+  }
+  
+  // 開發模式配置
+  return {
+    plugins: [vue()],
+    resolve: {
+      alias: {
+        '@': fileURLToPath(new URL('./src', import.meta.url))
+      }
+    },
+    server: {
+      proxy: {
+        '/api': {
+          target: 'http://127.0.0.1:5000',
+          changeOrigin: true
+        }
+      }
+    }
   }
 })
+
+================================================================================
+
+gunicorn_config.py
+
+================================================================================
+# gunicorn_config.py
+
+worker_class = "gevent"     # 改用 gevent worker
+workers = 2                 # 可自行斟酌調整 worker 數
+bind = "0.0.0.0:8080"       # 與 Dockerfile / container expose 相對應
+
+timeout = 1800              # ★ 改為半小時 (30分鐘) 
+graceful_timeout = 1800     # ★ 同樣30分鐘
+keepalive = 2
+
+# 可視需求再增加其他參數，如 max_requests、max_requests_jitter 等
+# max_requests = 1000
+# max_requests_jitter = 100
 
 ================================================================================
 
@@ -6174,3 +6764,6 @@ Flask-PyMongo==3.0.1
 pymongo==4.11.0
 openpyxl==3.1.5
 gunicorn==23.0.0
+boto3==1.28.0
+uvicorn==0.23.2
+gevent==22.10.2

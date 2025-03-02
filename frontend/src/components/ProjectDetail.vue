@@ -1,3 +1,4 @@
+<!-- frontend/src/components/ProjectDetail.vue -->
 <template>
   <div v-if="project" class="card p-3">
     <h5 class="card-title">Project Detail</h5>
@@ -11,21 +12,24 @@
     <p>Contractor: {{ project.contractor }}</p>
 
     <div class="mt-3">
-      <router-link
-        :to="`/projects/${projectId}/diaries`"
-        class="btn btn-info me-2"
-      >
-        Manage Site Diaries
-      </router-link>
+      <!-- 
+        已移除舊的 "Manage Site Diaries" 按鈕，避免觸發 /projects/:projectId/diaries 404
+      -->
 
-      <!-- ★ 新增的按鈕: Go to Gantt Chart -->
       <router-link
         :to="`/projects/${projectId}/gantt`"
-        class="btn btn-warning"
+        class="btn btn-warning me-2"
       >
         Gantt
       </router-link>
-      <!-- -------------- -->
+
+      <!-- 新增文件(包含 Daily Reports)的入口 -->
+      <router-link
+        :to="`/projects/${projectId}/documents`"
+        class="btn btn-secondary"
+      >
+        Documents
+      </router-link>
     </div>
   </div>
 </template>
